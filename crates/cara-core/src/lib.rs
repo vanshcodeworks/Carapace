@@ -12,8 +12,14 @@
 //! means the native tier must refuse to run code. Backends must check this
 //! before every spawn and abort otherwise. See docs/threat-model.md.
 
+pub mod backend;
 pub mod doctor;
 pub mod error;
+pub mod report;
+pub mod spec;
 
+pub use backend::{Backend, BackendError, SandboxHandle};
 pub use doctor::{Check, DoctorReport, Status};
 pub use error::CoreError;
+pub use report::{ExitReport, KillReason};
+pub use spec::{Limits, SandboxSpec};

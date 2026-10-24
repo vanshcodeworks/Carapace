@@ -10,3 +10,6 @@ repository.workspace = true
 carapace-core = { workspace = true }
 carapace-sys = { workspace = true }
 libc = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }

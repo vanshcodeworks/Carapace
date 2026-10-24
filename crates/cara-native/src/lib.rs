@@ -5,4 +5,10 @@
 
 #![cfg(target_os = "linux")]
 
+pub mod backend;
+pub mod child;
 pub mod doctor;
+mod supervisor;
+
+pub use backend::NativeBackend;
+pub use carapace_core::{Backend, SandboxHandle};
