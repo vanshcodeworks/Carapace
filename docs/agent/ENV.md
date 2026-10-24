@@ -1,0 +1,101 @@
+# Development Environment (docs/agent/ENV.md)
+
+The reference dev environment for this repository. Everything below was
+measured or performed by the agent on 2026-10-24/25 and is the basis for
+`cara doctor`'s checks and the strict tests (`CARA_STRICT_ENV_TESTS=1`).
+
+## Host
+
+| Item | Value |
+|---|---|
+| Windows | 10.0.26200 (Windows 11) |
+| WSL | 3.0.3.0 |
+| WSL kernel | 6.18.54.1-1 (6.18.54.1-microsoft-standard-WSL2 inside the distro) |
+| Linux distro | Ubuntu 24.04.5 LTS (installed via `wsl --install Ubuntu-24.04 --no-launch`) |
+| init | systemd 255 (255.4-1ubuntu8.17) as PID 1 |
+| Dev user | `dev` (uid 1000), created manually; passwordless sudo via /etc/sudoers.d/dev |
+| Rust | 1.99.1 stable (rustup, minimal profile + clippy + rustfmt) |
+
+The repository lives on the Windows mount (`/mnt/p/Carapace` in WSL). Builds
+run inside WSL with `CARGO_TARGET_DIR=$HOME/.cache/carapace-target` (ext4) so
+artifacts never touch the slow DrvFs mount — see `scripts/check.sh`.
+
+## Measured capabilities
+
+| Capability | Status | How measured |
+|---|---|---|
+| Unprivileged user namespaces | ✅ works | forked child `unshare(CLONE_NEWUSER)` as uid 1000 → success |
+| cgroup v2 | ✅ unified hierarchy at /sys/fs/cgroup (`nsdelegate`) | `statfs` magic 0x63677270 |
+| cgroup delegation for `dev` | ✅ cpu, io, memory, pids | writable probe at `user.slice/user-1000.slice/user@1000.service` |
+| Landlock | ✅ ABI v7 | `landlock_create_ruleset(NULL,0,VERSION)` → 7 |
+| Landlock in kernel config | ✅ CONFIG_SECURITY_LANDLOCK=y, first in CONFIG_LSM | /proc/config.gz |
+| seccomp-bpf | ✅ | `seccomp(SECCOMP_GET_ACTION_AVAIL, 0, &KILL_PROCESS)` → 0 |
+| pidfd_open | ✅ (kernel ≥ 5.3) | `pidfd_open(getpid(),0)` → fd |
+| close_range | ✅ (kernel ≥ 5.9) | `close_range(4,3,0)` → EINVAL |
+| io_uring | ✅ compiled in (CONFIG_IO_URING=y) | /proc/config.gz — seccomp stance: **deny by default** (see ADR when written) |
+| KVM | ❌ no /dev/kvm | Tier 3 (microVM) not implementable here; remedy below |
+| AppArmor | off (`/sys/module/apparmor/parameters/enabled` = N) | informational |
+
+## System changes made by the agent (all inside the disposable WSL distro)
+
+1. `wsl --install Ubuntu-24.04 --no-launch` — the distro itself.
+2. apt: `build-essential curl git pkg-config libseccomp-dev libseccomp2
+   ca-certificates uidmap fuse3`.
+3. rustup for user `dev` (stable toolchain).
+4. `/etc/sudoers.d/dev` — `dev ALL=(ALL) NOPASSWD:ALL` (dev convenience only).
+5. `/etc/systemd/system/user@.service.d/delegate.conf` — `Delegate=cpu memory pids io`
+   (adds io delegation; default user slices delegate cpu memory pids only).
+6. `loginctl enable-linger dev` — keeps `user@1000.service` (and its delegated
+   cgroup subtree) alive across WSL session churn.
+
+Nothing outside the WSL distro and the repository directory was modified.
+The `.wsl/` scratch directory in the repo root holds probe scripts and is
+gitignored.
+
+## Verified syscall constants (x86_64, from Ubuntu 6.8 linux-libc-dev headers + empirical C probes on this kernel)
+
+| Constant | Value |
+|---|---|
+| SYS_landlock_create_ruleset | 444 |
+| SYS_seccomp / SECCOMP_GET_ACTION_AVAIL / SECCOMP_RET_KILL_PROCESS | 317 / 2 / 0x80000000 |
+| SYS_pidfd_open | 434 |
+| SYS_close_range / CLOSE_RANGE_UNSHARE | 436 / 2 |
+| LANDLOCK_CREATE_RULESET_VERSION | 1 (1U << 0) |
+| CGROUP2_SUPER_MAGIC | 0x63677270 |
+
+## Remedies for missing capabilities (what `cara doctor` prints)
+
+- **KVM absent (Tier 3)**: on Windows 11, `%UserProfile%\.wslconfig` with
+  `[wsl2]` section and `nestedVirtualization=true`, then `wsl --shutdown`.
+  TODO(verify): whether this host/BIOS supports it. Tier 1/2 unaffected.
+- **No cgroup delegation** (typical WSL/SSH): `sudo loginctl enable-linger $USER`
+  plus the `user@.service` drop-in above, then re-login. Exact copy-paste
+  remedy lives in `cara-native` `check_delegation`.
+- **Unprivileged userns denied** (typical CI containers, hardened distros):
+  `sysctl kernel.unprivileged_userns_clone=1` (Debian/Ubuntu),
+  `kernel.apparmor_restrict_unprivileged_userns=0` (Ubuntu 23.10+), or run
+  inside a userns-capable environment. Carapace fails closed without it.
+
+## Build/check entry point
+
+From the repository root **inside WSL**:
+
+```sh
+bash scripts/check.sh   # fmt --check + clippy -D warnings + test --workspace, strict env tests on
+```
+
+From the Windows side, a quick single command:
+
+```
+wsl -d Ubuntu-24.04 -u dev -- bash -lc "bash /mnt/p/Carapace/scripts/check.sh"
+```
+
+## Quirks learned
+
+- Git-Bash → wsl.exe mangles shell variables containing `=` + paths; scripts
+  are written to files and executed instead (probe scripts in `.wsl/`).
+- WSL sessions are not systemd logind sessions by default; without lingering,
+  `user@1000.service` and its delegated cgroup subtree may not exist when
+  tests run — lingering fixes this.
+- `/proc/config.gz` is available on the WSL kernel — doctor and docs use it
+  for kernel-config claims.
