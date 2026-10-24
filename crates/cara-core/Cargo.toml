@@ -1,0 +1,12 @@
+[package]
+name = "carapace-core"
+description = "Frontend-agnostic sandbox abstractions: specs, policies, results, doctor model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

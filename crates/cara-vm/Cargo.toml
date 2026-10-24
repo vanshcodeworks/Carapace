@@ -1,0 +1,10 @@
+[package]
+name = "carapace-vm"
+description = "Tier 3 sandbox backend: microVM (Firecracker or libkrun, milestone C10)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+carapace-core = { workspace = true }

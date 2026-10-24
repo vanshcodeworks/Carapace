@@ -1,0 +1,10 @@
+[package]
+name = "carapace-wasm"
+description = "Tier 2 sandbox backend: Wasmtime with fuel and memory caps (milestone C9)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+carapace-core = { workspace = true }

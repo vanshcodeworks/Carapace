@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/cara-core",
+    "crates/cara-sys",
+    "crates/cara-native",
+    "crates/cara-wasm",
+    "crates/cara-vm",
+    "crates/cara-cli",
+    "crates/cara-mcp",
+    "crates/cara-escape-tests",
+]
+exclude = ["fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/vanshgoyal000/Carapace"
+rust-version = "1.85"
+
+[workspace.dependencies]
+carapace-core = { version = "0.1.0", path = "crates/cara-core" }
+carapace-sys = { version = "0.1.0", path = "crates/cara-sys" }
+carapace-native = { version = "0.1.0", path = "crates/cara-native" }
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+clap = { version = "4", features = ["derive", "string"] }
+
+[profile.release]
+lto = "thin"
+strip = "debuginfo"

@@ -1,0 +1,17 @@
+[package]
+name = "carapace-cli"
+description = "The `cara` command line: run untrusted code in a locked-down sandbox"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "cara"
+path = "src/main.rs"
+
+[dependencies]
+carapace-core = { workspace = true }
+carapace-native = { workspace = true }
+clap = { workspace = true }
+serde_json = { workspace = true }

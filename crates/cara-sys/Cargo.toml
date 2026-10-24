@@ -1,0 +1,10 @@
+[package]
+name = "carapace-sys"
+description = "Raw Linux syscall wrappers for Carapace (the only crate with raw-syscall unsafe)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+libc = { workspace = true }

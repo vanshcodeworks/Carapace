@@ -1,0 +1,10 @@
+[package]
+name = "carapace-mcp"
+description = "MCP server exposing run_code/explain_result tools (milestone C7)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+carapace-core = { workspace = true }

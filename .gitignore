@@ -1,0 +1,10 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Machine-local WSL dev environment (see docs/agent/ENV.md)
+/.wsl/
+
+# OS
+.DS_Store
+Thumbs.db

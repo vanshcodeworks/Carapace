@@ -1,0 +1,13 @@
+# Normalize on LF in the working tree and index. This repository is developed
+# and built on Linux (WSL2); CRLF in shell scripts or test fixtures breaks them.
+* text=auto eol=lf
+*.sh text eol=lf
+*.rs text eol=lf
+*.toml text eol=lf
+*.md text eol=lf
+*.c text eol=lf
+*.py text eol=lf
+*.lock text eol=lf
+*.png binary
+*.jpg binary
+*.gz binary

@@ -1,0 +1,12 @@
+[package]
+name = "carapace-native"
+description = "Tier 1 native sandbox backend: namespaces, cgroups, seccomp, Landlock (Linux only)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+carapace-core = { workspace = true }
+carapace-sys = { workspace = true }
+libc = { workspace = true }

@@ -1,0 +1,13 @@
+[package]
+name = "carapace-escape-tests"
+description = "Hostile payload catalog: every attack Carapace claims to stop, as a test (milestone C6)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+carapace-core = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
