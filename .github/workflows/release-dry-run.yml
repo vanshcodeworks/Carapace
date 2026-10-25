@@ -1,0 +1,48 @@
+# Release dry run: the mechanical gate behind docs/release.md. Builds the
+# release binary, runs the test suite, checks that carapace-core packages,
+# and uploads artifacts for inspection. It publishes NOTHING — tagging,
+# cargo publish, and GitHub releases are human actions (docs/release.md,
+# CONTRIBUTING.md rule 3).
+name: Release dry run
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release-dry-run:
+    name: build + test + package
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Note: hosted runners restrict unprivileged user namespaces, so
+      # environment-dependent tests self-skip (CARA_STRICT_ENV_TESTS unset).
+      # Same limitation as CI; a green run here is necessary, not
+      # sufficient — the full strict loop is scripts/check.sh on a
+      # Tier-1-ready machine (docs/release.md step 1).
+      - name: Build release binary
+        run: cargo build --release -p carapace-cli
+      - name: Test
+        run: cargo test --workspace
+      # carapace-core only: it is the one crate whose dependency closure is
+      # entirely registry-based. Publishing the others depends on the
+      # path-only vs publish decision for carapace-sys/-native
+      # (docs/release.md step 6, decision point).
+      - name: Publish dry run (carapace-core)
+        run: cargo publish --dry-run -p carapace-core
+      - name: Checksums
+        run: sha256sum target/release/cara | tee sha256sums.txt
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cara-release-dry-run
+          path: |
+            target/release/cara
+            sha256sums.txt
+          if-no-files-found: error

@@ -378,8 +378,13 @@ pub fn parse_bytes(s: &str, what: &str) -> Result<u64, PolicyError> {
         }
     };
     let total = value * mult as f64;
-    if total > u64::MAX as f64 {
-        return Err(PolicyError::Invalid(format!("{what}: size too large")));
+    // Cap: 1 TiB. Larger sizes are policy errors (the spec_limits fuzzer
+    // showed huge inputs slipping through the old float compare).
+    const MAX: f64 = (1u64 << 40) as f64;
+    if !total.is_finite() || total > MAX {
+        return Err(PolicyError::Invalid(format!(
+            "{what}: size exceeds the 1 TiB policy cap"
+        )));
     }
     Ok(total as u64)
 }
@@ -432,13 +437,26 @@ pub fn parse_duration(s: &str, what: &str) -> Result<Duration, PolicyError> {
                 )));
             }
         };
-        total += Duration::from_millis(value * mult);
+        // checked_mul: huge values must error, not silently wrap in
+        // release builds (found by the spec_limits fuzz target).
+        let millis = value
+            .checked_mul(mult)
+            .ok_or_else(|| PolicyError::Invalid(format!("{what}: duration too large")))?;
+        total += Duration::from_millis(millis);
         rest = next;
         any = true;
     }
     if !any || total.is_zero() {
         return Err(PolicyError::Invalid(format!(
             "{what}: {s:?} must be a positive duration"
+        )));
+    }
+    // Cap: 90 days per duration value (a policy asking for more is a
+    // mistake, not a feature).
+    const MAX: Duration = Duration::from_secs(90 * 24 * 3600);
+    if total > MAX {
+        return Err(PolicyError::Invalid(format!(
+            "{what}: duration exceeds the 90-day policy cap"
         )));
     }
     Ok(total)
@@ -544,6 +562,15 @@ language = "python3.12"
         assert_eq!(parse_bytes("8MiB", "t").unwrap(), 8 * 1024 * 1024);
         assert!(parse_bytes("8X", "t").is_err());
         assert!(parse_bytes("-8K", "t").is_err());
+    }
+
+    #[test]
+    fn fuzz_found_inputs_are_rejected() {
+        // Regression: the spec_limits fuzzer produced these.
+        assert!(parse_duration("8888888888888m", "t").is_err());
+        assert!(parse_duration("18446744073709551615s", "t").is_err());
+        assert!(parse_bytes("9999999999999999999", "t").is_err());
+        assert!(parse_bytes("88888888888888888888", "t").is_err());
     }
 
     #[test]
