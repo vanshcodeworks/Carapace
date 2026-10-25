@@ -128,9 +128,8 @@ fn rt_refer_cross_hierarchy_denied() {
         eprintln!("skipping");
         return;
     }
-    let out = out(
-        "echo x > /work/f; mv /work/f /etc/evil 2>/dev/null; echo rc=$?; ls /etc/evil 2>&1",
-    );
+    let out =
+        out("echo x > /work/f; mv /work/f /etc/evil 2>/dev/null; echo rc=$?; ls /etc/evil 2>&1");
     assert!(
         out.contains("rc=1") || out.contains("No such file"),
         "cross-hierarchy rename must fail: {out}"
@@ -182,11 +181,9 @@ fn rt_dual_stream_flood_killed_fast() {
         return;
     }
     let start = std::time::Instant::now();
-    let r = run(
-        sh("while :; do echo out; echo err 1>&2; done")
-            .max_output(32 * 1024)
-            .timeout(Duration::from_secs(30)),
-    );
+    let r = run(sh("while :; do echo out; echo err 1>&2; done")
+        .max_output(32 * 1024)
+        .timeout(Duration::from_secs(30)));
     assert_eq!(
         r.kill_reason,
         Some(carapace_core::KillReason::OutputOverflow),
@@ -252,11 +249,9 @@ fn rt_slow_drip_killed_by_timeout() {
         eprintln!("skipping");
         return;
     }
-    let r = run(
-        sh("while :; do echo drip; sleep 0.4; done")
-            .max_output(1024 * 1024)
-            .timeout(Duration::from_millis(900)),
-    );
+    let r = run(sh("while :; do echo drip; sleep 0.4; done")
+        .max_output(1024 * 1024)
+        .timeout(Duration::from_millis(900)));
     assert_eq!(
         r.kill_reason,
         Some(carapace_core::KillReason::Timeout),

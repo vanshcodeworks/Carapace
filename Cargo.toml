@@ -23,6 +23,7 @@ rust-version = "1.85"
 carapace-core = { version = "0.1.0", path = "crates/cara-core" }
 carapace-sys = { version = "0.1.0", path = "crates/cara-sys" }
 carapace-native = { version = "0.1.0", path = "crates/cara-native" }
+carapace-mcp = { version = "0.1.0", path = "crates/cara-mcp" }
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

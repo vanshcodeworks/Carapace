@@ -71,3 +71,9 @@ Legend: [C#] milestone, [RT] red-team, [A] audit, [H] hardening, [D] docs.
   grep docs for unqualified "secure", check unsafe blocks have comments).
 - [RT] Every 10th cycle: red-team cycle.
 - [D] Keep README claims generated-from-tests only.
+
+## Cycle 6 additions
+- [C6] redteam.rs probes (rename REFER cross-hierarchy, TIOCSTI, sethostname,
+  clock_settime, chroot, mknod, /proc/sys write, huge-argv E2BIG, zombie
+  hoard, dual-stream flood, invalid-UTF8 args) — running now.
+- [C8] bench.rs exists; warm numbers after zygote pool.

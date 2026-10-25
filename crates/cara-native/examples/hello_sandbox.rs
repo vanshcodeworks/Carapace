@@ -15,12 +15,16 @@ fn main() -> std::process::ExitCode {
     // The doctor gate: fail closed when this host cannot isolate.
     let env = backend.environment();
     for check in &env.checks {
-        println!("{:>5}  {}", match check.status {
-            carapace_core::Status::Ok => "ok",
-            carapace_core::Status::Warn => "warn",
-            carapace_core::Status::Fail => "FAIL",
-            carapace_core::Status::Info => "info",
-        }, check.name);
+        println!(
+            "{:>5}  {}",
+            match check.status {
+                carapace_core::Status::Ok => "ok",
+                carapace_core::Status::Warn => "warn",
+                carapace_core::Status::Fail => "FAIL",
+                carapace_core::Status::Info => "info",
+            },
+            check.name
+        );
     }
     if !env.ready() {
         eprintln!("\nThis host cannot run the native sandbox safely (see above).");
@@ -29,7 +33,10 @@ fn main() -> std::process::ExitCode {
 
     // Define what to run and how to limit it.
     let spec = SandboxSpec::new("/bin/sh")
-        .args(["-c", "echo hello from inside the sandbox; id -u; df -h /work | tail -1"])
+        .args([
+            "-c",
+            "echo hello from inside the sandbox; id -u; df -h /work | tail -1",
+        ])
         .env("PATH", "/usr/bin:/bin")
         .timeout(Duration::from_secs(10));
 

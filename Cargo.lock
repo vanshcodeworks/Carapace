@@ -57,6 +57,7 @@ name = "carapace-cli"
 version = "0.1.0"
 dependencies = [
  "carapace-core",
+ "carapace-mcp",
  "carapace-native",
  "clap",
  "serde_json",
@@ -77,6 +78,8 @@ name = "carapace-escape-tests"
 version = "0.1.0"
 dependencies = [
  "carapace-core",
+ "carapace-native",
+ "serde",
  "serde_json",
 ]
 
@@ -85,6 +88,9 @@ name = "carapace-mcp"
 version = "0.1.0"
 dependencies = [
  "carapace-core",
+ "carapace-native",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

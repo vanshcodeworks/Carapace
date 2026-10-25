@@ -45,9 +45,7 @@ fn bench_one(
 pub fn run_benchmark(n: usize) -> Result<String, String> {
     let backend = NativeBackend::new();
     if !backend.environment().ready() {
-        return Err(
-            "environment not ready for the native sandbox — run `cara doctor`".to_string(),
-        );
+        return Err("environment not ready for the native sandbox — run `cara doctor`".to_string());
     }
     let kernel = std::fs::read_to_string("/proc/sys/kernel/osrelease")
         .unwrap_or_default()

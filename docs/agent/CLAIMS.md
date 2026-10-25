@@ -50,3 +50,18 @@ test lands at listed milestone.
 | network mode full permits sockets; none denies (seccomp + netns) | hardening.rs socket test + seccomp_profile filter_for branch | ⏳ full-mode e2e TODO(test) C6 |
 | cara run --json has a stable report schema | run_ui json tests (kill_reason strings) | verified C5 |
 | cara run exit codes documented (0/2/3/4) | exit_codes.rs + cli tests | verified C5 |
+
+## C8 pre-benchmarks (cold path, cycle 6 — reference machine WSL2 kernel 6.18.54.1, Ubuntu 24.04.5)
+| Claim | Basis | Status |
+|---|---|---|
+| Cold start (full stack: 7 namespaces, rootfs+pivot, cgroup attach, Landlock, seccomp, exec): /bin/true median 6.71ms p95 9.27ms; /bin/sh 6.36ms p95 8.54ms; python3 -c pass 24.91ms p95 45.43ms (n=100 each) | crates/cara-native/examples/bench.rs output cycle 6 | ✅ measured cold; warm (pool) pending C8 |
+
+## C6 claims (added cycle 6/7)
+| Claim | Basis | Status |
+|---|---|---|
+| "What Carapace stops" README table is generated from the tested catalog | carapace-escape-tests table::markdown + README section | verified C6 |
+| All 20 escape payloads exhibit their documented safe outcome through the real sandbox | tests/suite.rs 21 tests green (bridged run 4.25s) | verified C6 |
+| No host env var leaks into the sandbox (PATH shared by design) | suite.rs env_leak (asserts against live host env) | verified C6 |
+| setuid bits are inert: CapEff=0, NoNewPrivs=1, uid changes EPERM | suite.rs setuid_escalation | verified C6 |
+| Red-team: chroot/mknod/sethostname//proc/sys/cross-hierarchy-rename denied; zombie hoards + dual floods + slow-drip contained | tests/redteam.rs 11 tests green | verified C6 |
+| Cold start: /bin/true median 6.71ms p95 9.27ms (n=100, WSL2 6.18) | examples/bench.rs | verified (machine-specific) |

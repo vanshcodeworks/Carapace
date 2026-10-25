@@ -53,6 +53,9 @@ enum Cmd {
         #[arg(long, default_value_t = 100)]
         runs: usize,
     },
+
+    /// Serve the MCP (Model Context Protocol) server on stdio.
+    Mcp,
 }
 
 #[derive(Subcommand)]
@@ -81,6 +84,7 @@ fn main() -> ExitCode {
             PolicyCmd::Check { file, json } => policy_check(&file, json),
             PolicyCmd::Explain { file } => policy_explain(&file),
         },
+        Cmd::Mcp => mcp_main(),
         Cmd::Bench { runs } => match carapace_native::bench::run_benchmark(runs) {
             Ok(report) => {
                 print!("{report}");
@@ -91,6 +95,20 @@ fn main() -> ExitCode {
                 ExitCode::from(exit_codes::ENV_NOT_READY)
             }
         },
+    }
+}
+
+fn mcp_main() -> ExitCode {
+    use std::io::BufReader;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    let mut server = carapace_mcp::McpServer::new(BufReader::new(stdin.lock()), stdout.lock());
+    match server.serve() {
+        Ok(()) => ExitCode::from(exit_codes::OK),
+        Err(e) => {
+            eprintln!("cara mcp: {e}");
+            ExitCode::from(exit_codes::ENV_NOT_READY)
+        }
     }
 }
 

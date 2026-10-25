@@ -82,3 +82,13 @@ concurrency-limit failures (one agent at a time appears allowed).
 Commands: scripts/check.sh; .wsl/run-full.sh; bind-probe/bind-strace probes.
 Results: full workspace green incl. 6 CLI e2e tests.
 Next: integrate subagent output (C6/C7), then C8.
+
+## Cycle 7 — 2026-10-25 — C6 complete
+Task: escape suite integration + red-team cycle 1 + README table.
+Outcome: DONE @ 3ae2e4d (+ b3501b7 probes). 21 suite tests + 11 redteam
+tests green bridged. Fixed agent's two test bugs: python stdout buffering
+(flush=True), PEP 538 LC_CTYPE misattributed as leak (now asserts no
+HOST-process env names). README table generated from catalog.
+Concurrency: agents run ONE at a time; docs agent running; MCP agent
+crashed mid-work twice (files in tree, WIP).
+Next: cara bench subcommand (bench.rs ready), MCP integration, C8 pool.
