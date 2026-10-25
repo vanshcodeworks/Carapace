@@ -1,37 +1,35 @@
 # STATE — agent working state (overwritten every cycle)
 
-Last updated: cycle 2 start (2026-10-25), milestone C1 in progress.
+Last updated: cycle 2 done (C1 complete), C2 in progress.
 
-## Current milestone
-C1: rootless namespaces + supervisor (timeout, tree kill, cleanup tests).
+## Done
+- C0 @ 75226dd, C1 @ 9714750 — all green (fmt/clippy/test incl. 9
+  supervisor integration tests, no leftover processes).
+- C1 delivers: rootless namespaces (user/pid/mount/net/ipc/uts/cgroup),
+  pidfd kill of pidns-init (kernel kills whole ns), wall timeout, output
+  caps, subreaper, fail-closed pre-exec handshake (Setup error, never a
+  silent run). Empirical gotchas solved: uid_map needs parent-recorded
+  uid (getuid is overflow inside ns); parent must close pipe write-end
+  copies after clone or EOF never arrives.
 
-## Done (verified green @ commit 75226dd)
-- C0 COMPLETE. Environment: WSL2 Ubuntu 24.04.5, kernel 6.18, userns ✅,
-  cgroup2 delegation (cpu/io/memory/pids at user@1000.service) ✅, Landlock
-  ABI 7 ✅, seccomp ✅, pidfd ✅, close_range ✅, no KVM (Tier 3 stubbed).
-- Workspace: 8 crates compile; fmt+clippy(-D warnings)+test --workspace all
-  green via scripts/check.sh (strict env assertions on).
-- `cara doctor`: 10 measured checks, JSON+human, exit 0/4. WSL quirk
-  handled: non-login processes sit in root-owned /non-systemd cgroup;
-  delegation root falls back to user@<uid>.service slice.
-- Threat model v1, ENV.md, all agent files, README (honest), CI file.
-
-## In progress
-- C1: SandboxSpec/ExitReport/KillReason + Backend trait in cara-core;
-  clone-with-namespaces child (userns maps, setgroups deny) in cara-sys;
-  supervisor with pidfd wait, wall timeout, output caps, subreaper +
-  pid-namespace-init kill; integration tests (exit codes, timeout kill,
-  output overflow kill, fork survival, fail-closed pre-exec, ns isolation).
+## In progress (C2)
+- Child mounts: private-propagation, tmpfs root (size-capped), ro-bind
+  /usr, /dev/{null,zero,urandom,random} binds, minimal /etc, scratch tmpfs
+  /work, pivot_root + MNT_DETACH old root, fresh /proc (own pidns view).
+- Post-pivot self-verification (mount table as expected, no old root).
+- Tests: /etc/passwd is ours; /usr write fails; host paths ENOENT;
+  /proc shows only own tree; python3 hello-world runs.
 
 ## Known bugs / risks
-- C1 sandbox has NO filesystem isolation yet (pivot_root is C2): only
-  self-written benign payloads run through it in tests; no `cara run` CLI
-  exposure until C2+. Documented in child.rs docs.
-- waitid(P_PIDFD) availability in libc crate unverified — fallback waitpid.
+- C1 sandbox has no fs isolation until C2 lands (benign payloads only).
+- After C2: no seccomp/Landlock until C4; /proc mount leaks little but
+  is fresh pidns proc; host /usr bind includes host binaries — acceptable
+  for tier-1 v1 (runtime recipes narrow it later).
 
 ## How to run checks
-From Windows: `wsl -d Ubuntu-24.04 -u dev -- bash /mnt/p/Carapace/scripts/check.sh`
-Commit only when green. Never run hostile payloads outside the sandbox.
+wsl -d Ubuntu-24.04 -u dev -- bash /mnt/p/Carapace/scripts/check.sh
+(bounded with timeout 300 in practice; kill stuck test pids via root if
+a hang reappears — check .wsl/probe-stuck.sh)
 
 ## Last verified commit
-75226dd (C0 docs + Cargo.lock; code in bcecc3a)
+9714750

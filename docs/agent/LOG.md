@@ -11,3 +11,15 @@ rustup; systemd Delegate drop-in + enable-linger; empirical C probes
 (.wsl/probe-syscalls.c) for syscall constants; file writes.
 Results: all probes green; first build pending next cycle.
 Next: run scripts/check.sh, fix until green, commit C0.
+
+## Cycle 2 — 2026-10-25 — C1 complete
+Task: namespace child + supervisor + tests (QUEUE C1 items).
+Outcome: DONE @ 9714750. 9 integration tests green, no leftovers. Two
+empirical fixes: (a) uid_map must use uid captured pre-clone (getuid()
+inside fresh userns = 65534 overflow → EPERM); (b) parent must close its
+pipe write-end copies right after clone, else exec-confirmation EOF and
+output readers hang forever (was: supervisor deadlock with live yes(1)).
+Commands: scripts/check.sh (fmt+clippy+test), single-thread test reruns,
+process autopsies via .wsl/probe-stuck.sh.
+Results: cargo test -p carapace-native: 9/9 ok in 0.92s.
+Next: C2 rootfs/pivot_root (child mount sequence + self-verification).

@@ -60,10 +60,13 @@ impl SandboxSpec {
 pub struct Limits {
     /// Wall-clock time before the tree is killed.
     pub timeout: Duration,
-    /// Combined stdout+stderr byte cap before the tree is killed.
+    /// Per-stream (stdout and stderr each) byte cap before the tree is
+    /// killed.
     pub max_output_bytes: usize,
-    // C3: memory_bytes, cpu_percent/quota, max_processes.
-    // C2: writable scratch size. C5: network mode.
+    /// Size of the writable /work scratch tmpfs inside the sandbox.
+    pub scratch_bytes: u64,
+    // C3: memory_bytes, cpu quota, max_processes.
+    // C4: fsize/nofile rlimits. C5: network mode.
 }
 
 impl Default for Limits {
@@ -71,6 +74,7 @@ impl Default for Limits {
         Self {
             timeout: Duration::from_secs(10),
             max_output_bytes: 8 * 1024 * 1024,
+            scratch_bytes: 64 * 1024 * 1024,
         }
     }
 }

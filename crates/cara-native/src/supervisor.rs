@@ -105,6 +105,17 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         BackendError::Setup(format!("{what}: {e}"))
     };
 
+    // Host-layout validation for the C2 runtime recipe (fail closed BEFORE
+    // cloning: merged-usr with a real /usr tree). Narrow, recipe-driven
+    // rootfs builds replace this in later milestones.
+    for p in ["/usr/bin/sh", "/usr/lib", "/usr/lib64"] {
+        if std::fs::metadata(p).is_err() {
+            return Err(BackendError::Setup(format!(
+                "host runtime layout unsupported: {p} missing (v1 requires a merged-usr host)"
+            )));
+        }
+    }
+
     // Pipes: all CLOEXEC. The child dup2s 0/1/2 (dup2 clears CLOEXEC on the
     // targets — exactly what the payload's stdio needs); every other
     // inherited copy vanishes at exec.
@@ -153,6 +164,13 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         // userns reports the overflow id until the map is written.
         parent_uid: unsafe { libc::getuid() }, // SAFETY: plain getter
         parent_gid: unsafe { libc::getgid() }, // SAFETY: plain getter
+        // tmpfs size options, pre-formatted here so the child never
+        // formats. Root holds /etc, symlinks, empty dirs: 8 MiB is ample.
+        // /work is the payload's writable scratch from the policy.
+        root_size_opt: std::ffi::CString::new(format!("size={}", 8 * 1024 * 1024))
+            .expect("numeric size option has no NULs"),
+        work_size_opt: std::ffi::CString::new(format!("size={}", spec.limits.scratch_bytes))
+            .map_err(|e| setup("scratch size", std::io::Error::other(format!("{e}"))))?,
     });
     let config_ptr = Box::into_raw(config) as *mut libc::c_void;
 
@@ -182,7 +200,9 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
 
     // Post-clone, pre-exec cleanup for any handshake failure below: the
     // child must never be left half-configured (fail closed).
-    let cleanup_err = |what: &str, e: std::io::Error| -> BackendError {
+    let child_pid = spawned.pid;
+    let child_pidfd = spawned.pidfd;
+    let cleanup_err = move |what: &str, e: std::io::Error| -> BackendError {
         kill_and_reap(&spawned);
         unsafe { fork::munmap_stack(stack_base, stack_size) };
         release_config(config_ptr);
@@ -265,8 +285,8 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         .map_err(|e| setup("stderr reader", e))?;
 
     Ok(NativeSandbox {
-        pid: spawned.pid,
-        pidfd: spawned.pidfd,
+        pid: child_pid,
+        pidfd: child_pidfd,
         stack: (stack_base, stack_size),
         config: config_ptr,
         start: Instant::now(),
@@ -307,6 +327,14 @@ fn stage_name(stage: u8) -> &'static str {
         stage::SET_RLIMIT => "rlimits",
         stage::SYNC => "stdio/sync",
         stage::EXEC => "execve",
+        stage::MOUNT_PRIVATE => "mount private",
+        stage::MOUNT_ROOT => "root tmpfs",
+        stage::MOUNT_RUNTIME => "runtime mounts",
+        stage::MOUNT_PROC => "proc mount",
+        stage::PIVOT => "pivot_root",
+        stage::PIVOT_CHDIR => "pivot chdir",
+        stage::PIVOT_DETACH => "pivot detach",
+        stage::VERIFY => "post-pivot verify",
         _ => "unknown",
     }
 }
@@ -378,25 +406,12 @@ impl NativeSandbox {
     }
 
     fn kill_tree(&mut self) {
-        // Primary: kill the PID-namespace init; the kernel then SIGKILLs
-        // everything left in that namespace (ADR-0002).
+        // Kill the PID-namespace init; the kernel then SIGKILLs everything
+        // left in that namespace (ADR-0002). No waitpid(-1) sweep here: a
+        // process hosting several sandboxes concurrently (the test suite,
+        // the future pool) must never reap another sandbox's children.
+        // Escaped descendants are prevented by the PID namespace itself.
         let _ = fork::pidfd_send_signal(self.pidfd, libc::SIGKILL);
-        // Belt and braces: reap reparented escapees (subreaper).
-        self.subreaper_sweep();
-    }
-
-    fn subreaper_sweep(&mut self) {
-        for _ in 0..1024 {
-            let mut status: libc::c_int = 0;
-            let r = unsafe {
-                // SAFETY: waitpid(-1, WNOHANG): non-blocking reap of any
-                // reparented descendant; 0 = none ready.
-                libc::waitpid(-1, &mut status, libc::WNOHANG)
-            };
-            if r <= 0 {
-                break;
-            }
-        }
     }
 
     fn reap(&mut self) -> libc::c_int {
@@ -452,9 +467,6 @@ impl NativeSandbox {
             .and_then(|t| t.join().ok())
             .unwrap_or_default();
 
-        // Final sweep: escaped descendants are zombies reparented to us.
-        self.subreaper_sweep();
-
         ExitReport {
             exit_code,
             signal,
@@ -474,7 +486,7 @@ fn truncate_cap(mut v: Vec<u8>, cap: usize) -> Vec<u8> {
 impl Drop for NativeSandbox {
     fn drop(&mut self) {
         // Safety net: even if wait() was never called, the tree dies and
-        // nothing leaks (pipes, stack, config, zombies).
+        // nothing leaks (pipes, stack, config, zombies, staging dir).
         self.kill_tree();
         let _ = self.reap();
         if let Some(t) = self.stdout_reader.take() {
