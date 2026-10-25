@@ -101,3 +101,19 @@ the handshake. ADR-0005 deferred by measurement (bbc0493) — cold path
 already 6.7-7.0ms median; pool is a ~3ms win for a new attack surface.
 Docs agent still running (owns docs/*.md, SECURITY.md, CONTRIBUTING.md).
 Next: docs integration, C9 Wasm tier.
+
+## Cycle 9 — 2026-10-25 — C8/C10/C12 complete, audit + demo green
+Task: fuzz targets, audit cycle, C10/C12 agent integration, demo.
+Outcome: ALL DONE. Fuzzers: policy_parse 50k, spec_limits 940k,
+report_json 199k runs clean AFTER spec_limits found a REAL bug
+(parse_duration wrap + 16,900-year durations; fixed with checked_mul +
+90-day/1TiB caps + regression tests). Audit: undocumented_unsafe_blocks
+now denied crate-wide. C10: ADR-0006 (libkrun first, sourced) + cara-vm
+KVM-free logic, fails closed both branches. C12: release runbook,
+release-dry-run workflow, demo. Demo: 9/9 PASS bridged (after accepting
+cap-by-denial outcomes for fork/memory scenarios — the caps held by
+DENIAL, which the demo now documents).
+Commands: scripts/check.sh (all green), run-fuzz.sh, run-demo.sh,
+wasm-dbg probes (removed).
+Next: remaining C11 red-team cycles 2-3 as ongoing hardening; C9 TODOs
+(fuel->cpu_time, scratch cap); publish = human action.
