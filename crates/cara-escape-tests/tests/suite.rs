@@ -425,22 +425,33 @@ fn verify(e: &EscapeTest, r: &ExitReport) {
 /// Host /proc scan: no process may carry `needle` in its cmdline after a
 /// sandbox run — the tree must be fully dead, not merely reaped.
 fn assert_no_payload_processes(needle: &str) {
-    std::thread::sleep(Duration::from_millis(200));
-    let dir = std::fs::read_dir("/proc").expect("/proc must be readable");
-    for entry in dir.flatten() {
-        let pid = entry.file_name().to_string_lossy().into_owned();
-        if !pid.chars().all(|c| c.is_ascii_digit()) {
-            continue;
+    // The kernel tears the PID namespace down asynchronously: right after
+    // wait() returns, a not-yet-reaped sibling can still be visible in the
+    // host's /proc for a few milliseconds. That is teardown latency, not
+    // an escape — retry with a settle window before declaring one.
+    for _ in 0..20 {
+        let mut alive = false;
+        let dir = std::fs::read_dir("/proc").expect("/proc must be readable");
+        for entry in dir.flatten() {
+            let pid = entry.file_name().to_string_lossy().into_owned();
+            if !pid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+                continue; // already gone, or not ours to read
+            };
+            let cmd = String::from_utf8_lossy(&cmdline);
+            if cmd.contains(needle) {
+                alive = true;
+                break;
+            }
         }
-        let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
-            continue; // already gone, or not ours to read
-        };
-        let cmd = String::from_utf8_lossy(&cmdline);
-        assert!(
-            !cmd.contains(needle),
-            "payload escaped the sandbox: pid {pid} still alive: {cmd:?}"
-        );
+        if !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(100));
     }
+    panic!("payload escaped the sandbox: {needle:?} processes still alive after 2s");
 }
 
 /// One suite case per catalog entry, in catalog order.

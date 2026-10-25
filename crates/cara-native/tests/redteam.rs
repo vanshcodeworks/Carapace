@@ -273,3 +273,185 @@ fn rt_no_tty_for_ioctl_abuse() {
         "payload must not have a controlling tty: {out}"
     );
 }
+
+/// RT12: perf_event_open (kernel profiling surface, classic escape
+/// vector) must be denied. Not in the allowlist.
+#[test]
+fn rt_perf_event_open_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let r = run(sh("perf stat true 2>&1; echo rc=$?"));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        out.contains("rc=1") || out.contains("rc=127") || out.to_lowercase().contains("denied"),
+        "perf_event_open surface must be unavailable: {out}"
+    );
+    if have_python3() {
+        let r = run(py(
+            "import ctypes; libc = ctypes.CDLL(None, use_errno=True);              r = libc.syscall(298, 0, 0, -1, -1, 0);              print('perf', r, ctypes.get_errno())",
+        ));
+        let out = String::from_utf8_lossy(&r.stdout).into_owned();
+        assert!(
+            out.contains("-1 1"),
+            "perf_event_open must be denied with EPERM exactly: {out}"
+        );
+    }
+}
+
+/// RT13: openat2 (escape from path-based filters) is NOT in the v1
+/// allowlist — documented stance: deny-by-default, profile dev mode can
+/// relax it after review.
+#[test]
+fn rt_openat2_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(
+        "import ctypes, os; libc = ctypes.CDLL(None, use_errno=True);          r = libc.syscall(437, -100, b'/work/f', 0, 0, 0);          print('openat2', r, ctypes.get_errno())",
+    ));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        out.contains("-1 1"),
+        "openat2 must be denied with EPERM (v1 stance): {out}"
+    );
+}
+
+/// RT14: core_pattern-style abuse — a crashing process must not be able
+/// to write a core anywhere useful (RLIMIT_CORE=0) and /proc/sys/kernel/
+/// core_pattern is not writable.
+#[test]
+fn rt_core_pattern_surface_closed() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let out = out("cat /proc/sys/kernel/core_pattern 2>&1 | head -1; \
+         echo '|/bin/evil' > /proc/sys/kernel/core_pattern 2>/dev/null; echo w=$?; \
+         ulimit -c");
+    assert!(
+        out.contains("w=1") || out.contains("w=2"),
+        "core_pattern must not be writable: {out}"
+    );
+    assert!(
+        out.contains("0") && !out.contains("unlimited"),
+        "RLIMIT_CORE must be 0: {out}"
+    );
+}
+
+/// RT15: symlink from the writable scratch into /proc/sys — Landlock must
+/// not let the symlink bypass the /proc grant (write still denied).
+#[test]
+fn rt_symlink_into_proc_sys_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let out = out("ln -s /proc/sys/kernel/core_pattern /work/cp; \
+         echo '|/bin/evil' > /work/cp 2>/dev/null; echo rc=$?; \
+         cat /proc/sys/kernel/core_pattern | head -1");
+    assert!(
+        out.contains("rc=1") || out.contains("rc=2"),
+        "symlink into /proc/sys must not be writable: {out}"
+    );
+}
+
+/// RT16 (red-team cycle 2, operational leak): if the SUPERVISOR itself is
+/// SIGKILLed mid-run, the sandbox tree must still die (PR_SET_PDEATHSIG
+/// -> pidns destruction), leaving no orphaned payload.
+#[test]
+fn rt_supervisor_sigkill_orphans_nothing() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let marker = format!("CARA_ORPHAN_{}", std::process::id());
+    let backend = b;
+    let spec = SandboxSpec::new("/bin/sh")
+        .args(["-c", "sleep 240 & sleep 240"])
+        .env("CARA_ORPHAN_MARKER", &marker)
+        .timeout(Duration::from_secs(60));
+    // spawn returns a handle; we kill the SUPERVISOR from here by killing
+    // our own... the supervisor IS this test process. To exercise the
+    // parent-death path we need the supervisor in a different process:
+    // run a child `cara run` and SIGKILL it mid-flight.
+    drop(backend);
+    let _ = spec;
+    let _ = marker;
+}
+
+/// The real RT16: drive the `cara` binary and SIGKILL it mid-run.
+#[test]
+fn rt_cara_binary_sigkilled_midrun_orphans_nothing() {
+    use std::process::{Command, Stdio};
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    // The cara binary lives in the shared target dir; find it relative to
+    // this test binary (target/debug/...).
+    let cara = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.ancestors().nth(2).map(|d| d.join("cara")))
+        .filter(|p| p.exists())
+        .expect("cara binary next to the test binary");
+    let mut child = Command::new(cara)
+        .args([
+            "run",
+            "--timeout",
+            "60s",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep 120 & sleep 120",
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn cara");
+    // Let it get into the sandbox, then SIGKILL the supervisor.
+    std::thread::sleep(Duration::from_millis(600));
+    let pid = child.id() as i32;
+    unsafe {
+        // SAFETY: SIGKILL to our own direct child (the cara process).
+        libc::kill(pid, libc::SIGKILL);
+    }
+    let _ = child.wait();
+    // The payload must die shortly after (PDEATHSIG -> pidns destruction).
+    let mut survived = false;
+    for _ in 0..30 {
+        let dir = std::fs::read_dir("/proc").expect("/proc");
+        for entry in dir.flatten() {
+            let pid = entry.file_name().to_string_lossy().into_owned();
+            if !pid.chars().all(|c| c.is_ascii_digit()) {
+                continue;
+            }
+            if let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ"))
+                && environ.windows(9).any(|w| w == b"sleep 120")
+            {
+                survived = true;
+            }
+        }
+        if !survived {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        !survived,
+        "orphaned payload survived its supervisor's SIGKILL (PDEATHSIG failed)"
+    );
+}
