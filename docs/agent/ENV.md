@@ -39,13 +39,15 @@ artifacts never touch the slow DrvFs mount — see `scripts/check.sh`.
 ## System changes made by the agent (all inside the disposable WSL distro)
 
 1. `wsl --install Ubuntu-24.04 --no-launch` — the distro itself.
-2. apt: `build-essential curl git pkg-config libseccomp-dev libseccomp2
+2. rustup nightly (profile minimal, for cargo-fuzz) and `cargo install
+   cargo-fuzz --locked`.
+3. apt: `build-essential curl git pkg-config libseccomp-dev libseccomp2
    ca-certificates uidmap fuse3`.
-3. rustup for user `dev` (stable toolchain).
-4. `/etc/sudoers.d/dev` — `dev ALL=(ALL) NOPASSWD:ALL` (dev convenience only).
-5. `/etc/systemd/system/user@.service.d/delegate.conf` — `Delegate=cpu memory pids io`
+4. rustup for user `dev` (stable toolchain).
+5. `/etc/sudoers.d/dev` — `dev ALL=(ALL) NOPASSWD:ALL` (dev convenience only).
+6. `/etc/systemd/system/user@.service.d/delegate.conf` — `Delegate=cpu memory pids io`
    (adds io delegation; default user slices delegate cpu memory pids only).
-6. `loginctl enable-linger dev` — keeps `user@1000.service` (and its delegated
+7. `loginctl enable-linger dev` — keeps `user@1000.service` (and its delegated
    cgroup subtree) alive across WSL session churn.
 
 Nothing outside the WSL distro and the repository directory was modified.
