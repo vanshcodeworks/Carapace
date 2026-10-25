@@ -25,8 +25,66 @@ pub fn run_checks() -> DoctorReport {
         check_seccomp(),
         check_pidfd(),
         check_close_range(),
+        check_runtime_layout(),
+        check_init(),
         check_kvm(),
     ])
+}
+
+/// P1 compat: the v1 rootfs recipe bind-mounts the host /usr read-only and
+/// needs the merged-usr layout (/usr/bin/sh, /usr/lib, /usr/lib64, with
+/// /bin -> usr/bin symlinks created inside the sandbox). Detect a
+/// non-merged layout here (with a remedy) instead of at spawn time.
+fn check_runtime_layout() -> Check {
+    let missing: Vec<&str> = ["/usr/bin/sh", "/usr/lib", "/usr/lib64"]
+        .iter()
+        .filter(|p| std::fs::metadata(p).is_err())
+        .copied()
+        .collect();
+    if missing.is_empty() {
+        Check::ok(
+            "runtime-layout",
+            "Runtime layout",
+            "merged-usr layout present (v1 recipe mounts host /usr read-only)",
+        )
+    } else {
+        Check::fail(
+            "runtime-layout",
+            "Runtime layout",
+            format!("missing: {} (the v1 recipe requires a merged-usr host)",
+                    missing.join(", ")),
+            "Non-merged-/usr distros (some Debian setups, Alpine) and musl              hosts are not supported by the v1 recipe. Options: install the              missing paths (e.g. Debian: usrmerge), or wait for hermetic              runtime rootfs images (backlog P2). Carapace fails closed.",
+        )
+    }
+}
+
+/// P1 compat: cgroup delegation remedies assume systemd (user@<uid>.service
+/// slices, loginctl). Without systemd the remedy differs — say so.
+fn check_init() -> Check {
+    // /proc/1/comm is world-readable even when /proc/1/exe is not (the exe
+    // link needs the same-uid or root); comm gives the task name, which is
+    // enough to distinguish systemd from everything else.
+    let name = std::fs::read_to_string("/proc/1/comm")
+        .map(|s| s.trim().to_string())
+        .map_err(|e| e.to_string());
+    match name {
+        Ok(n) if n.starts_with("systemd") || n == "init" => Check::ok(
+            "init",
+            "Init system",
+            format!("PID 1 is {n} (systemd delegation remedies apply)"),
+        ),
+        Ok(n) => Check::warn(
+            "init",
+            "Init system",
+            format!("PID 1 is {n}, not systemd"),
+            "cgroup delegation remedies in docs/troubleshooting.md assume              systemd (user@<uid>.service slices). Without systemd you must              arrange a delegated cgroup v2 subtree yourself (e.g. manual              chown of a subtree to your uid, then pass it via future              policy support). Carapace fails closed until delegation works.",
+        ),
+        Err(e) => Check::info(
+            "init",
+            "Init system",
+            format!("PID 1 unreadable ({e}); delegation remedies may not apply"),
+        ),
+    }
 }
 
 fn check_kernel() -> Check {
@@ -304,7 +362,7 @@ mod tests {
     #[test]
     fn all_checks_have_substance() {
         let report = run_checks();
-        assert!(report.checks.len() >= 8, "expected a full check suite");
+        assert!(report.checks.len() >= 12, "expected a full check suite");
         for c in &report.checks {
             assert!(!c.id.is_empty() && !c.name.is_empty(), "unnamed check");
             assert!(!c.detail.is_empty(), "check {} lacks detail", c.id);

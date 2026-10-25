@@ -39,8 +39,9 @@ artifacts never touch the slow DrvFs mount — see `scripts/check.sh`.
 ## System changes made by the agent (all inside the disposable WSL distro)
 
 1. `wsl --install Ubuntu-24.04 --no-launch` — the distro itself.
-2. rustup nightly (profile minimal, for cargo-fuzz) and `cargo install
-   cargo-fuzz --locked`.
+2. rustup nightly (profile minimal, for cargo-fuzz); `cargo install
+   cargo-fuzz --locked`; `cargo install cargo-audit cargo-deny --locked`
+   (P0, cycle 12).
 3. apt: `build-essential curl git pkg-config libseccomp-dev libseccomp2
    ca-certificates uidmap fuse3`.
 4. rustup for user `dev` (stable toolchain).

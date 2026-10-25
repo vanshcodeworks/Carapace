@@ -16,7 +16,7 @@ fn doctor_json_is_valid_and_exit_code_is_defined() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).expect("stdout is one JSON object");
     assert!(v["checks"].is_array(), "report has a checks array");
-    assert!(v["checks"].as_array().unwrap().len() >= 8);
+    assert!(v["checks"].as_array().unwrap().len() >= 12);
 }
 
 #[test]
