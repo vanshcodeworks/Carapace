@@ -39,8 +39,11 @@ test or measurement in this repository currently demonstrates it.
    Whether hosted runners pass (userns available? cgroup v2 delegation
    absent → tests self-skip? wasm parity runs?) is unproven. Verify by:
    pushing the branch (human action).
-6. **`cargo audit` / `cargo deny` results** — first run is part of P0
-   (this cycle); findings will be triaged in this file's update.
+6. **~~`cargo audit` / `cargo deny` results~~ DONE (cycle 12)**: cargo
+   audit rc=0 (no advisories, 205 deps); cargo deny all four sections ok
+   after writing an explicit license policy in deny.toml (permissive-only
+   allow list, each entry justified; copyleft fails the check by default).
+   Remaining: add `cargo deny check` to CI (currently local-only).
 7. **musl static build** — documented as a recipe (docs/release.md) with
    explicit TODO(verify); wasmtime/masa deps may not compile for musl.
    Never attempted.
