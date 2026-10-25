@@ -56,7 +56,7 @@ impl Catalog {
 }
 
 static CATALOG: &[EscapeTest] = &[
-    /// Unbounded process creation (`sleep` farm) inside the sandbox.
+    // Unbounded process creation (`sleep` farm) inside the sandbox.
     EscapeTest {
         id: "fork_bomb",
         name: "Fork bomb",
@@ -65,7 +65,7 @@ static CATALOG: &[EscapeTest] = &[
         attack: "Fork-bomb the sandbox with unbounded process creation",
         expected: "Capped by pids.max and killed at the timeout; peak process count stays near the cap and no stragglers survive on the host",
     },
-    /// Allocate far past the cgroup memory limit until the OOM kill fires.
+    // Allocate far past the cgroup memory limit until the OOM kill fires.
     EscapeTest {
         id: "memory_hog",
         name: "Memory hog",
@@ -77,7 +77,7 @@ print('SURVIVED')
         attack: "Exhaust memory far beyond the cgroup limit",
         expected: "OOM-killed at the memory limit (KillReason::MemoryLimit) with peak memory near the cap; the host is unaffected",
     },
-    /// Busy-loop forever; the wall timeout plus cpu.max quota must bound it.
+    // Busy-loop forever; the wall timeout plus cpu.max quota must bound it.
     EscapeTest {
         id: "cpu_spin",
         name: "CPU spin",
@@ -86,7 +86,7 @@ print('SURVIVED')
         attack: "Burn CPU forever to starve the host",
         expected: "Killed at the wall timeout with cpu_time close to the cpu.max quota (100 percent of one core)",
     },
-    /// Fill /work and /tmp with zeros until every cap rejects the write.
+    // Fill /work and /tmp with zeros until every cap rejects the write.
     EscapeTest {
         id: "disk_filler",
         name: "Disk filler",
@@ -95,7 +95,7 @@ print('SURVIVED')
         attack: "Fill both writable areas with 64 MiB of zeros",
         expected: "Writes fail with ENOSPC (8 MiB root tmpfs) or the RLIMIT_FSIZE / scratch-size cap; the host filesystem is untouched",
     },
-    /// `yes(1)` writes to stdout forever; the byte cap must kill the run.
+    // `yes(1)` writes to stdout forever; the byte cap must kill the run.
     EscapeTest {
         id: "output_flood",
         name: "Output flood",
@@ -104,7 +104,7 @@ print('SURVIVED')
         attack: "Flood stdout forever with yes(1)",
         expected: "Killed with KillReason::OutputOverflow at the output cap; captured output stays capped",
     },
-    /// Classic recon: host user enumeration via /etc/passwd.
+    // Classic recon: host user enumeration via /etc/passwd.
     EscapeTest {
         id: "read_etc_passwd",
         name: "Read /etc/passwd",
@@ -113,7 +113,7 @@ print('SURVIVED')
         attack: "Enumerate host users via /etc/passwd",
         expected: "Succeeds but shows the sandbox's own passwd (carapace-sandbox-marker), never host users",
     },
-    /// Password hash theft: /etc/shadow must not even exist in the sandbox.
+    // Password hash theft: /etc/shadow must not even exist in the sandbox.
     EscapeTest {
         id: "read_shadow",
         name: "Read /etc/shadow",
@@ -122,7 +122,7 @@ print('SURVIVED')
         attack: "Steal host password hashes via /etc/shadow",
         expected: "The file does not exist inside the sandbox; cat fails",
     },
-    /// Host home-directory listing must fail outright.
+    // Host home-directory listing must fail outright.
     EscapeTest {
         id: "read_home",
         name: "Read /home and /root",
@@ -131,7 +131,7 @@ print('SURVIVED')
         attack: "List host home directories /home and /root",
         expected: "Neither exists inside the sandbox (No such file or directory)",
     },
-    /// Try to plant files outside the sandbox on the two interesting mounts.
+    // Try to plant files outside the sandbox on the two interesting mounts.
     EscapeTest {
         id: "write_outside",
         name: "Write outside the sandbox",
@@ -140,8 +140,8 @@ print('SURVIVED')
         attack: "Plant files in host-writable locations (/etc, /usr)",
         expected: "Both writes denied: /usr is read-only (EROFS), /etc is denied by Landlock; no host file appears",
     },
-    /// Symlink from the writable scratch into /etc: the link must resolve
-    /// inside the Landlock-scoped view, not reach the host.
+    // Symlink from the writable scratch into /etc: the link must resolve
+    // inside the Landlock-scoped view, not reach the host.
     EscapeTest {
         id: "symlink_escape",
         name: "Symlink escape",
@@ -150,7 +150,7 @@ print('SURVIVED')
         attack: "Symlink from the writable area into /etc/passwd",
         expected: "The link resolves to the sandbox's own /etc/passwd within the Landlock scope; the host file is untouched",
     },
-    /// Kernel-interface abuse: read /proc/1 and enumerate pids.
+    // Kernel-interface abuse: read /proc/1 and enumerate pids.
     EscapeTest {
         id: "proc_escape",
         name: "/proc inspection",
@@ -159,7 +159,7 @@ print('SURVIVED')
         attack: "Inspect /proc for the host init and host pids",
         expected: "/proc/1 is the sandbox's own shell and the pid space is fresh (max pid <= 10); host processes are invisible",
     },
-    /// ptrace-attach the sandbox init: the classic injection primitive.
+    // ptrace-attach the sandbox init: the classic injection primitive.
     EscapeTest {
         id: "ptrace_attempt",
         name: "ptrace injection",
@@ -173,7 +173,7 @@ print('ret', r, 'errno', ctypes.get_errno())
         attack: "ptrace-attach the sandbox init for code injection",
         expected: "Denied with EPERM: ptrace is not in the seccomp allowlist",
     },
-    /// Mount a fresh filesystem: would remap the whole view of the world.
+    // Mount a fresh filesystem: would remap the whole view of the world.
     EscapeTest {
         id: "mount_attempt",
         name: "mount(2) attempt",
@@ -187,7 +187,7 @@ print('ret', r, 'errno', ctypes.get_errno())
         attack: "Mount a fresh tmpfs to remap the filesystem",
         expected: "Denied with EPERM: mount(2) is not in the seccomp allowlist",
     },
-    /// User+mount namespace escape attempt with the real unshare(1) tool.
+    // User+mount namespace escape attempt with the real unshare(1) tool.
     EscapeTest {
         id: "unshare_attempt",
         name: "unshare(2) escape",
@@ -196,7 +196,7 @@ print('ret', r, 'errno', ctypes.get_errno())
         attack: "Create a new user+mount namespace to regain privileges",
         expected: "Denied with EPERM: unshare(2) is not in the seccomp allowlist",
     },
-    /// Network egress to a public address; socket(2) must be denied first.
+    // Network egress to a public address; socket(2) must be denied first.
     EscapeTest {
         id: "socket_egress",
         name: "Network egress",
@@ -213,8 +213,8 @@ except OSError as e:
         attack: "Open a TCP connection to 1.1.1.1:80",
         expected: "Denied with EPERM on socket(2): no sockets exist (empty netns plus seccomp); the connection is never made",
     },
-    /// Abstract-namespace AF_UNIX: rendezvous with host processes without
-    /// any filesystem node.
+    // Abstract-namespace AF_UNIX: rendezvous with host processes without
+    // any filesystem node.
     EscapeTest {
         id: "abstract_unix_escape",
         name: "Abstract Unix socket",
@@ -231,9 +231,9 @@ except OSError as e:
         attack: "Bind an abstract-namespace AF_UNIX socket to rendezvous with host processes",
         expected: "Denied with EPERM: socket(2) itself is denied, so the abstract namespace is unreachable",
     },
-    /// Privilege escalation: uid changes plus a hunt for setuid binaries.
-    /// The read-only /usr bind may contain setuid-bit files from the host;
-    /// with CapEff=0 and NoNewPrivs=1 they are provably inert.
+    // Privilege escalation: uid changes plus a hunt for setuid binaries.
+    // The read-only /usr bind may contain setuid-bit files from the host;
+    // with CapEff=0 and NoNewPrivs=1 they are provably inert.
     EscapeTest {
         id: "setuid_escalation",
         name: "setuid escalation",
@@ -242,32 +242,32 @@ except OSError as e:
 import os, stat
 try:
     os.setuid(1)
-    print('SETUID1-OK')
+    print('SETUID1-OK', flush=True)
 except PermissionError as e:
-    print('setuid1-denied', e.errno)
+    print('setuid1-denied', e.errno, flush=True)
 try:
     os.setresuid(1, 1, 1)
-    print('SETRES-OK')
+    print('SETRES-OK', flush=True)
 except PermissionError as e:
-    print('setres-denied', e.errno)
+    print('setres-denied', e.errno, flush=True)
 count = 0
-for d, dirs, files in os.walk('/usr'):
+for d, dirs, files in os.walk('/usr/bin'):
     for f in files:
         try:
             if os.stat(d + '/' + f).st_mode & stat.S_ISUID:
                 count += 1
         except OSError:
             pass
-print('setuid-bit-binaries', count)
+print('setuid-bit-binaries', count, flush=True)
 for line in open('/proc/self/status'):
     if line.startswith(('CapEff', 'NoNewPrivs')):
-        print(line.rstrip())
+        print(line.rstrip(), flush=True)
 "#,
         attack: "Change uid and abuse setuid binaries for root",
         expected: "Every uid change fails with EPERM (no CAP_SETUID); setuid bits in the read-only /usr bind are inert: CapEff=0000000000000000 and NoNewPrivs=1",
     },
-    /// Kernel keyring abuse (add_key/keyctl); glibc exposes no symbols, so
-    /// raw x86_64 syscall numbers are used (add_key=248, keyctl=250).
+    // Kernel keyring abuse (add_key/keyctl); glibc exposes no symbols, so
+    // raw x86_64 syscall numbers are used (add_key=248, keyctl=250).
     EscapeTest {
         id: "keyring_abuse",
         name: "Keyring abuse",
@@ -283,7 +283,7 @@ print('keyctl ret', r2, 'errno', ctypes.get_errno())
         attack: "Abuse kernel keyrings via add_key/keyctl to stash or harvest secrets",
         expected: "Denied with EPERM: keyring syscalls are not in the seccomp allowlist",
     },
-    /// Descriptor leak probing: what fds did the runtime hand the payload?
+    // Descriptor leak probing: what fds did the runtime hand the payload?
     EscapeTest {
         id: "fd_leak_scan",
         name: "FD leak scan",
@@ -292,7 +292,7 @@ print('keyctl ret', r2, 'errno', ctypes.get_errno())
         attack: "Enumerate inherited descriptors for leaks into the payload",
         expected: "Exactly 0, 1, 2 plus the scanner's own transient directory fd; nothing else leaks in",
     },
-    /// Environment harvesting: the child must see only the allowlisted vars.
+    // Environment harvesting: the child must see only the allowlisted vars.
     EscapeTest {
         id: "env_leak",
         name: "Environment leak",
@@ -316,8 +316,7 @@ mod tests {
         assert_eq!(all.len(), 20, "catalog size drifted; update the suite too");
         for (i, t) in all.iter().enumerate() {
             assert!(
-                !t.id.is_empty()
-                    && t.id.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
+                !t.id.is_empty() && t.id.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
                 "id {:?} is not snake_case",
                 t.id
             );

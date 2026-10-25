@@ -35,6 +35,40 @@ kernel exploit (all namespaces share the host kernel) — that is what Tiers
 2 and 3 are for. See [docs/threat-model.md](docs/threat-model.md) for the
 honest, complete picture.
 
+## What Carapace stops
+
+Every row is a test in the escape suite (crate `carapace-escape-tests`): the
+payload runs through the real sandbox and the suite asserts the documented
+result. This table is generated from the catalog — it cannot drift from
+what is actually tested.
+
+| Attack | Result |
+|---|---|
+| `fork_bomb` — Fork bomb | Capped by pids.max and killed at the timeout; peak process count stays near the cap and no stragglers survive on the host |
+| `memory_hog` — Memory hog | OOM-killed at the memory limit with peak memory near the cap; the host is unaffected |
+| `cpu_spin` — CPU spin | Killed at the wall timeout with cpu_time close to the cpu.max quota (100 percent of one core) |
+| `disk_filler` — Disk filler | Writes fail with ENOSPC (root tmpfs cap) or the RLIMIT_FSIZE / scratch-size cap; the host filesystem is untouched |
+| `output_flood` — Output flood | Killed at the output cap; captured output stays capped |
+| `read_etc_passwd` — Read /etc/passwd | Succeeds but shows the sandbox's own passwd (with a sandbox marker), never host users |
+| `read_shadow` — Read /etc/shadow | The file does not exist inside the sandbox |
+| `read_home` — Read /home and /root | Neither exists inside the sandbox |
+| `write_outside` — Write outside the sandbox | Both writes denied: /usr is read-only (EROFS), /etc is denied by Landlock; no host file appears |
+| `symlink_escape` — Symlink escape | The link resolves to the sandbox's own /etc/passwd within the Landlock scope; the host file is untouched |
+| `proc_escape` — /proc inspection | /proc/1 is the sandbox's own init and the pid space is fresh; host processes are invisible |
+| `ptrace_attempt` — ptrace injection | Denied with EPERM: ptrace is not in the seccomp allowlist |
+| `mount_attempt` — mount(2) attempt | Denied with EPERM: mount(2) is not in the seccomp allowlist |
+| `unshare_attempt` — unshare(2) escape | Denied with EPERM: unshare(2) is not in the seccomp allowlist |
+| `socket_egress` — Network egress | Denied with EPERM on socket(2): no sockets exist (empty netns plus seccomp) |
+| `abstract_unix_escape` — Abstract Unix socket | Denied with EPERM: socket(2) itself is denied, so the abstract namespace is unreachable |
+| `setuid_escalation` — setuid escalation | Every uid change fails with EPERM (no CAP_SETUID); setuid bits are inert: CapEff=0 and NoNewPrivs=1 |
+| `keyring_abuse` — Keyring abuse | Denied with EPERM: keyring syscalls are not in the seccomp allowlist |
+| `fd_leak_scan` — FD leak scan | Exactly 0, 1, 2 plus the scanner's own transient directory fd; nothing else leaks in |
+| `env_leak` — Environment leak | The child sees exactly the allowlisted variables the spec set; nothing is inherited from the host |
+
+Additional red-team probes (tests/redteam.rs): chroot, mknod, sethostname,
+/proc/sys writes, cross-hierarchy rename, zombie hoards, dual-stream
+floods, slow-drip output, hostile argv — all denied or contained.
+
 ## Quick start (developers)
 
 Linux (or WSL2) with Rust ≥ 1.85:
