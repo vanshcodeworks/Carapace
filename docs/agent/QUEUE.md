@@ -77,3 +77,10 @@ Legend: [C#] milestone, [RT] red-team, [A] audit, [H] hardening, [D] docs.
   clock_settime, chroot, mknod, /proc/sys write, huge-argv E2BIG, zombie
   hoard, dual-stream flood, invalid-UTF8 args) — running now.
 - [C8] bench.rs exists; warm numbers after zygote pool.
+
+## Post-C12 backlog (Phase 3 / hardening, not blocking)
+- [C9-todo] fuel->cpu_time estimate, scratch byte cap, shared Engine kill().
+- [C10-todo] libkrun boot path (needs KVM host), shutdown semantics verify.
+- [C11-todo] red-team cycle 3 (protocol says keep going until clean x2).
+- [D] README: replace inline stop-table with build-time generation.
+- [PUB] musl build verify; cargo audit/deny in CI; publish = human.
