@@ -128,7 +128,10 @@ fn write_all(fd: RawFd, buf: &[u8]) -> Result<(), i32> {
             )
         };
         if n < 0 {
-            let e = unsafe { *libc::__errno_location() };
+            let e = unsafe {
+                // SAFETY: per-thread errno pointer, valid to read here.
+                *libc::__errno_location()
+            };
             if e == libc::EINTR {
                 continue;
             }
@@ -154,7 +157,10 @@ fn open_proc(path: &[u8], flags: libc::c_int) -> Result<RawFd, i32> {
         libc::open(buf.as_ptr().cast(), flags, 0)
     };
     if fd < 0 {
-        Err(unsafe { *libc::__errno_location() })
+        Err(unsafe {
+            // SAFETY: per-thread errno pointer, valid to read here.
+            *libc::__errno_location()
+        })
     } else {
         Ok(fd)
     }
@@ -219,7 +225,7 @@ fn wait_for_go(fd: RawFd) -> Result<(), i32> {
         if n == 0 {
             return Err(libc::EPIPE); // parent died or closed without go
         }
-        let e = unsafe { *libc::__errno_location() };
+        let e = errno();
         if e != libc::EINTR {
             return Err(e);
         }
@@ -539,7 +545,7 @@ fn verify_rootfs() -> Result<(), i32> {
         )
     };
     if fd < 0 {
-        return Err(unsafe { *libc::__errno_location() });
+        return Err(errno());
     }
     let un = unsafe {
         // SAFETY: unlink of the file we just created; close regardless.
@@ -553,7 +559,7 @@ fn verify_rootfs() -> Result<(), i32> {
         u
     };
     if un < 0 {
-        return Err(unsafe { *libc::__errno_location() });
+        return Err(errno());
     }
     Ok(())
 }
@@ -694,7 +700,7 @@ fn touch_raw(path: &[u8]) -> Result<(), i32> {
         )
     };
     if fd < 0 {
-        return Err(unsafe { *libc::__errno_location() });
+        return Err(errno());
     }
     errno_of(unsafe {
         // SAFETY: closing the fd we opened.
@@ -712,7 +718,7 @@ fn write_new_file(path: &[u8], contents: &[u8]) -> Result<(), i32> {
         )
     };
     if fd < 0 {
-        return Err(unsafe { *libc::__errno_location() });
+        return Err(errno());
     }
     let r = write_all(fd, contents);
     unsafe {
@@ -722,9 +728,20 @@ fn write_new_file(path: &[u8], contents: &[u8]) -> Result<(), i32> {
     r
 }
 
+/// Reads the thread-local errno. Async-signal-safe (a plain memory read).
+fn errno() -> i32 {
+    unsafe {
+        // SAFETY: __errno_location returns a valid per-thread pointer.
+        *libc::__errno_location()
+    }
+}
+
 fn errno_of(r: libc::c_int) -> Result<(), i32> {
     if r < 0 {
-        Err(unsafe { *libc::__errno_location() })
+        Err(unsafe {
+            // SAFETY: per-thread errno pointer, valid to read here.
+            *libc::__errno_location()
+        })
     } else {
         Ok(())
     }
@@ -790,7 +807,7 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         libc::unshare(cfg.unshare_flags)
     };
     if r < 0 {
-        fail(cfg, stage::NS_SETUP, unsafe { *libc::__errno_location() });
+        fail(cfg, stage::NS_SETUP, errno());
     }
 
     // 3. Deny setgroups, then write uid/gid maps: we are uid 0 inside the
@@ -824,7 +841,7 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         libc::fork()
     };
     if pid2 < 0 {
-        fail(cfg, stage::NS_SETUP, unsafe { *libc::__errno_location() });
+        fail(cfg, stage::NS_SETUP, errno());
     }
     if pid2 == 0 {
         // ---- stage-2: the actual sandbox init ----
@@ -869,7 +886,7 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         if r == pid2 {
             break;
         }
-        let e = unsafe { *libc::__errno_location() };
+        let e = errno();
         if e != libc::EINTR {
             st2 = 128 + libc::SIGKILL; // stage-2 vanished abnormally
             break;
@@ -902,7 +919,7 @@ fn run_payload(cfg: &ChildConfig) -> ! {
         libc::setrlimit(libc::RLIMIT_CORE, &rl)
     };
     if r < 0 {
-        fail(cfg, stage::SET_RLIMIT, unsafe { *libc::__errno_location() });
+        fail(cfg, stage::SET_RLIMIT, errno());
     }
 
     // Build the sandbox filesystem (milestone C2) and pivot into it.
@@ -910,11 +927,14 @@ fn run_payload(cfg: &ChildConfig) -> ! {
 
     // Wire up stdio. dup2 clears FD_CLOEXEC on the targets 0/1/2 — the
     // payload keeps its pipes across exec, and nothing else does.
-    if unsafe { libc::dup2(cfg.stdin_fd, 0) } < 0
-        || unsafe { libc::dup2(cfg.stdout_fd, 1) } < 0
-        || unsafe { libc::dup2(cfg.stderr_fd, 2) } < 0
-    {
-        fail(cfg, stage::SYNC, unsafe { *libc::__errno_location() });
+    // SAFETY: dup2(2) over our own pipe fds; targets 0/1/2 are free.
+    let stdio_ok = unsafe {
+        libc::dup2(cfg.stdin_fd, 0) >= 0
+            && libc::dup2(cfg.stdout_fd, 1) >= 0
+            && libc::dup2(cfg.stderr_fd, 2) >= 0
+    };
+    if !stdio_ok {
+        fail(cfg, stage::SYNC, errno());
     }
 
     // ---- C4 hardening, in the order the threat model documents ----------
@@ -951,7 +971,7 @@ fn run_payload(cfg: &ChildConfig) -> ! {
     }
     // execve returned: total failure. Report and die; the parent returns a
     // Setup error and NO code ran unsandboxed.
-    fail(cfg, stage::EXEC, unsafe { *libc::__errno_location() })
+    fail(cfg, stage::EXEC, errno())
 }
 
 /// Reports a pre-exec failure to the parent and exits. Never returns.
@@ -1002,7 +1022,7 @@ fn harden_rlimits(cfg: &ChildConfig) {
         libc::setrlimit(libc::RLIMIT_FSIZE, &rl)
     };
     if r < 0 {
-        fail(cfg, stage::SET_RLIMIT, unsafe { *libc::__errno_location() });
+        fail(cfg, stage::SET_RLIMIT, errno());
     }
     let rl = libc::rlimit {
         rlim_cur: 256,
@@ -1013,7 +1033,7 @@ fn harden_rlimits(cfg: &ChildConfig) {
         libc::setrlimit(libc::RLIMIT_NOFILE, &rl)
     };
     if r < 0 {
-        fail(cfg, stage::SET_RLIMIT, unsafe { *libc::__errno_location() });
+        fail(cfg, stage::SET_RLIMIT, errno());
     }
 }
 
@@ -1057,7 +1077,7 @@ fn drop_capabilities(cfg: &ChildConfig) {
         )
     };
     if r < 0 {
-        fail(cfg, stage::CAPS_DROP, unsafe { *libc::__errno_location() });
+        fail(cfg, stage::CAPS_DROP, errno());
     }
 }
 
@@ -1067,9 +1087,7 @@ fn set_no_new_privs(cfg: &ChildConfig) {
         libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64)
     };
     if r < 0 {
-        fail(cfg, stage::NO_NEW_PRIVS, unsafe {
-            *libc::__errno_location()
-        });
+        fail(cfg, stage::NO_NEW_PRIVS, errno());
     }
 }
 
@@ -1116,7 +1134,10 @@ fn apply_landlock(cfg: &ChildConfig) {
             )
         };
         if fd < 0 {
-            let e = unsafe { *libc::__errno_location() };
+            let e = unsafe {
+                // SAFETY: per-thread errno pointer, valid to read here.
+                *libc::__errno_location()
+            };
             unsafe {
                 // SAFETY: closing the ruleset fd on the error path.
                 libc::close(rs);

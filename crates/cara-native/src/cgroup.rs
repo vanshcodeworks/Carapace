@@ -32,7 +32,8 @@ pub fn delegated_root() -> Option<PathBuf> {
             }
         }
     }
-    let uid = unsafe { libc::getuid() }; // SAFETY: plain getter
+    // SAFETY: plain getter with no failure mode.
+    let uid = unsafe { libc::getuid() };
     candidates.push(PathBuf::from(format!(
         "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
     )));
@@ -74,7 +75,8 @@ fn own_cgroup_dir() -> Option<PathBuf> {
 pub fn attach_capable_root() -> Option<PathBuf> {
     let root = delegated_root()?;
     // Fork a child that stays alive while we try the attach.
-    let pid = unsafe { libc::fork() }; // SAFETY: probe context
+    // SAFETY: probe context; the child branch only sleeps then _exits.
+    let pid = unsafe { libc::fork() };
     if pid < 0 {
         return None;
     }
@@ -312,7 +314,8 @@ mod tests {
         }
         let root = delegated_root().expect("delegated root");
         // Fork a child that stays alive while we exercise the leaf.
-        let pid = unsafe { libc::fork() }; // SAFETY: probe context
+        // SAFETY: probe context; the child branch only sleeps then _exits.
+        let pid = unsafe { libc::fork() };
         assert!(pid >= 0);
         if pid == 0 {
             unsafe {
@@ -325,9 +328,11 @@ mod tests {
         let leaf = match CgroupLeaf::create(&root, &limits, pid) {
             Ok(l) => l,
             Err(e) => {
-                unsafe { libc::kill(pid, libc::SIGKILL) }; // SAFETY: our child
+                // // SAFETY: our child
+                unsafe { libc::kill(pid, libc::SIGKILL) };
                 let mut st = 0;
-                unsafe { libc::waitpid(pid, &mut st, 0) }; // SAFETY: our child
+                // // SAFETY: our child
+                unsafe { libc::waitpid(pid, &mut st, 0) };
                 panic!("leaf create failed: {e}");
             }
         };
@@ -346,7 +351,8 @@ mod tests {
         // The child is inside the leaf: cgroup.kill must terminate it.
         leaf.kill();
         let mut st = 0;
-        unsafe { libc::waitpid(pid, &mut st, 0) }; // SAFETY: our child
+        // // SAFETY: our child
+        unsafe { libc::waitpid(pid, &mut st, 0) };
         assert!(libc::WIFSIGNALED(st));
         // Now the leaf is empty and must be removable.
         let path = leaf.path().to_path_buf();

@@ -183,8 +183,12 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         }
         fd
     };
+    // SAFETY: each fd is open, exclusively ours, and not used again after
+    // the File takes ownership.
     let stdout_file = unsafe { fd_owned_file(stdout_rd) };
+    // SAFETY: as above.
     let stderr_file = unsafe { fd_owned_file(stderr_rd) };
+    // SAFETY: as above.
     let mut status_file = unsafe { fd_owned_file(status_rd) };
 
     // argv/env as CStrings now — the children must not allocate.
@@ -219,8 +223,14 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         stderr_fd: stderr_wr,
         // Capture BEFORE fork: inside the new userns getuid() reports the
         // overflow id until the map is written.
-        parent_uid: unsafe { libc::getuid() }, // SAFETY: plain getter
-        parent_gid: unsafe { libc::getgid() }, // SAFETY: plain getter
+        parent_uid: unsafe {
+            // SAFETY: plain getter with no failure mode.
+            libc::getuid()
+        },
+        parent_gid: unsafe {
+            // SAFETY: plain getter with no failure mode.
+            libc::getgid()
+        },
         // tmpfs size options, pre-formatted here so the children never
         // format. Root holds /etc, symlinks, empty dirs: 8 MiB is ample.
         root_size_opt: std::ffi::CString::new(format!("size={}", 8 * 1024 * 1024))
@@ -327,6 +337,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         }
     }
 
+    // SAFETY: result_rd is open and exclusively ours.
     let mut result_file = unsafe { fd_owned_file(result_rd) };
     let (overflow_rd, overflow_wr) = pipe2_cloexec().map_err(|e| setup("overflow pipe", e))?;
     // Handshake (two pipes, unambiguous):
@@ -362,6 +373,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
             }
         }
     }
+    // SAFETY: `got` holds exactly size_of::<ChildError>() valid bytes.
     let notice: ChildError = unsafe { std::ptr::read_unaligned(got.as_ptr() as *const ChildError) };
     if notice.stage != msg::PID2_NOTICE {
         return Err(spawn_cleanup(
@@ -402,6 +414,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         match status_file.read(&mut pre) {
             Ok(0) => break, // exec happened
             Ok(n) if n == std::mem::size_of::<ChildError>() => {
+                // SAFETY: `pre` holds exactly size_of::<ChildError>() valid bytes.
                 let report: ChildError =
                     unsafe { std::ptr::read_unaligned(pre.as_ptr() as *const ChildError) };
                 let stage_name = stage_name(report.stage);
@@ -746,6 +759,7 @@ impl NativeSandbox {
                 }
             }
             if off == fwd.len() {
+                // SAFETY: `fwd` holds exactly size_of::<ChildError>() valid bytes.
                 let m: ChildError =
                     unsafe { std::ptr::read_unaligned(fwd.as_ptr() as *const ChildError) };
                 if m.stage == msg::EXIT_FORWARD {

@@ -4,6 +4,8 @@
 //! to running unsandboxed.
 
 #![cfg(target_os = "linux")]
+// Same rule as cara-sys: every unsafe block carries a SAFETY comment.
+#![deny(clippy::undocumented_unsafe_blocks)]
 
 pub mod backend;
 pub mod bench;

@@ -30,7 +30,10 @@ pub fn run_checks() -> DoctorReport {
 }
 
 fn check_kernel() -> Check {
-    let mut uts: libc::utsname = unsafe { std::mem::zeroed() };
+    let mut uts: libc::utsname = unsafe {
+        // SAFETY: utsname is a plain POD C struct; a zeroed value is valid.
+        std::mem::zeroed()
+    };
     // SAFETY: uname(2) with a valid, zero-initialized utsname struct.
     let ret = unsafe { libc::uname(&mut uts) };
     if ret != 0 {
