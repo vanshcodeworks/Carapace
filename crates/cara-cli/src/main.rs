@@ -45,6 +45,14 @@ enum Cmd {
         #[command(subcommand)]
         cmd: PolicyCmd,
     },
+
+    /// Measure sandbox cold-start latency (median + p95, machine context
+    /// printed alongside — quote numbers only together with it).
+    Bench {
+        /// Runs per case.
+        #[arg(long, default_value_t = 100)]
+        runs: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -72,6 +80,16 @@ fn main() -> ExitCode {
         Cmd::Policy { cmd } => match cmd {
             PolicyCmd::Check { file, json } => policy_check(&file, json),
             PolicyCmd::Explain { file } => policy_explain(&file),
+        },
+        Cmd::Bench { runs } => match carapace_native::bench::run_benchmark(runs) {
+            Ok(report) => {
+                print!("{report}");
+                ExitCode::from(exit_codes::OK)
+            }
+            Err(e) => {
+                eprintln!("cara bench: {e}");
+                ExitCode::from(exit_codes::ENV_NOT_READY)
+            }
         },
     }
 }

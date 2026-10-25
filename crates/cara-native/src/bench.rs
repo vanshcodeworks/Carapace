@@ -4,6 +4,7 @@
 //! Everything here measures the REAL spawn→exit path. Numbers are only
 //! meaningful with the machine context printed alongside (kernel + OS).
 
+use crate::NativeBackend;
 use carapace_core::{Backend, SandboxSpec};
 use std::time::{Duration, Instant};
 

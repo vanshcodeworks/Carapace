@@ -6,6 +6,7 @@
 #![cfg(target_os = "linux")]
 
 pub mod backend;
+pub mod bench;
 pub mod cgroup;
 pub mod child;
 pub mod doctor;
