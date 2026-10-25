@@ -1,6 +1,6 @@
 # ADR-0005: Zygote pool and cold/warm start strategy
 
-Date: 2026-10-25 · Status: accepted (design; implementation in C8) · Milestone: C8
+Date: 2026-10-25 · Status: accepted as DESIGN; implementation DEFERRED by measurement · Milestone: C8 (re-evaluated cycle 7)
 
 ## Context
 Current cold start (measured on the reference dev env, cycle 6, before
@@ -58,3 +58,30 @@ to reuse.
 - The cold path stays the reference implementation; the pool is a wrapper,
   not a fork of the logic — the child steps are shared code.
 - Fuzz/property tests for the command-socket protocol (C8 fuzz targets).
+
+## Re-evaluation (cycle 7, measured)
+
+The cold path landed faster than the design assumed: median 6.7–7.0 ms,
+p95 8.5–9.3 ms for the FULL isolation stack (n=100, reference machine —
+see `cara bench`). The pool could hide roughly the unshare+rootfs+Landlock
+share (~3–4 ms) but requires:
+
+- a command-socket protocol into a forked, no-allocation child (config
+  must be read into pre-mmap'd buffers and parsed without allocation —
+  serde is out), and
+- per-run cgroup attach to move INTO the zygote (nsdelegate constrains
+  this to same-subtree contexts; another delegation-shaped edge case).
+
+That is a new attack surface and a new failure-mode class for a ~3 ms win
+on a path that is already two orders of magnitude below interpreter
+startup (python3 ≈ 22 ms where the interpreter itself dominates).
+
+**Decision: defer implementation.** Re-trigger conditions (any one):
+- cold p95 regresses above 15 ms on the reference machine;
+- a workload profile shows sandbox-setup CPU dominating a real user's
+  loop (agent tool-call telemetry, opt-in, local only);
+- per-profile pools become necessary (multiple seccomp profiles in
+  demand), making the protocol worth building once for several wins.
+
+`cara bench` remains the arbiter. The design above stands for whoever
+picks this up.
