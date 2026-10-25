@@ -129,3 +129,13 @@ green; full workspace green. Fuzz-found policy caps regression-tested.
 Commands: run-rt.sh, run-full.sh, scripts/check.sh.
 Next: FINAL_REPORT; remaining backlog = wasm TODOs, libkrun boot path,
 publish (human).
+
+## Cycle 11 — 2026-10-25 — C11 red-team cycle 3
+Task: concurrency, leaks, API-misuse probes.
+Outcome: REAL API BUG found — double wait() re-reported success; fixed
+(one-shot wait, Supervision error on second call). New probes RT17-21:
+concurrent isolation (8 parallel, no cross-talk), no fd leaks over 30
+runs, zero-cap kill, stdin EOF. 22/22 red-team green; full workspace
+green. Consecutive clean audits: 2 (cycles 9-10); red-team cycle 3 found
+one issue which was fixed and is now permanently tested.
+Commands: run-rt.sh, run-full.sh, scripts/check.sh.

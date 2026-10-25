@@ -98,3 +98,11 @@ test lands at listed milestone.
 | Supervisor death by ANY route (crash/SIGKILL) destroys the sandbox tree — no orphaned payloads | redteam.rs rt_cara_binary_sigkilled_midrun_orphans_nothing + PR_SET_PDEATHSIG in stage-1 | verified C11 (found + fixed this cycle) |
 | perf_event_open, openat2 denied (EPERM); core_pattern surface closed (RLIMIT_CORE=0, /proc/sys RO) | redteam.rs RT12-RT14 | verified C11 |
 | Landlock defeats symlink indirection from writable scratch into /proc/sys | redteam.rs rt_symlink_into_proc_sys_denied | verified C11 |
+
+## C11 cycle-3 claims
+| Claim | Basis | Status |
+|---|---|---|
+| Concurrent sandboxes are isolated (no cross-contamination of output) | redteam.rs rt_concurrent_sandboxes_isolated (8 parallel) | verified C11 |
+| No descriptor/resource leaks across many sequential runs | redteam.rs rt_no_resource_leaks_over_many_runs (30 runs, fd count) | verified C11 |
+| wait() is one-shot; double call errors cleanly (no silent re-report) | redteam.rs rt_double_wait_is_clean_error | verified C11 (found + fixed) |
+| Zero output cap kills immediately; stdin reads EOF without hanging | redteam.rs rt_zero_output_cap_kills_immediately, rt_stdin_reads_eof | verified C11 |
