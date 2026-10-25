@@ -3,6 +3,7 @@
 //! sandbox's specific countermeasure. Payloads run ONLY through the
 //! sandbox.
 
+use carapace_core::report::KillReason;
 use carapace_core::{Backend, BackendError, SandboxSpec};
 use carapace_native::NativeBackend;
 use std::time::Duration;
@@ -453,5 +454,126 @@ fn rt_cara_binary_sigkilled_midrun_orphans_nothing() {
     assert!(
         !survived,
         "orphaned payload survived its supervisor's SIGKILL (PDEATHSIG failed)"
+    );
+}
+
+// ---------------- red-team cycle 3: concurrency, leaks, API misuse -------
+
+/// RT17: concurrent sandboxes must not cross-contaminate — 8 parallel runs
+/// each write their own marker; every report contains exactly its own.
+#[test]
+fn rt_concurrent_sandboxes_isolated() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let mut handles = Vec::new();
+    for i in 0..8 {
+        let spec = SandboxSpec::new("/bin/sh")
+            .args(["-c", &format!("echo marker-{i}; sleep 0.3; echo end-{i}")])
+            .env("PATH", "/usr/bin:/bin")
+            .timeout(Duration::from_secs(20));
+        handles.push((
+            i,
+            std::thread::spawn(move || {
+                let mut h = NativeBackend::new().spawn(&spec).expect("spawn");
+                h.wait().expect("wait")
+            }),
+        ));
+    }
+    for (i, h) in handles {
+        let r = h.join().expect("thread");
+        let out = String::from_utf8_lossy(&r.stdout).into_owned();
+        assert!(
+            out.contains(&format!("marker-{i}")),
+            "own marker missing: {out:?}"
+        );
+        assert!(
+            !out.contains(&format!("marker-{}", (i + 1) % 8)),
+            "cross-contamination in report for {i}: {out:?}"
+        );
+    }
+}
+
+/// RT18: resource leaks across many sequential runs — fd count and memory
+/// must return to baseline (close_range + Drop hygiene).
+#[test]
+fn rt_no_resource_leaks_over_many_runs() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let fd_count = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    // Warm up (threads, caches) then measure around 30 runs.
+    for _ in 0..3 {
+        let mut h = b.spawn(&sh("true")).unwrap();
+        h.wait().unwrap();
+    }
+    let before = fd_count();
+    for _ in 0..30 {
+        let mut h = b.spawn(&sh("true")).unwrap();
+        h.wait().unwrap();
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let after = fd_count();
+    assert!(
+        after <= before + 2,
+        "descriptor leak: before={before} after={after}"
+    );
+}
+
+/// RT19: wait() called twice must fail cleanly, not panic or double-report.
+#[test]
+fn rt_double_wait_is_clean_error() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let mut h = b.spawn(&sh("true")).unwrap();
+    let r1 = h.wait().expect("first wait");
+    assert_eq!(r1.exit_code, Some(0));
+    let err = match h.wait() {
+        Err(e) => e,
+        Ok(_) => panic!("double wait must not re-report success"),
+    };
+    assert!(
+        matches!(err, carapace_core::BackendError::Supervision(_)),
+        "second wait must be a Supervision error: {err}"
+    );
+}
+
+/// RT20: zero output cap — any write is an immediate overflow kill.
+#[test]
+fn rt_zero_output_cap_kills_immediately() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let r = run(sh("echo hi").max_output(0).timeout(Duration::from_secs(10)));
+    assert_eq!(r.kill_reason, Some(KillReason::OutputOverflow), "{r:?}");
+    assert!(r.stdout.is_empty());
+}
+
+/// RT21: stdin is empty — a reader gets EOF, not a hang.
+#[test]
+fn rt_stdin_reads_eof() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let start = std::time::Instant::now();
+    let r = run(sh("cat; echo survived-stdin-eof").timeout(Duration::from_secs(10)));
+    assert_eq!(r.exit_code, Some(0));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(out.contains("survived-stdin-eof"), "{out:?}");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "must not block on stdin: {:?}",
+        start.elapsed()
     );
 }

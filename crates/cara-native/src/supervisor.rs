@@ -117,6 +117,9 @@ pub(crate) struct NativeSandbox {
     killed_reason: Mutex<Option<KillReason>>,
     /// Forwarded raw waitpid status of the payload, once known.
     reaped: Mutex<Option<libc::c_int>>,
+    /// Set by wait(); a second call is a caller bug and errors (the trait
+    /// documents wait as call-once — silently re-reporting would hide it).
+    waited: Mutex<bool>,
     /// The run's cgroup leaf (limits + accounting); removed on drop.
     cgroup_leaf: Option<crate::cgroup::CgroupLeaf>,
     /// Host-side staging dir; removed after the child (and its mount ns)
@@ -486,6 +489,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         overflow,
         killed_reason: Mutex::new(None),
         reaped: Mutex::new(None),
+        waited: Mutex::new(false),
         cgroup_leaf: Some(cgroup_leaf),
         staging_dir,
         overflow_wr,
@@ -651,6 +655,15 @@ fn stage_name(stage: u8) -> &'static str {
 impl NativeSandbox {
     /// Implementation of `SandboxHandle::wait`.
     pub fn wait(&mut self) -> Result<ExitReport, BackendError> {
+        {
+            let mut w = self.waited.lock().unwrap();
+            if *w {
+                return Err(BackendError::Supervision(
+                    "wait called twice on one sandbox handle".into(),
+                ));
+            }
+            *w = true;
+        }
         let deadline = self.start + self.timeout;
         loop {
             // Kill conditions first: explicit kill wins, then overflow.
