@@ -1,6 +1,6 @@
 # STATE — agent working state (overwritten every cycle)
 
-Last updated: cycle 8 (C9 complete @ 0dbb190), C10/C12 agents running.
+Last updated: cycle 10 — ALL MILESTONES C0-C12 COMPLETE @ 02044f0. See FINAL_REPORT.md.
 
 ## Done (all green via scripts/check.sh)
 - C0-C5 COMPLETE. eae8a2b = policy TOML (deny_unknown_fields, presets,
