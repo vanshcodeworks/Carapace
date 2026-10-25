@@ -1,7 +1,6 @@
 # STATE — agent working state (overwritten every cycle)
 
-Last updated: cycle 6 done (C5 complete @ eae8a2b), C6/C7 in progress
-via parallel subagents.
+Last updated: cycle 8 (C9 complete @ 0dbb190), C10/C12 agents running.
 
 ## Done (all green via scripts/check.sh)
 - C0-C5 COMPLETE. eae8a2b = policy TOML (deny_unknown_fields, presets,
@@ -11,14 +10,17 @@ via parallel subagents.
 - Test suites: supervisor (9), rootfs (10), limits (5), hardening (10),
   cli_run (6), doctor (8+), core policy (9). Full workspace green.
 
+## Done since C5
+- C6 escape suite (20 payloads, 21 tests) + redteam.rs (11 probes) +
+  generated README table (3ae2e4d, b3501b7). C7 MCP server via cara mcp
+  (335b8bb) + full docs set (9c56935). C9 Wasm tier with parity tests
+  (0dbb190) — wasmtime 50, fuel/epoch/limiter, state-based kill
+  classification. ADR-0005 pool deferred by measurement (bbc0493).
+
 ## In progress (parallel subagents)
-- SUBAGENT A: cara-escape-tests catalog (20 payloads) + suite + README
-  table generator. Files: crates/cara-escape-tests/** + one workspace dep line.
-- SUBAGENT B: carapace-mcp stdio JSON-RPC server (initialize/tools/list/
-  tools/call run_code+explain_result, hostile input validation, e2e test).
-  Files: crates/cara-mcp/** + one workspace dep line.
-- ME (main thread): library examples, C8 prep (fuzz scaffold, zygote ADR),
-  integration of agent output, commits.
+- SUBAGENT: C10 microVM ADR + cara-vm KVM-free logic (ADR-0006).
+- SUBAGENT: C12 release runbook + demo script + release-dry-run workflow.
+- ME (main thread): C8 fuzz runs, integration, commits.
 
 ## Known bugs / risks
 - mkdir_p lesson encoded: never hardcode prefix lengths; keep join
