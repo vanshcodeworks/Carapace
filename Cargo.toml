@@ -21,6 +21,9 @@ rust-version = "1.85"
 
 [workspace.dependencies]
 carapace-core = { version = "0.1.0", path = "crates/cara-core" }
+wasmtime = { version = "50", default-features = false, features = ["cranelift", "runtime", "wat", "component-model", "async"] }
+wasmtime-wasi = { version = "50", default-features = false, features = ["p1"] }
+wat = "1"
 carapace-sys = { version = "0.1.0", path = "crates/cara-sys" }
 carapace-native = { version = "0.1.0", path = "crates/cara-native" }
 carapace-mcp = { version = "0.1.0", path = "crates/cara-mcp" }

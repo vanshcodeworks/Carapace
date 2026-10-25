@@ -86,6 +86,7 @@ fn json_report(r: &ExitReport) -> String {
         Some(KillReason::Timeout) => serde_json::json!("timeout"),
         Some(KillReason::OutputOverflow) => serde_json::json!("output_overflow"),
         Some(KillReason::MemoryLimit) => serde_json::json!("memory_limit"),
+        Some(KillReason::CpuLimit) => serde_json::json!("cpu_limit"),
         Some(KillReason::Internal(m)) => serde_json::json!(format!("internal: {m}")),
     };
     serde_json::json!({
@@ -132,6 +133,7 @@ fn kill_text(reason: &KillReason) -> String {
         KillReason::Timeout => "wall-clock limit exceeded".into(),
         KillReason::OutputOverflow => "output limit exceeded".into(),
         KillReason::MemoryLimit => "memory limit exceeded (OOM)".into(),
+        KillReason::CpuLimit => "CPU limit exceeded".into(),
         KillReason::Internal(m) => format!("internal error: {m}"),
     }
 }

@@ -575,6 +575,7 @@ fn report_to_json(report: &ExitReport) -> Value {
             Some(KillReason::Timeout) => json!("timeout"),
             Some(KillReason::OutputOverflow) => json!("output_overflow"),
             Some(KillReason::MemoryLimit) => json!("memory_limit"),
+            Some(KillReason::CpuLimit) => json!("cpu_limit"),
             Some(KillReason::Internal(m)) => json!(format!("internal: {m}")),
         },
         "stdout": String::from_utf8_lossy(&report.stdout),
@@ -637,6 +638,12 @@ fn explain_report(report: &Value) -> String {
             "The sandbox killed the run: it wrote more to stdout or stderr than \
              the capture cap allows. Print less, or run with a larger output \
              limit via a policy file.\n",
+        ),
+        Some("cpu_limit") => out.push_str(
+            "The sandbox killed the run: it consumed more CPU than its fuel \
+             budget allows. Do less work, or run with a larger cpu/timeout \
+             policy.
+",
         ),
         Some("memory_limit") => out.push_str(
             "The kernel killed the run for using more memory than its cgroup \

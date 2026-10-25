@@ -12,6 +12,9 @@ pub enum KillReason {
     /// The memory limit was hit and the kernel OOM-killed the run
     /// (detected via the cgroup's memory.events counter).
     MemoryLimit,
+    /// The CPU budget ran out (Wasm tier: fuel exhaustion under the
+    /// policy's cpu/timeout mapping).
+    CpuLimit,
     /// Carapace-internal failure while setting up or supervising the run.
     /// The code never ran or stopped running: never silently ignored.
     Internal(String),
