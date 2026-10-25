@@ -92,3 +92,12 @@ HOST-process env names). README table generated from catalog.
 Concurrency: agents run ONE at a time; docs agent running; MCP agent
 crashed mid-work twice (files in tree, WIP).
 Next: cara bench subcommand (bench.rs ready), MCP integration, C8 pool.
+
+## Cycle 7b — 2026-10-25 — C7 complete
+Task: MCP server integration.
+Outcome: DONE @ 335b8bb. MCP agent delivered cara-mcp (28 unit + 1 e2e
+green, clippy-clean); I wired `cara mcp` into the CLI and smoke-tested
+the handshake. ADR-0005 deferred by measurement (bbc0493) — cold path
+already 6.7-7.0ms median; pool is a ~3ms win for a new attack surface.
+Docs agent still running (owns docs/*.md, SECURITY.md, CONTRIBUTING.md).
+Next: docs integration, C9 Wasm tier.
