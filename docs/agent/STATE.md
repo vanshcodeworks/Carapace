@@ -1,35 +1,34 @@
 # STATE — agent working state (overwritten every cycle)
 
-Last updated: cycle 5 done (C4 complete @ f4b4b02), C5 in progress.
+Last updated: cycle 6 done (C5 complete @ eae8a2b), C6/C7 in progress
+via parallel subagents.
 
 ## Done (all green via scripts/check.sh)
-- C0-C4 complete. 68 tests. Full Tier 1 stack now active per run:
-  namespaces (7) -> private-ns rootfs/pivot -> cgroup limits ->
-  fd close_range -> rlimits (fsize/nofile/core) -> capset drop ->
-  no_new_privs -> Landlock (ABI-aware grants) -> seccomp allowlist ->
-  exec. Payload sees fds {0,1,2}, CapEff=0, NoNewPrivs=1, EPERM on
-  namespace/socket/io_uring syscalls, Landlock-denied writes outside
-  /work+/tmp+/dev, kernel OOM at memory limit.
+- C0-C5 COMPLETE. eae8a2b = policy TOML (deny_unknown_fields, presets,
+  unit parsing), filesystem binds (rw + ro) via staging-dir design,
+  network modes none/full + honest allowlist refusal (ADR-0004),
+  `cara run` / `cara policy check|explain` CLI with JSON reports.
+- Test suites: supervisor (9), rootfs (10), limits (5), hardening (10),
+  cli_run (6), doctor (8+), core policy (9). Full workspace green.
 
-## In progress (C5 — policy + network + CLI)
-- cara-core/src/policy.rs: TOML policy parse+validate, presets strict/
-  dev/network-light; limits parsing (bytes "256MB", percents, durations).
-- SandboxSpec gains filesystem read_only/read_write binds + network mode.
-- Network: default none (netns empty — already enforced); `full` mode =
-  share host netns (opt-in; requires setns from parent — ADR); allowlist
-  mode deferred with ADR (design doc).
-- CLI: `cara run` (file or -c code, --policy), `cara policy check|explain`,
-  exit codes; JSON report output (--json).
-- Tests: policy parse/validation matrix; explain output contains key
-  facts; run with default policy works; unknown-field rejection.
+## In progress (parallel subagents)
+- SUBAGENT A: cara-escape-tests catalog (20 payloads) + suite + README
+  table generator. Files: crates/cara-escape-tests/** + one workspace dep line.
+- SUBAGENT B: carapace-mcp stdio JSON-RPC server (initialize/tools/list/
+  tools/call run_code+explain_result, hostile input validation, e2e test).
+  Files: crates/cara-mcp/** + one workspace dep line.
+- ME (main thread): library examples, C8 prep (fuzz scaffold, zygote ADR),
+  integration of agent output, commits.
 
 ## Known bugs / risks
-- none open.
-- io.max not set (optional; documented).
-- allowlist network mode = C5 ADR design only.
+- mkdir_p lesson encoded: never hardcode prefix lengths; keep join
+  separators (bind ENOENT debugging).
+- Stale staging dirs from debugging sessions may exist under
+  /run/user/1000/cara-staging.* — .wsl/purge-leaves.sh pattern applies.
 
 ## How to run checks
 wsl -d Ubuntu-24.04 -u dev -- bash /mnt/p/Carapace/scripts/check.sh
+(.wsl/run-full.sh = tests only, self-bridging; per-suite runners exist)
 
 ## Last verified commit
-f4b4b02
+eae8a2b

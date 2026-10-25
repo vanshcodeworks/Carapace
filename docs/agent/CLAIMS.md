@@ -40,3 +40,13 @@ test lands at listed milestone.
 | Capabilities dropped + no_new_privs set | hardening.rs no_new_privs_and_zero_capabilities (observed in-sandbox) | verified C4 |
 | Single-file size capped by RLIMIT_FSIZE | hardening.rs fsize_rlimit_caps_single_files | verified C4 |
 | Normal interpreter runtimes unaffected | hardening.rs normal_python_still_works + all prior suites | verified C4 |
+
+## C5 claims (added cycle 6)
+| Claim | Basis | Status |
+|---|---|---|
+| Policy files reject unknown fields/units/presets (fail closed) | cara-core policy tests + cli_run policy_check_valid_and_invalid | verified C5 |
+| read_write binds expose exactly the listed host dirs inside the sandbox | cli_run run_with_read_write_bind_sees_host_dir | verified C5 |
+| network mode allowlist fails closed at run time (not implemented) | cli_run run_fails_closed_on_unknown_network_mode_in_policy | verified C5 |
+| network mode full permits sockets; none denies (seccomp + netns) | hardening.rs socket test + seccomp_profile filter_for branch | ⏳ full-mode e2e TODO(test) C6 |
+| cara run --json has a stable report schema | run_ui json tests (kill_reason strings) | verified C5 |
+| cara run exit codes documented (0/2/3/4) | exit_codes.rs + cli tests | verified C5 |

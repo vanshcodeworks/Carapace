@@ -69,3 +69,16 @@ Commands: scripts/check.sh; .wsl/run-hard.sh; probe-c4.sh.
 Results: 68 tests green; hardening suite 10/10; python runs ~29ms under
 the full stack.
 Next: C5 policy TOML + network modes + cara run/policy CLI.
+
+## Cycle 6 — 2026-10-25 — C5 complete
+Task: policy + binds + network + CLI (QUEUE C5); subagent parallelization
+started per user request.
+Outcome: DONE @ eae8a2b. Bind debugging saga (strace-assisted): mkdtemp
+staging + tmpfs-over-staging design; mkdir_p separator bug; ENOENT chain.
+open_tree/move_mount path abandoned (EINVAL rootless) in favor of
+before-overmount path-based binds. strace installed (ENV.md).
+Subagents: escape-suite agent running; docs + MCP agents relaunched after
+concurrency-limit failures (one agent at a time appears allowed).
+Commands: scripts/check.sh; .wsl/run-full.sh; bind-probe/bind-strace probes.
+Results: full workspace green incl. 6 CLI e2e tests.
+Next: integrate subagent output (C6/C7), then C8.
