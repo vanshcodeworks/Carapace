@@ -110,6 +110,10 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 ///
 /// - syscalls in `allowed` → `RET_ALLOW`
 /// - `clone(2)` with any CLONE_NEW* flag → `RET_ERRNO|EPERM`
+/// - `clone3(2)` → `RET_ERRNO|ENOSYS` (glibc/musl fall back to `clone(2)`
+///   only on ENOSYS; EPERM would break thread creation everywhere — found
+///   by the P2 runtime matrix, python threading failed with "can't start
+///   new thread")
 /// - everything else → `RET_ERRNO|EPERM`, or `RET_LOG` when
 ///   `log_denied` is set (profile development: log, then allow — never
 ///   the default in production)
@@ -124,67 +128,81 @@ pub fn compile_allowlist(allowed: &[libc::c_long], log_denied: bool) -> Filter {
     } else {
         RET_ERRNO | libc::EPERM as u32
     };
+
+    // Jump offsets are computed from final indices (a taken branch lands at
+    // pc + 1 + offset), so this function assembles in three passes:
+    // prefix -> chain -> kill/default, then patches the two forward jumps.
+    // Semantics are verified instruction-by-instruction by the BPF
+    // mini-interpreter test (`filter_semantics_interpreted`).
     let mut prog: Vec<libc::sock_filter> = Vec::with_capacity(16 + allowed.len() * 2);
 
-    // Exact instruction layout — jump semantics: a taken branch lands at
-    // pc + 1 + offset. Verified instruction-by-instruction by the BPF
-    // mini-interpreter test (`filter_semantics_interpreted`):
-    //
-    //   p0  LD arch
-    //   p1  JEQ AUDIT_ARCH  jt=0 (→p2)   jf=6 (→p8 KILL)
-    //   p2  LD nr                     ← arch ok
-    //   p3  JEQ clone      jt=0 (→p4)   jf=5 (→p9 chain)
-    //   p4  LD arg0_lo                ← clone: inspect flags
-    //   p5  JSET NEW_MASK  jt=1 (→p7)   jf=0 (→p6)
-    //   p6  RET ALLOW                 ← clone without namespace flags
-    //   p7  RET ERRNO|EPERM           ← clone with namespace flags
-    //   p8  RET KILL_PROCESS          ← wrong architecture
-    //   p9+ JEQ nr / RET ALLOW pairs  ← the allowlist chain
-    //   last RET default
-    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH)); // p0
-    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 0, 6)); // p1
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARCH)); // 0: LD arch
+    prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH, 0, 0)); // 1: patched
+    prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR)); // 2: LD nr
 
     #[cfg(target_arch = "x86_64")]
     {
-        prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR)); // p2
         prog.push(jump(
             BPF_JMP | BPF_JEQ | BPF_K,
             libc::SYS_clone as u32,
             0,
-            5,
-        )); // p3
-        prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0_LO)); // p4
-        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 1, 0)); // p5
-        prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW)); // p6
-        prog.push(stmt(BPF_RET | BPF_K, RET_ERRNO | libc::EPERM as u32)); // p7
+            0,
+        )); // 3: patched
+        prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_ARG0_LO)); // 4
+        prog.push(jump(BPF_JMP | BPF_JSET | BPF_K, CLONE_NEW_MASK, 1, 0)); // 5
+        prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW)); // 6
+        prog.push(stmt(BPF_RET | BPF_K, RET_ERRNO | libc::EPERM as u32)); // 7
+        prog.push(jump(
+            BPF_JMP | BPF_JEQ | BPF_K,
+            libc::SYS_clone3 as u32,
+            0,
+            1,
+        )); // 8: miss (jf=1) → chain at 10
+        prog.push(stmt(BPF_RET | BPF_K, RET_ERRNO | libc::ENOSYS as u32)); // 9
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
-        // Unsupported architecture: no clone handling; every syscall goes
-        // to the chain (and the arch mismatch above kills first).
-        prog.push(stmt(BPF_LD | BPF_W | BPF_ABS, OFF_NR)); // p2
-        prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, u32::MAX, 0, 0)); // p3: no-op
-        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // unused filler
-        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // filler
-        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // filler
-        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // filler
+        // Unsupported architecture: no clone/clone3 handling; the arch
+        // mismatch above kills first, and this filler keeps indices stable.
+        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // 3
+        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // 4
+        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // 5
+        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // 6
+        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // 7
+        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // 8
+        prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // 9
     }
-    prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // p8: arch miss
 
     // Allowlist chain: each allowed nr falls into RET_ALLOW.
     let mut sorted: Vec<u32> = allowed.iter().map(|&n| n as u32).collect();
     sorted.sort_unstable();
     sorted.dedup();
     for nr in sorted {
-        if nr == libc::SYS_clone as u32 {
-            continue; // handled by the dedicated block above
+        if nr == libc::SYS_clone as u32 || nr == libc::SYS_clone3 as u32 {
+            continue; // handled by the dedicated blocks above
         }
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
         prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW));
     }
 
-    // Default.
+    // The default (chain end) comes FIRST; the wrong-architecture kill is
+    // a separate ret after it, so the last chain miss reaches the default.
+    let default_idx = prog.len() as u32;
     prog.push(stmt(BPF_RET | BPF_K, default_action));
+    prog.push(stmt(BPF_RET | BPF_K, RET_KILL_PROCESS)); // arch miss target
+
+    // Patch the forward jumps.
+    prog[1] = jump(
+        BPF_JMP | BPF_JEQ | BPF_K,
+        AUDIT_ARCH,
+        0,
+        (default_idx + 1 - 2) as u8,
+    );
+    #[cfg(target_arch = "x86_64")]
+    {
+        // clone miss → the clone3 check at index 8.
+        prog[3] = jump(BPF_JMP | BPF_JEQ | BPF_K, libc::SYS_clone as u32, 0, 4);
+    }
 
     debug_assert!(prog.len() <= 4096, "BPF_MAXINSNS");
     Filter { prog }
@@ -233,17 +251,17 @@ mod tests {
         // First insn loads arch; second is the arch jump.
         assert_eq!(p[0].code, BPF_LD | BPF_W | BPF_ABS);
         assert_eq!(p[0].k, OFF_ARCH);
-        // Default action is the last insn.
-        let last = p[p.len() - 1];
-        assert_eq!(last.code, BPF_RET | BPF_K);
-        assert_eq!(last.k, RET_ERRNO | libc::EPERM as u32);
+        // Default action is second-to-last (last is the arch-kill).
+        let def = p[p.len() - 2];
+        assert_eq!(def.code, BPF_RET | BPF_K);
+        assert_eq!(def.k, RET_ERRNO | libc::EPERM as u32);
     }
 
     #[test]
     fn log_mode_default_is_ret_log() {
         let f = compile_allowlist(&[libc::SYS_read], true);
-        let last = f.as_slice()[f.len() - 1];
-        assert_eq!(last.k, RET_LOG);
+        let def = f.as_slice()[f.len() - 2];
+        assert_eq!(def.k, RET_LOG);
     }
 
     /// A minimal BPF evaluator over `struct seccomp_data`, used to prove
@@ -346,6 +364,19 @@ mod tests {
         assert_eq!(
             eval_filter(p, &data_for(libc::SYS_clone, libc::CLONE_NEWNS as u64 | 11)),
             RET_ERRNO | libc::EPERM as u32
+        );
+
+        // clone3: always ENOSYS so libc falls back to the filtered clone.
+        // (Thread creation broke with EPERM here — python "can't start new
+        // thread" — because glibc/musl only fall back on ENOSYS.)
+        assert_eq!(
+            eval_filter(p, &data_for(libc::SYS_clone3, 0)),
+            RET_ERRNO | libc::ENOSYS as u32,
+            "clone3 must be ENOSYS"
+        );
+        assert_eq!(
+            eval_filter(p, &data_for(libc::SYS_clone3, 0x0001_0000)),
+            RET_ERRNO | libc::ENOSYS as u32
         );
 
         // Wrong architecture -> KILL_PROCESS (fail closed).

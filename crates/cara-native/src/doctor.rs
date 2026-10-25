@@ -51,8 +51,10 @@ fn check_runtime_layout() -> Check {
         Check::fail(
             "runtime-layout",
             "Runtime layout",
-            format!("missing: {} (the v1 recipe requires a merged-usr host)",
-                    missing.join(", ")),
+            format!(
+                "missing: {} (the v1 recipe requires a merged-usr host)",
+                missing.join(", ")
+            ),
             "Non-merged-/usr distros (some Debian setups, Alpine) and musl              hosts are not supported by the v1 recipe. Options: install the              missing paths (e.g. Debian: usrmerge), or wait for hermetic              runtime rootfs images (backlog P2). Carapace fails closed.",
         )
     }
