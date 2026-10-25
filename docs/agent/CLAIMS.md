@@ -18,3 +18,13 @@ test lands at listed milestone.
 
 ## Retractions / corrections
 (none yet)
+
+## C3 claims (added cycle 4)
+| Claim | Basis | Status |
+|---|---|---|
+| Memory limit kills hogs at the configured cap (64MB) with OOM reason and peak recorded | limits.rs memory_hog_is_oom_killed_at_limit | verified C3 |
+| pids.max caps fork bombs; no straggler processes | limits.rs fork_bomb_is_capped_by_pids_max (+ /proc scan) | verified C3 |
+| cpu.max quota measurably shapes CPU (20% vs 200%) | limits.rs cpu_quota_shapes_usage | verified C3 |
+| Resource report populated (cpu time, peak mem, wall) | limits.rs resource_report_is_populated | verified C3 |
+| cgroup leaves always removed (async, <=10s) | limits.rs cgroup_leaves_are_always_removed | verified C3 |
+| WSL: cgroup attach only works inside user slice; bridge = systemd-run --user --scope (~13ms) | .wsl probes bridge-test.sh; doctor remedy text | verified C3 |

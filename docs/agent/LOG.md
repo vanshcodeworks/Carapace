@@ -39,3 +39,20 @@ test runs via .wsl/run-tests.sh (lesson: cargo build -p cli does NOT
 rebuild test binaries — caused a false-persisting bug report).
 Results: 19/19 integration tests green (9 supervisor + 10 rootfs).
 Next: C3 cgroup limits.
+
+## Cycle 4 — 2026-10-25 — C3 complete
+Task: cgroup v2 limits + resource report (QUEUE C3).
+Outcome: DONE @ 5e23c89. Root cause chain solved with C probes: nsdelegate
+forbids moving tasks into a delegated subtree from outside (WSL
+/non-systemd) AND parent cannot move a userns child at all -> two-stage
+child (fork plain, attach, then unshare+fork pidns-init), ADR-0003.
+Doctor now tests REAL attach capability; check.sh self-bridges via
+systemd-run --user --scope (13ms, WSL only). Deadlocks fixed: stage-1
+holding status/stdio pipes (no CLOEXEC for non-exec'ing process); overflow
+flag gated behind poll -> self-pipe (flooder test 10s -> ms; suite
+11.4s -> 1.4s). pidfd/ESRCH race handled. Warnings: leaf removal is async
+(kernel teardown takes seconds on 6.18-wsl).
+Commands: scripts/check.sh (all green, repeated 3x stable via
+.wsl/loop-sup.sh); probes in .wsl/probe-cgroup-*.
+Results: 24 sandbox integration tests green; supervisor suite 1.4s.
+Next: C4 seccomp+Landlock+capdrop+rlimits+fd sanitization.

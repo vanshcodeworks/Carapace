@@ -207,6 +207,8 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
             .expect("numeric size option has no NULs"),
         work_size_opt: std::ffi::CString::new(format!("size={}", spec.limits.scratch_bytes))
             .map_err(|e| setup("scratch size", std::io::Error::other(format!("{e}"))))?,
+        fsize_limit: spec.limits.scratch_bytes.max(1024),
+        seccomp_filter: crate::seccomp_profile::base_filter().as_slice().to_vec(),
     });
     let config_ptr = Box::into_raw(config) as *mut libc::c_void;
 

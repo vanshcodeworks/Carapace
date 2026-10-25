@@ -32,6 +32,11 @@ pub mod stage {
     pub const PIVOT_DETACH: u8 = 14;
     pub const VERIFY: u8 = 12;
     pub const NS_SETUP: u8 = 15;
+    pub const FD_CLOSE: u8 = 30;
+    pub const CAPS_DROP: u8 = 31;
+    pub const NO_NEW_PRIVS: u8 = 32;
+    pub const LANDLOCK: u8 = 33;
+    pub const SECCOMP: u8 = 34;
 }
 
 /// Fixed-size pre-exec failure report written to the exec-status pipe.
@@ -75,6 +80,11 @@ pub(crate) struct ChildConfig {
     /// child only passes pointers to mount(2)).
     pub root_size_opt: CString,
     pub work_size_opt: CString,
+    /// RLIMIT_FSIZE for the payload (the per-file size cap).
+    pub fsize_limit: u64,
+    /// Compiled seccomp filter (parent-side compilation; installed by
+    /// stage-2 as the LAST setup step before exec).
+    pub seccomp_filter: Vec<libc::sock_filter>,
 }
 
 // ---------------------------------------------------------------- raw I/O
@@ -813,6 +823,14 @@ fn run_payload(cfg: &ChildConfig) -> ! {
         fail(cfg, stage::SYNC, unsafe { *libc::__errno_location() });
     }
 
+    // ---- C4 hardening, in the order the threat model documents ----------
+    harden_fds(cfg);
+    harden_rlimits(cfg);
+    drop_capabilities(cfg);
+    set_no_new_privs(cfg);
+    apply_landlock(cfg);
+    install_seccomp(cfg);
+
     // execve. C arrays built from the leaked config; on success we never
     // return. The status pipe (CLOEXEC) closes at exec: that EOF is the
     // parent's "running" signal (stage-1's forwarding comes later, through
@@ -854,6 +872,187 @@ fn fail(cfg: &ChildConfig, stage: u8, errno: i32) -> ! {
     unsafe {
         // SAFETY: final exit; nothing to unwind in a forked child.
         libc::_exit(127);
+    }
+}
+
+// ------------------------------------------------------- C4 hardening
+
+/// Closes every fd above 2 except the exec-status write end (still needed
+/// to report an exec failure): two close_range calls bracketing it. The
+/// payload inherits exactly {0,1,2}.
+fn harden_fds(cfg: &ChildConfig) {
+    let keep = cfg.status_wr;
+    if keep > 3 {
+        errno_of(unsafe {
+            // SAFETY: close_range(3, keep-1, 0): plain closes.
+            libc::syscall(libc::SYS_close_range, 3u32, (keep - 1) as u32, 0u32) as libc::c_int
+        })
+        .or_fail(cfg, stage::FD_CLOSE);
+    }
+    errno_of(unsafe {
+        // SAFETY: close_range(keep+1, UINT_MAX, 0).
+        libc::syscall(libc::SYS_close_range, (keep + 1) as u32, u32::MAX, 0u32) as libc::c_int
+    })
+    .or_fail(cfg, stage::FD_CLOSE);
+}
+
+/// RLIMIT_FSIZE caps any single file the payload writes (the /work tmpfs
+/// bounds the total independently); RLIMIT_NOFILE caps descriptor use.
+fn harden_rlimits(cfg: &ChildConfig) {
+    let rl = libc::rlimit {
+        rlim_cur: cfg.fsize_limit,
+        rlim_max: cfg.fsize_limit,
+    };
+    let r = unsafe {
+        // SAFETY: setrlimit(RLIMIT_FSIZE, &rl) with a valid struct.
+        libc::setrlimit(libc::RLIMIT_FSIZE, &rl)
+    };
+    if r < 0 {
+        fail(cfg, stage::SET_RLIMIT, unsafe { *libc::__errno_location() });
+    }
+    let rl = libc::rlimit {
+        rlim_cur: 256,
+        rlim_max: 256,
+    };
+    let r = unsafe {
+        // SAFETY: setrlimit(RLIMIT_NOFILE, &rl) with a valid struct.
+        libc::setrlimit(libc::RLIMIT_NOFILE, &rl)
+    };
+    if r < 0 {
+        fail(cfg, stage::SET_RLIMIT, unsafe { *libc::__errno_location() });
+    }
+}
+
+/// Drops every capability (we are uid 0 in the userns; after this the
+/// payload holds none, not even namespaced ones).
+fn drop_capabilities(cfg: &ChildConfig) {
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid: libc::c_int,
+    }
+    #[repr(C)]
+    struct CapData {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    let mut hdr = CapHeader {
+        version: 0x2008_0522, // _LINUX_CAPABILITY_VERSION_3 (capability.h)
+        pid: 0,
+    };
+    let mut data = [
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+        CapData {
+            effective: 0,
+            permitted: 0,
+            inheritable: 0,
+        },
+    ];
+    let r = unsafe {
+        // SAFETY: capset(2) with the standard v3 header and two data
+        // structs; all sets zeroed = drop everything.
+        libc::syscall(
+            libc::SYS_capset,
+            std::ptr::from_mut(&mut hdr),
+            data.as_mut_ptr(),
+        )
+    };
+    if r < 0 {
+        fail(cfg, stage::CAPS_DROP, unsafe { *libc::__errno_location() });
+    }
+}
+
+fn set_no_new_privs(cfg: &ChildConfig) {
+    let r = unsafe {
+        // SAFETY: prctl(PR_SET_NO_NEW_PRIVS, 1): plain process attribute.
+        libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1u64, 0u64, 0u64, 0u64)
+    };
+    if r < 0 {
+        fail(cfg, stage::NO_NEW_PRIVS, unsafe {
+            *libc::__errno_location()
+        });
+    }
+}
+
+/// Landlock: deny-by-default across the whole filesystem; explicit grants:
+/// read-only /usr, /proc, /etc; read-write /work, /tmp, /dev (only our
+/// four safe device nodes live there). ABI-aware; fails closed if the
+/// kernel lacks Landlock (doctor gates this environment class, so an
+/// error here is a real anomaly, not noise).
+fn apply_landlock(cfg: &ChildConfig) {
+    let Some(abi) = carapace_sys::landlock::abi_version() else {
+        fail(cfg, stage::LANDLOCK, libc::ENOSYS);
+    };
+    if abi < 1 {
+        fail(cfg, stage::LANDLOCK, libc::EOPNOTSUPP);
+    }
+    let handled = carapace_sys::landlock::handled_access_for_abi(abi);
+    let rs = match carapace_sys::landlock::create_ruleset(handled) {
+        Ok(fd) => fd,
+        Err(e) => fail(cfg, stage::LANDLOCK, e),
+    };
+    use carapace_sys::landlock::access_fs as fs;
+    for (path, access) in [
+        (c"/usr".to_bytes_with_nul(), fs::RO),
+        (c"/proc".to_bytes_with_nul(), fs::RO),
+        (c"/etc".to_bytes_with_nul(), fs::RO),
+        (c"/dev".to_bytes_with_nul(), fs::RW_FILES),
+        (c"/work".to_bytes_with_nul(), fs::RW_ALL),
+        (c"/tmp".to_bytes_with_nul(), fs::RW_ALL),
+    ] {
+        let fd = unsafe {
+            // SAFETY: openat(2) O_PATH on fixed literal paths inside the
+            // pivoted root.
+            libc::openat(
+                libc::AT_FDCWD,
+                path.as_ptr().cast::<libc::c_char>(),
+                libc::O_PATH | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let e = unsafe { *libc::__errno_location() };
+            unsafe {
+                // SAFETY: closing the ruleset fd on the error path.
+                libc::close(rs);
+            }
+            fail(cfg, stage::LANDLOCK, e);
+        }
+        let r = carapace_sys::landlock::add_path_beneath(rs, access, fd);
+        unsafe {
+            // SAFETY: the O_PATH fd is not needed after adding the rule.
+            libc::close(fd);
+        }
+        if let Err(e) = r {
+            unsafe {
+                // SAFETY: closing the ruleset fd on the error path.
+                libc::close(rs);
+            }
+            fail(cfg, stage::LANDLOCK, e);
+        }
+    }
+    if let Err(e) = carapace_sys::landlock::restrict_self(rs) {
+        unsafe {
+            // SAFETY: closing the ruleset fd on the error path.
+            libc::close(rs);
+        }
+        fail(cfg, stage::LANDLOCK, e);
+    }
+    unsafe {
+        // SAFETY: the ruleset is applied; the fd is no longer needed.
+        libc::close(rs);
+    }
+}
+
+/// seccomp LAST: with Landlock applied and fds sanitized, the allowlist
+/// filter seals the syscall surface until exec.
+fn install_seccomp(cfg: &ChildConfig) {
+    if let Err(e) = carapace_sys::seccomp::install(&cfg.seccomp_filter) {
+        fail(cfg, stage::SECCOMP, e);
     }
 }
 

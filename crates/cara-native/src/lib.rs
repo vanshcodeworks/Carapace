@@ -9,6 +9,7 @@ pub mod backend;
 pub mod cgroup;
 pub mod child;
 pub mod doctor;
+pub mod seccomp_profile;
 mod supervisor;
 
 pub use backend::NativeBackend;

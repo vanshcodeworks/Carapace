@@ -1,39 +1,38 @@
 # STATE — agent working state (overwritten every cycle)
 
-Last updated: cycle 3 done (C2 complete @ 745dc0a), C3 in progress.
+Last updated: cycle 4 done (C3 complete @ 5e23c89), C4 in progress.
 
-## Done (all verified green via scripts/check.sh)
-- C0: workspace + doctor + threat model + docs (bcecc3a, 75226dd)
-- C1: rootless namespaces + supervisor (9714750): clone w/ 7 ns flags,
-  CLONE_PIDFD, maps, timeout, output caps, pidns-init tree kill, fail-closed
-  pre-exec handshake. 9 integration tests.
-- C2: rootfs + pivot_root (745dc0a): private tmpfs over /tmp (zero host
-  artifacts), ro /usr bind, safe /dev binds, minimal /etc (marker), capped
-  /work, fresh proc, pivot+detach, post-pivot self-verify. 10 rootfs tests
-  incl. python3 hello-world. Full sandbox spawn+run measured ~8ms wall.
+## Done (all green via scripts/check.sh — which self-bridges via
+systemd-run on WSL; see ADR-0003)
+- C0 (bcecc3a/75226dd), C1 (9714750), C2 (745dc0a), C3 (5e23c89).
+- C3: rootless cgroup v2 limits (memory.max+swap0, pids.max, cpu.max),
+  two-stage child (plain-fork stage-1 attaches to leaf then unshares;
+  stage-2 = pidns init), doctor attach-capability check + WSL remedy,
+  resource report (cpu/peak-mem/peak-pids/OOM->MemoryLimit), overflow
+  self-pipe (ms-kill), no waitpid(-1) sweeps. 24 integration tests.
 
-## In progress (C3 — cgroups)
-- Limits growth in core: memory_bytes, cpu_percent, max_processes.
-- Supervisor: resolve delegated root (reuse doctor logic), create leaf
-  cara-run-<id> under it in the go-pipe window, write memory.max +
-  memory.swap.max=0 + pids.max + cpu.max, move child pid in via
-  leaf/cgroup.procs, enable controllers in subtree_control as needed.
-- ExitReport: cpu usage (cpu.stat), peak memory (memory.peak), oom_kill
-  (memory.events), pids peak.
-- Cleanup: rmdir leaf on every teardown path; cgroup.kill kill switch.
-- Tests: memory hog OOM-killed at limit; fork bomb stopped by pids.max;
-  cpu quota shapes usage; report numbers sane; leaf always gone.
+## In progress (C4 — syscall/fs hardening)
+- seccomp-bpf allowlist compiler (raw BPF in cara-sys; per-runtime
+  profiles; default-deny; ERRATADATA; log-mode for profile development).
+- Landlock ruleset: RW /work, R /usr + /proc + /dev nodes; ABI-aware.
+- Capability drop (capset all=0) + PR_SET_NO_NEW_PRIVS in stage-2 before
+  exec; rlimits (fsize=scratch, nofile cap); close_range fd sanitization
+  before exec (keep 0/1/2 only).
+- Fail-closed tests: blocked syscall kills with report; Landlock denies
+  /usr write despite mount RW... (already RO); fd leak scan from inside
+  (/proc/self/fd count == 3); no_new_privs observable (setuid binary
+  cannot elevate — /usr has none mounted, verify bit is set via
+  /proc/self/status NoNewPrivs).
 
 ## Known bugs / risks
-- One supervisor-suite test consumes a full 10s (assertions pass) —
-  profile and fix. QUEUED.
-- /usr bind includes host full /usr: v1 recipe; narrower runtimes later.
-- No seccomp/Landlock until C4: payload has fs isolation but full syscall
-  access. Escape suite only after C4.
+- none open; leftover cgroup leaves from debugging purged (218 dirs,
+  .wsl/purge-leaves.sh).
+- io.max not set (io controller delegated but per-device needed) —
+  TODO(C5+) document as optional.
 
 ## How to run checks
 wsl -d Ubuntu-24.04 -u dev -- bash /mnt/p/Carapace/scripts/check.sh
-(.wsl/run-tests.sh = supervisor suite only; examples/probe.rs dev tool)
+Per-suite: .wsl/run-{tests,rootfs,limits,full}.sh (all self-bridge).
 
 ## Last verified commit
-745dc0a
+5e23c89
