@@ -151,10 +151,11 @@ mod tests {
     use super::*;
 
     fn limits(memory_bytes: u64, cpu_percent: u32) -> Limits {
-        let mut l = Limits::default();
-        l.memory_bytes = memory_bytes;
-        l.cpu_percent = cpu_percent;
-        l
+        Limits {
+            memory_bytes,
+            cpu_percent,
+            ..Limits::default()
+        }
     }
 
     fn plan(memory_bytes: u64, cpu_percent: u32) -> VmPlan {
@@ -169,7 +170,13 @@ mod tests {
     fn default_limits_map_to_one_vcpu_and_default_ram() {
         // Limits::default(): 256 MiB, 100 %.
         let p = plan(256 * MIB, 100);
-        assert_eq!(p, VmPlan { vcpus: 1, memory_mib: 256 });
+        assert_eq!(
+            p,
+            VmPlan {
+                vcpus: 1,
+                memory_mib: 256
+            }
+        );
     }
 
     #[test]
@@ -222,9 +229,10 @@ mod tests {
         if kvm_available() {
             return; // clean skip: this host has KVM, the other test covers it
         }
-        let err = VmBackend::new()
-            .spawn(&spec_with(256 * MIB, 100))
-            .unwrap_err();
+        let err = match VmBackend::new().spawn(&spec_with(256 * MIB, 100)) {
+            Err(e) => e,
+            Ok(_) => panic!("spawn must fail without KVM"),
+        };
         assert!(
             matches!(err, BackendError::EnvironmentNotReady(_)),
             "expected EnvironmentNotReady, got: {err:?}"
@@ -238,9 +246,10 @@ mod tests {
         if !kvm_available() {
             return; // clean skip: KVM-capable hosts only (docs/agent/ENV.md: dev env has none)
         }
-        let err = VmBackend::new()
-            .spawn(&spec_with(256 * MIB, 100))
-            .unwrap_err();
+        let err = match VmBackend::new().spawn(&spec_with(256 * MIB, 100)) {
+            Err(e) => e,
+            Ok(_) => panic!("the boot path is not implemented; must fail closed"),
+        };
         assert!(
             matches!(err, BackendError::Setup(_)),
             "expected Setup, got: {err:?}"
