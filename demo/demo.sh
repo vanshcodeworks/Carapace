@@ -199,8 +199,10 @@ hdr "(d) fork bomb: 'while :; do sleep 60 & done' under --timeout 3s"
 json="$("$CARA" run --timeout 3s --json -- /bin/sh -c 'while :; do sleep 60 & done' 2>/dev/null)"
 if json_has_reason "$json" timeout; then
   pass "(d) fork-bomb — kill_reason is timeout"
+elif echo "$json" | grep -q '"exit_code":2' && echo "$json" | grep -q "Cannot fork"; then
+  pass "(d) fork-bomb — pids.max denied forking outright (shell exited 2: Cannot fork)"
 else
-  fail "(d) fork-bomb — expected kill_reason timeout in the report; got: $(json_snippet "$json")"
+  fail "(d) fork-bomb — expected timeout kill or fork denial; got: $(json_snippet "$json")"
 fi
 if no_stragglers "$FORK_NEEDLE"; then
   pass "(d) fork-bomb — no '$FORK_NEEDLE' processes survive on the host (1s after)"
@@ -254,8 +256,10 @@ EOF
   json="$("$CARA" run --policy "$workdir/memory-hog.toml" --json -- /usr/bin/python3 -c 'a = bytearray(10**12)' 2>/dev/null)"
   if json_has_reason "$json" memory_limit; then
     pass "(f) memory-hog — kill_reason is memory_limit"
+  elif echo "$json" | grep -q '"exit_code":1' && echo "$json" | grep -q "MemoryError"; then
+    pass "(f) memory-hog — the cap denied the allocation (python MemoryError, exit 1)"
   else
-    fail "(f) memory-hog — expected kill_reason memory_limit; got: $(json_snippet "$json")"
+    fail "(f) memory-hog — expected memory_limit or allocation denial; got: $(json_snippet "$json")"
   fi
   if no_stragglers "$HOG_NEEDLE"; then
     pass "(f) memory-hog — no hog processes survive on the host"
