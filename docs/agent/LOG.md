@@ -117,3 +117,15 @@ Commands: scripts/check.sh (all green), run-fuzz.sh, run-demo.sh,
 wasm-dbg probes (removed).
 Next: remaining C11 red-team cycles 2-3 as ongoing hardening; C9 TODOs
 (fuel->cpu_time, scratch cap); publish = human action.
+
+## Cycle 10 — 2026-10-25 — C11 red-team cycle 2
+Task: fresh attack classes from public escape research (core_pattern,
+process_vm_*, maskedPaths-style symlink abuse, perf_event_open) +
+operational leak.
+Outcome: REAL LEAK found and fixed — SIGKILLed supervisor orphaned the
+sandbox (PR_SET_PDEATHSIG + getppid race check now in stage-1; RT16
+reproduces and proves). RT12-15 added (all denied). 17/17 red-team
+green; full workspace green. Fuzz-found policy caps regression-tested.
+Commands: run-rt.sh, run-full.sh, scripts/check.sh.
+Next: FINAL_REPORT; remaining backlog = wasm TODOs, libkrun boot path,
+publish (human).
