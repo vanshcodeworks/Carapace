@@ -1,6 +1,6 @@
 # Carapace — Final Report (agent build, cycles 1–10)
 
-Date: 2026-10-25 · Branch: `agent/work` · 26 commits · 178 tests, 0 failures
+Date: 2026-10-25 (final update cycle 11) · Branch: `agent/work` · 28 commits · 183 tests, 0 failures
 Reference environment: WSL2, kernel 6.18.54.1, Ubuntu 24.04.5, i7-class
 x86_64 laptop (docs/agent/ENV.md).
 
@@ -68,6 +68,10 @@ dominates). Full cold path: 7 namespaces + rootfs + pivot + cgroup attach
 4. Landlock verified load-bearing (blocks /etc writes on writable tmpfs);
    PEP 538 LC_CTYPE injection identified as interpreter behavior, not a
    leak; dash's exported PWD documented.
+5. **Double-wait API bug** (C11 red-team 3): a second wait() silently
+   re-reported success. Fixed to one-shot with a clean error; concurrency
+   isolation and no-descriptor-leak proofs added (8 parallel sandboxes,
+   30 sequential runs).
 
 ## Honest limitations (also in threat-model §7)
 
