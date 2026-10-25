@@ -207,19 +207,35 @@ fn no_staging_dirs_leak_on_host() {
     }
     let before = count_staging();
     let _ = run(sh("echo done"));
-    let after = count_staging();
-    assert_eq!(before, after, "staging dirs must be cleaned up");
+    // Concurrent suites may legitimately have staging dirs in flight;
+    // our own one must disappear. Eventual-consistency window ~5s.
+    let mut after = count_staging();
+    for _ in 0..25 {
+        after = count_staging();
+        if after <= before {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        after <= before,
+        "staging dirs must be cleaned up (before={before}, after={after})"
+    );
 }
 
 fn count_staging() -> usize {
-    std::fs::read_dir("/tmp")
-        .map(|d| {
-            d.flatten()
-                .filter(|e| {
-                    let n = e.file_name().to_string_lossy().into_owned();
-                    n.starts_with("cara-root.")
-                })
-                .count()
-        })
-        .unwrap_or(0)
+    let count_in = |dir: &str| {
+        std::fs::read_dir(dir)
+            .map(|d| {
+                d.flatten()
+                    .filter(|e| {
+                        let n = e.file_name().to_string_lossy().into_owned();
+                        n.starts_with("cara-staging.") || n.starts_with("cara-root.")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    };
+    let xdg = std::env::var("XDG_RUNTIME_DIR").unwrap_or_default();
+    count_in("/tmp") + if xdg.is_empty() { 0 } else { count_in(&xdg) }
 }

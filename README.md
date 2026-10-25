@@ -7,10 +7,12 @@ arbitrary, untrusted programs (AI-generated code first and foremost) with
 hard limits on CPU, memory, processes, wall time, disk, and output, and
 strict control of filesystem and network access. No daemon. No Docker.
 
-> **Status: early development (milestone C0).** The environment gate
-> (`cara doctor`) works today; sandboxed execution lands over the coming
-> milestones (see docs/agent/STATE.md). Nothing is published yet, and no
-> security claim is made beyond what docs/agent/CLAIMS.md maps to a test.
+> **Status: Tier 1 works end to end (milestones C0–C7).** `cara doctor`
+> gates the environment, `cara run` executes with the full isolation
+> stack (namespaces, cgroups, Landlock, seccomp, capability drop), the
+> escape suite proves what is stopped, and `cara mcp` serves run_code to
+> agents. Nothing is published yet; every claim is mapped to a test in
+> docs/agent/CLAIMS.md.
 
 ## Why
 

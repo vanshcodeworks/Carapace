@@ -1,10 +1,11 @@
 # MCP Server Guide
 
-> **Status: NOT BUILT YET.** The server lands with **milestone C7 — being
-> built now** (`crates/cara-mcp`, currently a scaffold). Everything on this
-> page is the *design contract* the implementation must satisfy, plus the
-> client configuration you will use once it exists. Do not wire clients up
-> to it until the C7 milestone is announced in docs/agent/STATE.md.
+> **Status: BUILT (milestone C7, commit 335b8bb).** The server ships as
+> `cara mcp` (and the standalone `cara-mcp` binary) in `crates/cara-mcp`:
+> line-delimited JSON-RPC 2.0 over stdio, `initialize` / `tools/list` /
+> `tools/call`, with the hostile-input rules below enforced (28 protocol
+> unit tests + a real-sandbox e2e test). Client configuration below is
+> live.
 
 ## Purpose
 
