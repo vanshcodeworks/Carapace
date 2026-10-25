@@ -1,30 +1,18 @@
-//! Parent-side supervision of one sandbox run: stdio wiring, the go/exec
-//! handshake, wall-time timeout, output caps, pidfd kill, reaping.
+//! Parent-side supervision of one sandbox run (two-stage child design —
+//! see `child.rs` for why stage-1 is a plain fork that unshares later):
+//! stdio wiring, the go/exec handshake, cgroup attach, wall-time timeout,
+//! output caps, pidfd kill of the payload init, reaping, resource report.
 
-use crate::child::{ChildConfig, ChildError, stage};
+use crate::child::{ChildConfig, ChildError, msg, stage};
 use carapace_core::BackendError;
 use carapace_core::report::{ExitReport, KillReason};
 use carapace_core::spec::SandboxSpec;
 use carapace_sys::fork;
 use std::io::Read;
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-
-/// Namespace flags for every Tier 1 sandbox child: fresh user, PID, mount,
-/// network, IPC, UTS and cgroup namespaces (see threat-model §3 and
-/// ADR-0002 for the kill story that depends on CLONE_NEWPID).
-const SANDBOX_FLAGS: libc::c_int = (libc::SIGCHLD as libc::c_int)
-    | libc::CLONE_NEWUSER as libc::c_int
-    | libc::CLONE_NEWPID as libc::c_int
-    | libc::CLONE_NEWNS as libc::c_int
-    | libc::CLONE_NEWNET as libc::c_int
-    | libc::CLONE_NEWIPC as libc::c_int
-    | libc::CLONE_NEWUTS as libc::c_int
-    | libc::CLONE_NEWCGROUP as libc::c_int;
-
-const CHILD_STACK_SIZE: usize = 512 * 1024;
 
 fn pipe2_cloexec() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as libc::c_int; 2];
@@ -44,16 +32,37 @@ fn pipe2_cloexec() -> std::io::Result<(RawFd, RawFd)> {
 unsafe fn fd_owned_file(fd: RawFd) -> std::fs::File {
     unsafe {
         // SAFETY: caller guarantees the fd is valid and exclusively ours.
-        std::os::unix::io::FromRawFd::from_raw_fd(fd)
+        FromRawFd::from_raw_fd(fd)
     }
 }
 
-/// Reads `fd` until EOF into a Vec, keeping at most `cap` bytes and setting
-/// `overflow` when more arrived (the reader keeps draining so the child
-/// never blocks on a full pipe while dying).
-fn read_capped(mut file: std::fs::File, cap: usize, overflow: Arc<AtomicBool>) -> Vec<u8> {
+fn pidfd_open(pid: libc::pid_t) -> std::io::Result<libc::c_int> {
+    let r = unsafe {
+        // SAFETY: pidfd_open(2) on a live same-uid pid with flags 0.
+        libc::syscall(libc::SYS_pidfd_open, pid as libc::c_long, 0u32)
+    };
+    if r < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(r as libc::c_int)
+    }
+}
+
+/// Reads `fd` until EOF into a Vec, keeping at most `cap` bytes. On the
+/// first excess byte the overflow flag is set AND one byte goes to
+/// `signal_wr`, waking the supervisor's poll loop immediately (without the
+/// signal, a quiet-but-over-limit payload would only be noticed when poll
+/// times out). The reader keeps draining so the child never blocks on a
+/// full pipe while dying.
+fn read_capped(
+    mut file: std::fs::File,
+    cap: usize,
+    overflow: Arc<AtomicBool>,
+    signal_wr: RawFd,
+) -> Vec<u8> {
     let mut out = Vec::new();
     let mut buf = [0u8; 65536];
+    let mut signalled = false;
     loop {
         match file.read(&mut buf) {
             Ok(0) => break,
@@ -62,10 +71,10 @@ fn read_capped(mut file: std::fs::File, cap: usize, overflow: Arc<AtomicBool>) -
                     let take = std::cmp::min(n, cap - out.len());
                     out.extend_from_slice(&buf[..take]);
                     if n > take {
-                        overflow.store(true, Ordering::Relaxed);
+                        note_overflow(&overflow, signal_wr, &mut signalled);
                     }
                 } else if n > 0 {
-                    overflow.store(true, Ordering::Relaxed);
+                    note_overflow(&overflow, signal_wr, &mut signalled);
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -75,12 +84,30 @@ fn read_capped(mut file: std::fs::File, cap: usize, overflow: Arc<AtomicBool>) -
     out
 }
 
+fn note_overflow(overflow: &AtomicBool, signal_wr: RawFd, signalled: &mut bool) {
+    overflow.store(true, Ordering::Relaxed);
+    if !*signalled {
+        *signalled = true;
+        let b = b"!";
+        unsafe {
+            // SAFETY: one-byte write to our own pipe; EAGAIN is fine (the
+            // supervisor was already woken).
+            libc::write(signal_wr, b.as_ptr().cast(), 1);
+        }
+    }
+}
+
 /// One running sandbox. Created by [`super::backend::NativeBackend::spawn`].
 pub(crate) struct NativeSandbox {
-    pid: libc::pid_t,
-    pidfd: libc::c_int,
-    stack: (*mut u8, usize),
+    /// Stage-1 proxy pid (plain fork; exits after forwarding status).
+    pid1: libc::pid_t,
+    /// pidfd of the stage-2 payload init (pid 1 of the sandbox PID
+    /// namespace): primary kill target and exit poll source. None when the
+    /// payload exited before the pidfd could be opened (already finished).
+    pidfd2: Option<libc::c_int>,
     config: *mut libc::c_void,
+    /// Result pipe read end: receives EXIT_FORWARD after the payload dies.
+    result_file: Option<std::fs::File>,
     start: Instant,
     timeout: Duration,
     max_output: usize,
@@ -88,26 +115,35 @@ pub(crate) struct NativeSandbox {
     stderr_reader: Option<std::thread::JoinHandle<Vec<u8>>>,
     overflow: Arc<AtomicBool>,
     killed_reason: Mutex<Option<KillReason>>,
-    /// Set once the child has been reaped, with its raw wait status.
+    /// Forwarded raw waitpid status of the payload, once known.
     reaped: Mutex<Option<libc::c_int>>,
+    /// The run's cgroup leaf (limits + accounting); removed on drop.
+    cgroup_leaf: Option<crate::cgroup::CgroupLeaf>,
+    /// Self-pipe write end handed to the reader threads for overflow
+    /// signals; closed on drop.
+    overflow_wr: RawFd,
+    /// Self-pipe read end polled alongside the pidfd; closed on drop.
+    overflow_rd: RawFd,
 }
 
-// SAFETY: NativeSandbox owns its raw pointers exclusively (the mmap'd child
-// stack and the leaked ChildConfig); they are only dereferenced/freed on
-// the owning thread after the child is reaped, so moving the handle across
-// threads cannot race anything.
+// SAFETY: NativeSandbox owns its raw pointer (the leaked ChildConfig)
+// exclusively; it is only dereferenced/freed on the owning thread after
+// the child is reaped, so moving the handle across threads cannot race.
 unsafe impl Send for NativeSandbox {}
 
 /// Spawns the sandbox child. Returns the live handle, or a `Setup` error
 /// when isolation could not be established (the payload never ran).
 pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
+    // Honest wall-time origin: the very beginning of the spawn, not the
+    // moment supervision begins (the payload may already be running by
+    // then — the handshake overlaps the payload's first milliseconds).
+    let spawn_start = Instant::now();
     let setup = |what: &str, e: std::io::Error| -> BackendError {
         BackendError::Setup(format!("{what}: {e}"))
     };
 
     // Host-layout validation for the C2 runtime recipe (fail closed BEFORE
-    // cloning: merged-usr with a real /usr tree). Narrow, recipe-driven
-    // rootfs builds replace this in later milestones.
+    // forking: merged-usr with a real /usr tree).
     for p in ["/usr/bin/sh", "/usr/lib", "/usr/lib64"] {
         if std::fs::metadata(p).is_err() {
             return Err(BackendError::Setup(format!(
@@ -116,10 +152,11 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         }
     }
 
-    // Pipes: all CLOEXEC. The child dup2s 0/1/2 (dup2 clears CLOEXEC on the
+    // Pipes: all CLOEXEC. Stage-2 dup2s 0/1/2 (dup2 clears CLOEXEC on the
     // targets — exactly what the payload's stdio needs); every other
     // inherited copy vanishes at exec.
     let (status_rd, status_wr) = pipe2_cloexec().map_err(|e| setup("status pipe", e))?;
+    let (result_rd, result_wr) = pipe2_cloexec().map_err(|e| setup("result pipe", e))?;
     let (go_rd, go_wr) = pipe2_cloexec().map_err(|e| setup("go pipe", e))?;
     let (stdout_rd, stdout_wr) = pipe2_cloexec().map_err(|e| setup("stdout pipe", e))?;
     let (stderr_rd, stderr_wr) = pipe2_cloexec().map_err(|e| setup("stderr pipe", e))?;
@@ -133,12 +170,11 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         }
         fd
     };
-    // Reader files take exclusive ownership of these fds.
     let stdout_file = unsafe { fd_owned_file(stdout_rd) };
     let stderr_file = unsafe { fd_owned_file(stderr_rd) };
-    let status_file = unsafe { fd_owned_file(status_rd) };
+    let mut status_file = unsafe { fd_owned_file(status_rd) };
 
-    // argv/env as CStrings now — the child must not allocate.
+    // argv/env as CStrings now — the children must not allocate.
     let mk_cstring = |s: &str, what: &str| -> Result<std::ffi::CString, BackendError> {
         std::ffi::CString::new(s).map_err(|e| setup(what, std::io::Error::other(format!("{e}"))))
     };
@@ -156,17 +192,17 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         argv,
         envp,
         status_wr,
+        result_wr,
         go_rd,
         stdin_fd: devnull_rd,
         stdout_fd: stdout_wr,
         stderr_fd: stderr_wr,
-        // Capture BEFORE clone: the child's own getuid() inside the new
-        // userns reports the overflow id until the map is written.
+        // Capture BEFORE fork: inside the new userns getuid() reports the
+        // overflow id until the map is written.
         parent_uid: unsafe { libc::getuid() }, // SAFETY: plain getter
         parent_gid: unsafe { libc::getgid() }, // SAFETY: plain getter
-        // tmpfs size options, pre-formatted here so the child never
-        // formats. Root holds /etc, symlinks, empty dirs: 8 MiB is ample.
-        // /work is the payload's writable scratch from the policy.
+        // tmpfs size options, pre-formatted here so the children never
+        // format. Root holds /etc, symlinks, empty dirs: 8 MiB is ample.
         root_size_opt: std::ffi::CString::new(format!("size={}", 8 * 1024 * 1024))
             .expect("numeric size option has no NULs"),
         work_size_opt: std::ffi::CString::new(format!("size={}", spec.limits.scratch_bytes))
@@ -174,43 +210,57 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
     });
     let config_ptr = Box::into_raw(config) as *mut libc::c_void;
 
-    let (stack_base, stack_size) =
-        unsafe { fork::alloc_child_stack(CHILD_STACK_SIZE) }.map_err(|e| {
-            release_config(config_ptr);
-            setup("child stack", e)
-        })?;
-    let stack_top = unsafe { stack_base.add(stack_size) };
-
-    let spawned = unsafe {
-        fork::clone_ns(
-            crate::child::child_main,
-            stack_top,
-            SANDBOX_FLAGS,
-            config_ptr,
-        )
+    // Stage-1: a PLAIN fork (no namespaces yet) — required so the parent
+    // can move it into the cgroup leaf (see child.rs design note).
+    let pid1 = unsafe {
+        // SAFETY: fork(2); the child branch immediately calls the
+        // async-signal-safe child_main and _exits.
+        libc::fork()
     };
-    let spawned = match spawned {
-        Ok(s) => s,
-        Err(e) => {
-            unsafe { fork::munmap_stack(stack_base, stack_size) };
-            release_config(config_ptr);
-            return Err(setup("clone(namespaces)", e));
+    if pid1 < 0 {
+        release_config(config_ptr);
+        return Err(setup("fork", std::io::Error::last_os_error()));
+    }
+    if pid1 == 0 {
+        let code = crate::child::child_main(config_ptr);
+        unsafe {
+            // SAFETY: stage-1/2 never return normally; this is the final
+            // exit for unexpected returns.
+            libc::_exit(code);
+        }
+    }
+
+    // Fail-closed cleanup for any handshake failure below.
+    // C3: create the cgroup leaf and attach the PARKED stage-1 child. It
+    // has no namespaces and no descendants yet, so the limits cover every
+    // process this run will ever create. Failure is fatal (fail closed).
+    let cgroup_leaf = match crate::cgroup::delegated_root() {
+        Some(root) => match crate::cgroup::CgroupLeaf::create(&root, &spec.limits, pid1) {
+            Ok(leaf) => leaf,
+            Err(e) => {
+                return Err(spawn_cleanup(
+                    pid1,
+                    None,
+                    None,
+                    config_ptr,
+                    "cgroup limits",
+                    e,
+                ));
+            }
+        },
+        None => {
+            return Err(spawn_cleanup(
+                pid1,
+                None,
+                None,
+                config_ptr,
+                "cgroup limits",
+                std::io::Error::other("no delegated cgroup root found"),
+            ));
         }
     };
 
-    // Post-clone, pre-exec cleanup for any handshake failure below: the
-    // child must never be left half-configured (fail closed).
-    let child_pid = spawned.pid;
-    let child_pidfd = spawned.pidfd;
-    let cleanup_err = move |what: &str, e: std::io::Error| -> BackendError {
-        kill_and_reap(&spawned);
-        unsafe { fork::munmap_stack(stack_base, stack_size) };
-        release_config(config_ptr);
-        setup(what, e)
-    };
-
-    // Tell the child to exec (nothing between clone and exec needs the
-    // parent in C1; C3 uses this window for the cgroup attach).
+    // Release stage-1: it unshares everything and forks the payload init.
     let go_buf = *b"G";
     loop {
         let n = unsafe {
@@ -224,26 +274,95 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         if e.raw_os_error() == Some(libc::EINTR) {
             continue;
         }
-        return Err(cleanup_err("go signal", e));
+        return Err(spawn_cleanup(
+            pid1,
+            None,
+            Some(&cgroup_leaf),
+            config_ptr,
+            "go signal",
+            e,
+        ));
     }
 
-    // CRITICAL: close the parent's copies of every child-facing fd NOW.
-    // The child has its own duplicates; holding write-ends open here would
-    // block EOF detection on the status/stdio pipes forever (observed as a
-    // supervisor hang). Nothing of the child survives in our fd table.
-    for fd in [status_wr, go_rd, go_wr, stdout_wr, stderr_wr, devnull_rd] {
+    // CRITICAL: close the parent's copies of every child-facing fd NOW:
+    // holding write-ends open here would block EOF detection on the
+    // status/stdio pipes forever.
+    for fd in [
+        status_wr, result_wr, go_rd, go_wr, stdout_wr, stderr_wr, devnull_rd,
+    ] {
         unsafe {
-            // SAFETY: fds we created; after the clone (which duplicated
-            // them into the child) and the go write, the parent has no
-            // further use for any of them.
+            // SAFETY: fds we created; the children hold their own
+            // duplicates and the go byte was already written.
             libc::close(fd);
         }
     }
-    // status_rd lives on as `status_file`; stdio read ends as reader Files.
 
-    // exec confirmation: EOF = running; ChildError = pre-exec failure
-    // (fail closed — the payload never ran).
-    let mut status_file = status_file;
+    let mut result_file = unsafe { fd_owned_file(result_rd) };
+    let (overflow_rd, overflow_wr) = pipe2_cloexec().map_err(|e| setup("overflow pipe", e))?;
+    // Handshake (two pipes, unambiguous):
+    //  - result pipe (stage-1): PID2_NOTICE now, EXIT_FORWARD at payload end
+    //  - status pipe (stage-2): ChildError on pre-exec failure; EOF = exec
+    let mut got = [0u8; std::mem::size_of::<ChildError>()];
+    let mut off = 0usize;
+    while off < got.len() {
+        match result_file.read(&mut got[off..]) {
+            Ok(0) => {
+                return Err(spawn_cleanup(
+                    pid1,
+                    None,
+                    Some(&cgroup_leaf),
+                    config_ptr,
+                    "handshake",
+                    std::io::Error::other("stage-1 died before forking the payload"),
+                ));
+            }
+            Ok(n) => off += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                return Err(spawn_cleanup(
+                    pid1,
+                    None,
+                    Some(&cgroup_leaf),
+                    config_ptr,
+                    "result pipe",
+                    e,
+                ));
+            }
+        }
+    }
+    let notice: ChildError = unsafe { std::ptr::read_unaligned(got.as_ptr() as *const ChildError) };
+    if notice.stage != msg::PID2_NOTICE {
+        return Err(spawn_cleanup(
+            pid1,
+            None,
+            Some(&cgroup_leaf),
+            config_ptr,
+            "handshake",
+            std::io::Error::other(format!("unexpected stage-1 message {}", notice.stage)),
+        ));
+    }
+    let pid2 = notice.errno;
+    // Short-lived payloads can exit before we open the pidfd (pidfd_open
+    // refuses zombies with ESRCH): that is not a setup failure — the run
+    // simply already finished. wait() handles the None case by reaping
+    // directly from the result pipe.
+    let pidfd2 = match pidfd_open(pid2) {
+        Ok(f) => Some(f),
+        Err(e) if e.raw_os_error() == Some(libc::ESRCH) => None,
+        Err(e) => {
+            return Err(spawn_cleanup(
+                pid1,
+                Some(pid2),
+                Some(&cgroup_leaf),
+                config_ptr,
+                "pidfd_open(payload)",
+                std::io::Error::other(format!("{e} (pid {pid2})")),
+            ));
+        }
+    };
+
+    // exec confirmation on the STATUS pipe: EOF = running; ChildError =
+    // pre-exec failure (fail closed — the payload never ran).
     let mut pre = [0u8; std::mem::size_of::<ChildError>()];
     loop {
         match status_file.read(&mut pre) {
@@ -252,20 +371,35 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 let report: ChildError =
                     unsafe { std::ptr::read_unaligned(pre.as_ptr() as *const ChildError) };
                 let stage_name = stage_name(report.stage);
-                return Err(cleanup_err(
+                return Err(spawn_cleanup(
+                    pid1,
+                    Some(pid2),
+                    Some(&cgroup_leaf),
+                    config_ptr,
                     &format!("child setup at {stage_name}"),
                     std::io::Error::from_raw_os_error(report.errno),
                 ));
             }
             Ok(_) => {
-                return Err(cleanup_err(
+                return Err(spawn_cleanup(
+                    pid1,
+                    Some(pid2),
+                    Some(&cgroup_leaf),
+                    config_ptr,
                     "status pipe",
                     std::io::Error::other("short read"),
                 ));
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => {
-                return Err(cleanup_err("status pipe", e));
+                return Err(spawn_cleanup(
+                    pid1,
+                    Some(pid2),
+                    Some(&cgroup_leaf),
+                    config_ptr,
+                    "status pipe",
+                    e,
+                ));
             }
         }
     }
@@ -276,20 +410,21 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
     let ov1 = Arc::clone(&overflow);
     let stdout_reader = std::thread::Builder::new()
         .stack_size(256 * 1024)
-        .spawn(move || read_capped(stdout_file, cap, ov1))
+        .spawn(move || read_capped(stdout_file, cap, ov1, overflow_wr))
         .map_err(|e| setup("stdout reader", e))?;
     let ov2 = Arc::clone(&overflow);
     let stderr_reader = std::thread::Builder::new()
         .stack_size(256 * 1024)
-        .spawn(move || read_capped(stderr_file, cap, ov2))
+        .spawn(move || read_capped(stderr_file, cap, ov2, overflow_wr))
         .map_err(|e| setup("stderr reader", e))?;
 
+    drop(status_file); // status pipe fully consumed; result pipe kept
     Ok(NativeSandbox {
-        pid: child_pid,
-        pidfd: child_pidfd,
-        stack: (stack_base, stack_size),
+        pid1,
+        pidfd2,
         config: config_ptr,
-        start: Instant::now(),
+        result_file: Some(result_file),
+        start: spawn_start,
         timeout: spec.limits.timeout,
         max_output: spec.limits.max_output_bytes,
         stdout_reader: Some(stdout_reader),
@@ -297,6 +432,9 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         overflow,
         killed_reason: Mutex::new(None),
         reaped: Mutex::new(None),
+        cgroup_leaf: Some(cgroup_leaf),
+        overflow_wr,
+        overflow_rd,
     })
 }
 
@@ -304,19 +442,49 @@ fn release_config(p: *mut libc::c_void) {
     if !p.is_null() {
         unsafe {
             // SAFETY: p came from Box::into_raw in spawn; reclaimed exactly
-            // once, after the child that referenced it is dead.
+            // once, after the children that referenced it are dead.
             drop(Box::from_raw(p as *mut ChildConfig));
         }
     }
 }
 
-fn kill_and_reap(spawned: &fork::SpawnedChild) {
-    let _ = fork::pidfd_send_signal(spawned.pidfd, libc::SIGKILL);
-    let mut status: libc::c_int = 0;
-    unsafe {
-        // SAFETY: blocking waitpid on our direct clone child; cleanup path.
-        libc::waitpid(spawned.pid, &mut status, 0);
+/// Fail-closed teardown for a spawn that could not complete: kill every
+/// process of the half-built run (cgroup.kill covers both stages even when
+/// the payload pid is unknown), reap what we can, free the config, and
+/// return the Setup error.
+fn spawn_cleanup(
+    pid1: libc::pid_t,
+    pid2: Option<libc::pid_t>,
+    leaf: Option<&crate::cgroup::CgroupLeaf>,
+    config_ptr: *mut libc::c_void,
+    what: &str,
+    e: std::io::Error,
+) -> BackendError {
+    if let Some(l) = leaf {
+        l.kill();
     }
+    unsafe {
+        // SAFETY: signaling our own children; reaping the proxy.
+        libc::kill(pid1, libc::SIGKILL);
+        let mut st: libc::c_int = 0;
+        libc::waitpid(pid1, &mut st, 0);
+        if let Some(p2) = pid2 {
+            // The payload init was reparented to us when stage-1 died; it
+            // is SIGKILLed already, so a blocking reap terminates quickly.
+            let mut st2: libc::c_int = 0;
+            libc::waitpid(p2, &mut st2, 0);
+        } else {
+            // pid2 unknown: bounded, non-blocking, best-effort sweep.
+            for _ in 0..8 {
+                let mut st2: libc::c_int = 0;
+                if libc::waitpid(-1, &mut st2, libc::WNOHANG) <= 0 {
+                    break;
+                }
+            }
+        }
+    }
+    release_config(config_ptr);
+    BackendError::Setup(format!("{what}: {e}"))
 }
 
 fn stage_name(stage: u8) -> &'static str {
@@ -335,6 +503,7 @@ fn stage_name(stage: u8) -> &'static str {
         stage::PIVOT_CHDIR => "pivot chdir",
         stage::PIVOT_DETACH => "pivot detach",
         stage::VERIFY => "post-pivot verify",
+        stage::NS_SETUP => "namespace unshare",
         _ => "unknown",
     }
 }
@@ -367,16 +536,28 @@ impl NativeSandbox {
                 break;
             }
 
-            let mut pfd = [libc::pollfd {
-                fd: self.pidfd,
-                events: libc::POLLIN,
-                revents: 0,
-            }];
+            let Some(pidfd2) = self.pidfd2 else {
+                // Payload already exited before we could open a pidfd:
+                // nothing to poll; reap directly.
+                break;
+            };
+            let mut pfd = [
+                libc::pollfd {
+                    fd: pidfd2,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.overflow_rd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
             let remaining = ((deadline - now).as_millis().min(i32::MAX as u128) as i32) + 1;
             let n = unsafe {
-                // SAFETY: poll(2) over one valid pollfd with a bounded
+                // SAFETY: poll(2) over two valid pollfds with a bounded
                 // timeout; EINTR handled below.
-                libc::poll(pfd.as_mut_ptr(), 1, remaining)
+                libc::poll(pfd.as_mut_ptr(), 2, remaining)
             };
             if n < 0 {
                 let e = std::io::Error::last_os_error();
@@ -386,9 +567,8 @@ impl NativeSandbox {
                 return Err(BackendError::Supervision(format!("poll: {e}")));
             }
             if n > 0 && (pfd[0].revents & libc::POLLIN) != 0 {
-                break; // child exited
+                break; // payload init exited
             }
-            // n == 0 → timeout re-checked at loop top
         }
 
         let status = self.reap();
@@ -406,42 +586,69 @@ impl NativeSandbox {
     }
 
     fn kill_tree(&mut self) {
-        // Kill the PID-namespace init; the kernel then SIGKILLs everything
-        // left in that namespace (ADR-0002). No waitpid(-1) sweep here: a
-        // process hosting several sandboxes concurrently (the test suite,
-        // the future pool) must never reap another sandbox's children.
-        // Escaped descendants are prevented by the PID namespace itself.
-        let _ = fork::pidfd_send_signal(self.pidfd, libc::SIGKILL);
+        // Primary: SIGKILL the payload init via pidfd (kernel then kills
+        // everything left in its PID namespace — ADR-0002).
+        if let Some(fd) = self.pidfd2 {
+            let _ = fork::pidfd_send_signal(fd, libc::SIGKILL);
+        }
+        // The proxy dies with the payload (it only waits and forwards);
+        // kill it too so it can never linger.
+        unsafe {
+            // SAFETY: signaling our direct child; pid reuse is not a
+            // concern while stage-1 is alive, and cgroup.kill covers races.
+            libc::kill(self.pid1, libc::SIGKILL);
+        }
+        // Third switch: cgroup.kill SIGKILLs everything in the leaf.
+        if let Some(leaf) = &self.cgroup_leaf {
+            leaf.kill();
+        }
     }
 
+    /// Reads the forwarded payload status and reaps the proxy.
     fn reap(&mut self) -> libc::c_int {
         let mut slot = self.reaped.lock().unwrap();
         if let Some(s) = *slot {
             return s;
         }
-        loop {
-            let mut status: libc::c_int = 0;
-            let r = unsafe {
-                // SAFETY: blocking waitpid on our direct child.
-                libc::waitpid(self.pid, &mut status, 0)
-            };
-            if r == self.pid {
-                *slot = Some(status);
-                return status;
-            }
-            if r < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.raw_os_error() == Some(libc::EINTR) {
-                    continue;
+        // Read the EXIT_FORWARD message (8 bytes) from the status pipe.
+        let mut fwd = [0u8; std::mem::size_of::<ChildError>()];
+        let mut got: Option<libc::c_int> = None;
+        if let Some(f) = self.result_file.as_mut() {
+            let mut off = 0usize;
+            while off < fwd.len() {
+                match f.read(&mut fwd[off..]) {
+                    Ok(0) => break,
+                    Ok(n) => off += n,
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
                 }
-                // ECHILD despite the pidfd saying it exited: the subreaper
-                // sweep already reaped it. Synthesize a SIGKILL death — the
-                // only path here is supervisor-initiated kills.
-                let s = 128 + libc::SIGKILL;
-                *slot = Some(s);
-                return s;
+            }
+            if off == fwd.len() {
+                let m: ChildError =
+                    unsafe { std::ptr::read_unaligned(fwd.as_ptr() as *const ChildError) };
+                if m.stage == msg::EXIT_FORWARD {
+                    got = Some(m.errno);
+                }
             }
         }
+        // Reap the proxy regardless.
+        let mut st1: libc::c_int = 0;
+        loop {
+            let r = unsafe {
+                // SAFETY: blocking waitpid on our direct child (stage-1).
+                libc::waitpid(self.pid1, &mut st1, 0)
+            };
+            if r == self.pid1 {
+                break;
+            }
+            let e = std::io::Error::last_os_error();
+            if e.raw_os_error() != Some(libc::EINTR) {
+                break;
+            }
+        }
+        let status = got.unwrap_or(128 + libc::SIGKILL);
+        *slot = Some(status);
+        status
     }
 
     fn finish_report(&mut self, status: libc::c_int) -> ExitReport {
@@ -456,6 +663,13 @@ impl NativeSandbox {
             None
         };
 
+        // Accounting (leaf must still exist; it is removed on Drop).
+        let stats = self
+            .cgroup_leaf
+            .as_ref()
+            .map(crate::cgroup::CgroupLeaf::stats)
+            .unwrap_or_default();
+
         let stdout = self
             .stdout_reader
             .take()
@@ -467,13 +681,22 @@ impl NativeSandbox {
             .and_then(|t| t.join().ok())
             .unwrap_or_default();
 
+        let mut kill_reason = self.killed_reason.lock().unwrap().take();
+        if kill_reason.is_none() && stats.oom_kill && signal == Some(libc::SIGKILL) {
+            // The kernel OOM-killed the run within its memory limit.
+            kill_reason = Some(KillReason::MemoryLimit);
+        }
+
         ExitReport {
             exit_code,
             signal,
-            kill_reason: self.killed_reason.lock().unwrap().take(),
+            kill_reason,
             wall_time: self.start.elapsed(),
             stdout: truncate_cap(stdout, self.max_output),
             stderr: truncate_cap(stderr, self.max_output),
+            cpu_time: stats.cpu_usec.map(Duration::from_micros),
+            peak_memory_bytes: stats.peak_memory_bytes,
+            peak_processes: stats.peak_processes,
         }
     }
 }
@@ -486,7 +709,7 @@ fn truncate_cap(mut v: Vec<u8>, cap: usize) -> Vec<u8> {
 impl Drop for NativeSandbox {
     fn drop(&mut self) {
         // Safety net: even if wait() was never called, the tree dies and
-        // nothing leaks (pipes, stack, config, zombies, staging dir).
+        // nothing leaks (pipes, config, zombies, cgroup leaf, pidfd).
         self.kill_tree();
         let _ = self.reap();
         if let Some(t) = self.stdout_reader.take() {
@@ -495,11 +718,18 @@ impl Drop for NativeSandbox {
         if let Some(t) = self.stderr_reader.take() {
             let _ = t.join();
         }
+        self.result_file.take(); // closes the result pipe
         release_config(self.config);
-        let (base, size) = self.stack;
+        if let Some(fd) = self.pidfd2 {
+            unsafe {
+                // SAFETY: pidfd we opened in spawn; all users are done.
+                libc::close(fd);
+            }
+        }
         unsafe {
-            // SAFETY: from alloc_child_stack; child is reaped by now.
-            fork::munmap_stack(base, size);
+            // SAFETY: our overflow self-pipe; readers have been joined.
+            libc::close(self.overflow_wr);
+            libc::close(self.overflow_rd);
         }
     }
 }

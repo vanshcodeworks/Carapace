@@ -23,3 +23,19 @@ Commands: scripts/check.sh (fmt+clippy+test), single-thread test reruns,
 process autopsies via .wsl/probe-stuck.sh.
 Results: cargo test -p carapace-native: 9/9 ok in 0.92s.
 Next: C2 rootfs/pivot_root (child mount sequence + self-verification).
+
+## Cycle 3 — 2026-10-25 — C2 complete
+Task: child rootfs + pivot_root + fs-isolation tests.
+Outcome: DONE @ 745dc0a. Rootfs: private-/tmp-then-pivot design (no host
+artifacts at all — replaced mkdtemp staging which leaked dirs due to async
+ns teardown + EEXIST races). Empirical lessons: empty-slice as_ptr is
+dangling for mount(NULL,...) => EFAULT; MNT_DETACH is umount2-only =>
+EINVAL as mount flag; uid_map needs parent-recorded ids (re-confirmed via
+probes); waitpid(-1) sweeps in multi-sandbox processes steal other
+sandboxes' children (removed; pidns kill suffices). python3 runs in the
+sandbox (~8ms full spawn+exec wall time via examples/probe).
+Commands: scripts/check.sh; .wsl/probe-pivot*.c isolations; fresh-binary
+test runs via .wsl/run-tests.sh (lesson: cargo build -p cli does NOT
+rebuild test binaries — caused a false-persisting bug report).
+Results: 19/19 integration tests green (9 supervisor + 10 rootfs).
+Next: C3 cgroup limits.

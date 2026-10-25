@@ -9,6 +9,9 @@ pub enum KillReason {
     Timeout,
     /// stdout+stderr exceeded the configured byte cap.
     OutputOverflow,
+    /// The memory limit was hit and the kernel OOM-killed the run
+    /// (detected via the cgroup's memory.events counter).
+    MemoryLimit,
     /// Carapace-internal failure while setting up or supervising the run.
     /// The code never ran or stopped running: never silently ignored.
     Internal(String),
@@ -30,7 +33,12 @@ pub struct ExitReport {
     pub stdout: Vec<u8>,
     /// Captured stderr (already capped).
     pub stderr: Vec<u8>,
-    // C3: cpu_time, peak memory, oom kill flag from cgroups.
+    /// CPU time consumed by the whole tree (cgroup cpu.stat), if available.
+    pub cpu_time: Option<Duration>,
+    /// Peak memory of the whole tree (cgroup memory.peak), if available.
+    pub peak_memory_bytes: Option<u64>,
+    /// Peak process count (cgroup pids.peak), if the kernel provides it.
+    pub peak_processes: Option<u64>,
 }
 
 impl ExitReport {
@@ -54,6 +62,9 @@ mod tests {
             wall_time: Duration::from_millis(1),
             stdout: Vec::new(),
             stderr: Vec::new(),
+            cpu_time: None,
+            peak_memory_bytes: None,
+            peak_processes: None,
         };
         assert!(r.ran_to_completion());
         r.kill_reason = Some(KillReason::Timeout);

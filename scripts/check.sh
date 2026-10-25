@@ -16,6 +16,17 @@ if ! command -v cargo >/dev/null 2>&1 && [ -f "$HOME/.cargo/env" ]; then
   . "$HOME/.cargo/env"
 fi
 
+# Cgroup delegation requires running inside the user slice. Normal Linux
+# logins are; WSL's wsl.exe commands land in a root-owned /non-systemd
+# cgroup outside it, so bridge the whole run through the user manager
+# (one systemd-run, ~15ms — see docs/agent/ENV.md and doctor's remedy).
+if ! grep -q "user.slice/user-$(id -u).slice" /proc/self/cgroup 2>/dev/null \
+   && command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user true >/dev/null 2>&1; then
+  echo "==> outside user slice; re-running under systemd-run --user --scope"
+  exec systemd-run --user --scope --quiet "$0" "$@"
+fi
+
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check
 

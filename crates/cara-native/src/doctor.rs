@@ -6,7 +6,7 @@
 
 use carapace_core::{Check, DoctorReport};
 use carapace_sys::{landlock, mount, ns, seccomp};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 /// Controllers Tier 1 requires to enforce its documented limits.
 const REQUIRED_CONTROLLERS: [&str; 3] = ["memory", "cpu", "pids"];
@@ -119,18 +119,6 @@ fn check_cgroup2() -> Check {
     }
 }
 
-/// Resolves the cgroup v2 directory of this process under /sys/fs/cgroup.
-fn own_cgroup_dir() -> Option<PathBuf> {
-    let line = std::fs::read_to_string("/proc/self/cgroup").ok()?;
-    let v2 = line.lines().find(|l| l.starts_with("0::"))?;
-    let rel = v2.trim_start_matches("0::").trim();
-    if rel.is_empty() {
-        Some(PathBuf::from("/sys/fs/cgroup"))
-    } else {
-        Some(PathBuf::from("/sys/fs/cgroup").join(rel))
-    }
-}
-
 fn read_controllers(dir: &Path) -> Vec<String> {
     std::fs::read_to_string(dir.join("cgroup.controllers"))
         .unwrap_or_default()
@@ -139,73 +127,28 @@ fn read_controllers(dir: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Finds a cgroup this process may create children in — the delegation root
-/// the supervisor will build `cara-*` leaf cgroups under.
-///
-/// Search order (the first writable directory wins):
-/// 1. this process's own cgroup and its ancestors (the normal case for a
-///    systemd login session, where `user@<uid>.service` is delegated);
-/// 2. the systemd user-manager slice
-///    `/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service`
-///    (with `enable-linger`, this subtree is delegated to us *even when the
-///    current process sits elsewhere* — e.g. WSL puts non-login commands in
-///    a root-owned `/non-systemd` cgroup). Attaching the sandbox child to a
-///    leaf under this subtree only requires writing the *child's* pid, not
-///    moving ourselves.
-fn find_delegation_root() -> Option<(PathBuf, Vec<String>)> {
-    let mut candidates = Vec::new();
-    if let Some(mut cur) = own_cgroup_dir() {
-        loop {
-            candidates.push(cur.clone());
-            if !cur.pop() {
-                break;
-            }
-        }
-    }
-    let uid = unsafe { libc::getuid() };
-    // SAFETY: getuid is a plain getter with no failure mode.
-    candidates.push(PathBuf::from(format!(
-        "/sys/fs/cgroup/user.slice/user-{uid}.slice/user@{uid}.service"
-    )));
-    for cur in candidates {
-        let probe = cur.join(unique_probe_name());
-        match std::fs::create_dir(&probe) {
-            Ok(()) => {
-                // Best-effort cleanup; a leftover dot-dir is inert.
-                let _ = std::fs::remove_dir(&probe);
-                let controllers = read_controllers(&cur);
-                return Some((cur, controllers));
-            }
-            Err(_) => continue,
-        }
-    }
-    None
-}
-
-/// Unique name for delegation probes so concurrent callers (tests) never
-/// observe each other's probe directories.
-fn unique_probe_name() -> String {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SEQ: AtomicU64 = AtomicU64::new(0);
-    format!(
-        ".cara-doctor-probe-{}-{}",
-        std::process::id(),
-        SEQ.fetch_add(1, Ordering::Relaxed)
-    )
-}
-
 fn check_delegation() -> Check {
-    match find_delegation_root() {
+    // The REAL capability test: not just a writable directory, but the
+    // ability to move a forked child into a leaf under it. nsdelegate
+    // denies cross-boundary moves — e.g. WSL puts wsl.exe commands in a
+    // root-owned /non-systemd cgroup outside the user slice.
+    let attach_root = crate::cgroup::attach_capable_root();
+    match attach_root {
         None => Check::fail(
             "cgroup-delegation",
             "cgroup delegation",
-            "no writable cgroup in this process's ancestry: memory/cpu/pids limits cannot be set",
-            "With systemd: `sudo loginctl enable-linger $USER` and ensure the user slice \
-             delegates controllers (drop-in /etc/systemd/system/user@.service.d/delegate.conf \
-             with `[Service]\\nDelegate=cpu io memory pids`), then re-login. \
+            "cannot move a child process into a delegated cgroup leaf from here \
+             (memory/cpu/pids limits would be unenforceable)",
+            "On a normal Linux login this works out of the box. If this process \
+             sits outside its user slice (WSL puts wsl.exe commands in \
+             /non-systemd), run cara inside the user manager: \
+             `systemd-run --user --scope --quiet cara ...` or from a real login \
+             session. Also verify delegation: `sudo loginctl enable-linger $USER` \
+             plus a user@.service Delegate=cpu io memory pids drop-in. \
              See docs/troubleshooting.md.",
         ),
-        Some((root, controllers)) => {
+        Some(root) => {
+            let controllers = read_controllers(&root);
             let missing_required: Vec<&str> = REQUIRED_CONTROLLERS
                 .iter()
                 .filter(|c| !controllers.contains(&c.to_string()))
@@ -404,10 +347,10 @@ mod tests {
 
     #[test]
     fn delegation_probe_cleans_up_after_itself() {
-        // Run twice; a leftover probe dir would make the second run observe
-        // it (mkdir of an existing dir fails), so success twice proves cleanup.
-        let first = find_delegation_root();
-        let second = find_delegation_root();
+        // Run twice; a leftover probe leaf would make the second run's
+        // attach fail, so success twice proves cleanup.
+        let first = crate::cgroup::attach_capable_root();
+        let second = crate::cgroup::attach_capable_root();
         assert_eq!(first.is_some(), second.is_some());
     }
 }

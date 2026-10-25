@@ -31,6 +31,7 @@ pub mod stage {
     pub const PIVOT_CHDIR: u8 = 13;
     pub const PIVOT_DETACH: u8 = 14;
     pub const VERIFY: u8 = 12;
+    pub const NS_SETUP: u8 = 15;
 }
 
 /// Fixed-size pre-exec failure report written to the exec-status pipe.
@@ -47,9 +48,13 @@ pub(crate) struct ChildConfig {
     pub argv: Vec<CString>,
     /// Full envp for execve.
     pub envp: Vec<CString>,
-    /// Write end of the exec-status pipe (CLOEXEC). exec success = the pipe
-    /// closes (EOF at the parent); failure = a [`ChildError`] is written.
+    /// Write end of the exec-status pipe (CLOEXEC, STAGE-2 ONLY). exec
+    /// success = the pipe closes (EOF at the parent); failure = a
+    /// [`ChildError`] is written.
     pub status_wr: RawFd,
+    /// Write end of the result pipe (STAGE-1 ONLY, held until exit): the
+    /// payload-pid notice and, later, the forwarded wait status.
+    pub result_wr: RawFd,
     /// Read end of the go-pipe (CLOEXEC). The child blocks until the parent
     /// says go, so the parent can finish any post-clone, pre-exec setup
     /// (cgroup attach from C3) without racing the payload.
@@ -628,8 +633,32 @@ impl OrFail for Result<(), i32> {
     }
 }
 
-/// The child entry point. `arg` is a leaked `*mut Box<ChildConfig>` (the
-/// Box is recovered with Box::from_raw — no allocation involved).
+/// Stage message kinds sent through the exec-status pipe beyond error
+/// reports (see the two-stage design note on [`child_main`]).
+pub mod msg {
+    /// stage=20: payload pid (the PID-namespace init) in `errno`.
+    pub const PID2_NOTICE: u8 = 20;
+    /// stage=21: forwarded raw waitpid status of the payload in `errno`.
+    pub const EXIT_FORWARD: u8 = 21;
+}
+
+/// The child entry point: a TWO-STAGE design.
+///
+/// The supervisor forks a PLAIN (no namespaces) stage-1 process, because a
+/// rootless parent may only move a plain child of its own uid into a
+/// delegated cgroup leaf (crossing into the subtree from a user namespace
+/// is denied by `nsdelegate`). Stage-1 then:
+///
+/// 1. waits for the go signal (parent attaches it to the cgroup leaf first),
+/// 2. `unshare`s ALL namespaces (user/pid/mount/net/ipc/uts) in one call —
+///    the unprivileged-legal combination — and writes its id maps,
+/// 3. forks stage-2, which (as pid 1 of the new PID namespace, so its death
+///    kills the whole tree) does rlimits → rootfs → pivot → stdio → execve,
+/// 4. forwards the payload pid and later its wait status to the supervisor,
+///    and exits.
+///
+/// Fork safety: between fork and exec, stage-1/2 only use raw syscalls
+/// (no allocation, no std formatting, no locks).
 pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
     let cfg: &ChildConfig = unsafe {
         // SAFETY: the parent passed a leaked Box<ChildConfig> pointer via
@@ -637,26 +666,129 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         &*(arg as *const ChildConfig)
     };
 
-    // 1. Deny setgroups, then write uid/gid maps: we are uid 0 inside the
+    // 1. Park until the parent has attached this process to the cgroup
+    //    leaf (limits must cover every descendant we are about to create).
+    if let Err(e) = wait_for_go(cfg.go_rd) {
+        fail(cfg, stage::SYNC, e);
+    }
+
+    // 2. All namespaces at once. NEWUSER first in the flag set is what
+    //    makes this unprivileged-legal: the kernel creates the user
+    //    namespace, then the rest owned by it.
+    const UNSHARE_FLAGS: libc::c_int = libc::CLONE_NEWUSER as libc::c_int
+        | libc::CLONE_NEWNS as libc::c_int
+        | libc::CLONE_NEWPID as libc::c_int
+        | libc::CLONE_NEWNET as libc::c_int
+        | libc::CLONE_NEWIPC as libc::c_int
+        | libc::CLONE_NEWUTS as libc::c_int;
+    let r = unsafe {
+        // SAFETY: unshare(2) with a constant flag set; no memory args.
+        libc::unshare(UNSHARE_FLAGS)
+    };
+    if r < 0 {
+        fail(cfg, stage::NS_SETUP, unsafe { *libc::__errno_location() });
+    }
+
+    // 3. Deny setgroups, then write uid/gid maps: we are uid 0 inside the
     //    new user namespace, mapped 1:1 onto the parent's unprivileged ids.
     //    Order matters: setgroups must be denied before gid_map is accepted.
-    if let Err(e) = write_proc_file(b"/proc/self/setgroups", b"deny") {
+    if let Err(e) = write_proc_file(c"/proc/self/setgroups".to_bytes_with_nul(), b"deny") {
         fail(cfg, stage::DENY_SETGROUPS, e);
     }
-    // The parent captured its uid/gid BEFORE the clone: inside this
+    // The parent captured its uid/gid BEFORE the fork: inside this
     // namespace getuid() is meaningless (overflow) until the map exists.
     let ruid = cfg.parent_uid;
     let rgid = cfg.parent_gid;
     let mut line = [0u8; 32];
-    if let Err(e) = write_proc_file(b"/proc/self/uid_map", map_line(ruid, &mut line)) {
+    if let Err(e) = write_proc_file(
+        c"/proc/self/uid_map".to_bytes_with_nul(),
+        map_line(ruid, &mut line),
+    ) {
         fail(cfg, stage::WRITE_UID_MAP, e);
     }
     let mut line = [0u8; 32];
-    if let Err(e) = write_proc_file(b"/proc/self/gid_map", map_line(rgid, &mut line)) {
+    if let Err(e) = write_proc_file(
+        c"/proc/self/gid_map".to_bytes_with_nul(),
+        map_line(rgid, &mut line),
+    ) {
         fail(cfg, stage::WRITE_GID_MAP, e);
     }
 
-    // 2. rlimits: no core dumps. (fsize/nofile arrive with C4 policy.)
+    // 4. Fork stage-2: the payload's PID-namespace init.
+    let pid2 = unsafe {
+        // SAFETY: fork(2); both halves below stay async-signal-safe.
+        libc::fork()
+    };
+    if pid2 < 0 {
+        fail(cfg, stage::NS_SETUP, unsafe { *libc::__errno_location() });
+    }
+    if pid2 == 0 {
+        // ---- stage-2: the actual sandbox init ----
+        run_payload(cfg);
+    }
+
+    // ---- stage-1: supervisor proxy ----
+    // CRITICAL: close every child-facing fd except our result pipe. We
+    // never exec (so CLOEXEC never fires for us); holding the status or
+    // stdio pipes open would block the parent's EOF detection forever —
+    // observed as a deadlock once the payload fills its stdout pipe.
+    for fd in [
+        cfg.status_wr,
+        cfg.go_rd,
+        cfg.stdin_fd,
+        cfg.stdout_fd,
+        cfg.stderr_fd,
+    ] {
+        unsafe {
+            // SAFETY: fds from the config; stage-2 owns its own copies.
+            libc::close(fd);
+        }
+    }
+    // Tell the parent which pid to watch (the payload init).
+    let notice = ChildError {
+        stage: msg::PID2_NOTICE,
+        errno: pid2,
+    };
+    let bytes = std::ptr::from_ref(&notice).cast::<u8>();
+    let _ = write_all(cfg.result_wr, unsafe {
+        // SAFETY: `bytes` covers exactly size_of::<ChildError>() valid
+        // bytes of a local struct alive across this call.
+        std::slice::from_raw_parts(bytes, std::mem::size_of::<ChildError>())
+    });
+    // Wait for the payload init and forward its raw status, then exit.
+    let mut st2: libc::c_int = 0;
+    loop {
+        let r = unsafe {
+            // SAFETY: blocking waitpid on our direct child (stage-2).
+            libc::waitpid(pid2, &mut st2, 0)
+        };
+        if r == pid2 {
+            break;
+        }
+        let e = unsafe { *libc::__errno_location() };
+        if e != libc::EINTR {
+            st2 = 128 + libc::SIGKILL; // stage-2 vanished abnormally
+            break;
+        }
+    }
+    let fwd = ChildError {
+        stage: msg::EXIT_FORWARD,
+        errno: st2,
+    };
+    let bytes = std::ptr::from_ref(&fwd).cast::<u8>();
+    let _ = write_all(cfg.result_wr, unsafe {
+        // SAFETY: as above.
+        std::slice::from_raw_parts(bytes, std::mem::size_of::<ChildError>())
+    });
+    unsafe {
+        // SAFETY: proxy done; nothing to unwind.
+        libc::_exit(0);
+    }
+}
+
+/// Stage-2 body: everything after namespaces, until execve. Never returns.
+fn run_payload(cfg: &ChildConfig) -> ! {
+    // rlimits: no core dumps. (fsize/nofile arrive with C4 policy.)
     let rl = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -669,11 +801,11 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         fail(cfg, stage::SET_RLIMIT, unsafe { *libc::__errno_location() });
     }
 
-    // 3. Build the sandbox filesystem (milestone C2) and pivot into it.
+    // Build the sandbox filesystem (milestone C2) and pivot into it.
     setup_rootfs(cfg);
 
-    // 4. Wire up stdio. dup2 clears FD_CLOEXEC on the targets 0/1/2 — the
-    //    payload keeps its pipes across exec, and nothing else does.
+    // Wire up stdio. dup2 clears FD_CLOEXEC on the targets 0/1/2 — the
+    // payload keeps its pipes across exec, and nothing else does.
     if unsafe { libc::dup2(cfg.stdin_fd, 0) } < 0
         || unsafe { libc::dup2(cfg.stdout_fd, 1) } < 0
         || unsafe { libc::dup2(cfg.stderr_fd, 2) } < 0
@@ -681,15 +813,10 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         fail(cfg, stage::SYNC, unsafe { *libc::__errno_location() });
     }
 
-    // 5. Wait until the parent finished any post-clone setup (from C3:
-    //    cgroup attach) — never race the payload.
-    if let Err(e) = wait_for_go(cfg.go_rd) {
-        fail(cfg, stage::SYNC, e);
-    }
-
-    // 6. execve. C arrays built from the leaked config; on success we never
-    //    return. The status pipe (CLOEXEC) closes at exec: that EOF is the
-    //    parent's "running" signal.
+    // execve. C arrays built from the leaked config; on success we never
+    // return. The status pipe (CLOEXEC) closes at exec: that EOF is the
+    // parent's "running" signal (stage-1's forwarding comes later, through
+    // its own copy, after the payload dies).
     let mut argv_buf: [*const libc::c_char; 64] = [std::ptr::null(); 64];
     let mut envp_buf: [*const libc::c_char; 256] = [std::ptr::null(); 256];
     if cfg.argv.is_empty() || cfg.argv.len() >= argv_buf.len() {

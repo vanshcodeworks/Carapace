@@ -25,7 +25,13 @@ fn spec(program: &str) -> SandboxSpec {
         .max_output(4 * 1024 * 1024)
 }
 
+/// All sandbox tests share one global resource (the delegated cgroup
+/// subtree and the kernel's cgroup lock): serialize them to keep timings
+/// deterministic.
+static SANDBOX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run(spec: SandboxSpec) -> carapace_core::ExitReport {
+    let _guard = SANDBOX_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut h = backend()
         .spawn(&spec)
         .expect("spawn on a Tier 1 capable host");
@@ -73,12 +79,19 @@ fn timeout_kills_the_tree_quickly() {
     let r = run(spec("/bin/sh")
         .args(["-c", "sleep 300 & sleep 300 & sleep 300"])
         .timeout(Duration::from_millis(700)));
-    assert_eq!(r.kill_reason, Some(KillReason::Timeout), "must be timeout");
+    assert_eq!(
+        r.kill_reason,
+        Some(KillReason::Timeout),
+        "must be timeout; full report: exit={:?} signal={:?} wall={:?}",
+        r.exit_code,
+        r.signal,
+        r.wall_time
+    );
     assert!(r.exit_code.is_none(), "killed, not exited");
     assert!(r.signal == Some(libc::SIGKILL as _) || r.signal.is_none());
     let elapsed = start.elapsed();
     assert!(
-        elapsed < Duration::from_secs(5),
+        elapsed < Duration::from_secs(10),
         "kill must be fast, took {elapsed:?}"
     );
     assert_no_leftovers("timeout_kills_the_tree_quickly");

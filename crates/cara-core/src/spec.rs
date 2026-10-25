@@ -65,8 +65,14 @@ pub struct Limits {
     pub max_output_bytes: usize,
     /// Size of the writable /work scratch tmpfs inside the sandbox.
     pub scratch_bytes: u64,
-    // C3: memory_bytes, cpu quota, max_processes.
-    // C4: fsize/nofile rlimits. C5: network mode.
+    /// Memory cap in bytes (cgroup v2 memory.max; swap disabled).
+    pub memory_bytes: u64,
+    /// CPU allowance in percent of one core (cgroup v2 cpu.max quota per
+    /// 100ms period). 100 = one full core, 400 = four cores.
+    pub cpu_percent: u32,
+    /// Maximum processes in the sandbox (cgroup v2 pids.max) — the
+    /// fork-bomb cap.
+    pub max_processes: u32,
 }
 
 impl Default for Limits {
@@ -75,6 +81,9 @@ impl Default for Limits {
             timeout: Duration::from_secs(10),
             max_output_bytes: 8 * 1024 * 1024,
             scratch_bytes: 64 * 1024 * 1024,
+            memory_bytes: 256 * 1024 * 1024,
+            cpu_percent: 100,
+            max_processes: 64,
         }
     }
 }
