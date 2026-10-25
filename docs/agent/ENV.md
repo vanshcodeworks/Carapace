@@ -99,3 +99,4 @@ wsl -d Ubuntu-24.04 -u dev -- bash -lc "bash /mnt/p/Carapace/scripts/check.sh"
   tests run — lingering fixes this.
 - `/proc/config.gz` is available on the WSL kernel — doctor and docs use it
   for kernel-config claims.
+strace

@@ -1,7 +1,9 @@
 //! What to run and how it is limited. Platform-agnostic by rule: this crate
 //! compiles everywhere, enforcement lives in backends.
 
+use crate::policy::NetworkMode;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// A request to run one program under sandboxing.
@@ -21,6 +23,12 @@ pub struct SandboxSpec {
     pub env: BTreeMap<String, String>,
     /// Limits applied to this run.
     pub limits: Limits,
+    /// Extra host paths to bind read-only (beyond the runtime defaults).
+    pub read_only: Vec<PathBuf>,
+    /// Extra host paths to bind read-write (Landlock-granted).
+    pub read_write: Vec<PathBuf>,
+    /// Network access mode.
+    pub network: NetworkMode,
 }
 
 impl SandboxSpec {
@@ -31,6 +39,9 @@ impl SandboxSpec {
             args: Vec::new(),
             env: BTreeMap::new(),
             limits: Limits::default(),
+            read_only: Vec::new(),
+            read_write: Vec::new(),
+            network: NetworkMode::None,
         }
     }
 

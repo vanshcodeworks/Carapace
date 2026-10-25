@@ -56,3 +56,16 @@ Commands: scripts/check.sh (all green, repeated 3x stable via
 .wsl/loop-sup.sh); probes in .wsl/probe-cgroup-*.
 Results: 24 sandbox integration tests green; supervisor suite 1.4s.
 Next: C4 seccomp+Landlock+capdrop+rlimits+fd sanitization.
+
+## Cycle 5 — 2026-10-25 — C4 complete
+Task: seccomp+Landlock+caps+rlimits+fd sanitization (QUEUE C4).
+Outcome: DONE @ f4b4b02. Real bug found by tests: BPF clone-block
+fall-through returned ALLOW for EVERY syscall (socket creation succeeded
+inside the sandbox!) — fixed layout + added a permanent BPF
+mini-interpreter unit test proving filter semantics structurally.
+Landlock verified load-bearing (blocks /etc writes on writable tmpfs).
+seccomp stance on io_uring: denied (test asserts exact EPERM).
+Commands: scripts/check.sh; .wsl/run-hard.sh; probe-c4.sh.
+Results: 68 tests green; hardening suite 10/10; python runs ~29ms under
+the full stack.
+Next: C5 policy TOML + network modes + cara run/policy CLI.

@@ -119,6 +119,9 @@ pub(crate) struct NativeSandbox {
     reaped: Mutex<Option<libc::c_int>>,
     /// The run's cgroup leaf (limits + accounting); removed on drop.
     cgroup_leaf: Option<crate::cgroup::CgroupLeaf>,
+    /// Host-side staging dir; removed after the child (and its mount ns)
+    /// is gone.
+    staging_dir: std::ffi::CString,
     /// Self-pipe write end handed to the reader threads for overflow
     /// signals; closed on drop.
     overflow_wr: RawFd,
@@ -141,6 +144,16 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
     let setup = |what: &str, e: std::io::Error| -> BackendError {
         BackendError::Setup(format!("{what}: {e}"))
     };
+
+    // Network allowlist mode: designed (ADR-0004) but not implemented —
+    // fail closed with a clear message rather than pretending.
+    if let carapace_core::NetworkMode::Allowlist(_) = spec.network {
+        return Err(BackendError::Setup(
+            "network mode \"allowlist\" is not implemented yet (ADR-0004); \
+             use mode = \"none\" or \"full\""
+                .to_string(),
+        ));
+    }
 
     // Host-layout validation for the C2 runtime recipe (fail closed BEFORE
     // forking: merged-usr with a real /usr tree).
@@ -188,6 +201,13 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         envp.push(mk_cstring(&format!("{k}={v}"), "env entry")?);
     }
 
+    // Staging dir for the child's new-root tmpfs: mkdtemp in a
+    // uid-writable filesystem. $XDG_RUNTIME_DIR (systemd user runtime,
+    // dev-owned tmpfs) first; /tmp fallback (world-writable, mkdtemp is
+    // 0700-unique). Removed on every teardown path.
+    let staging_dir = mk_staging_dir().map_err(|e| setup("staging dir", e))?;
+    let staging_cref: &std::ffi::CStr = &staging_dir;
+
     let config = Box::new(ChildConfig {
         argv,
         envp,
@@ -208,7 +228,12 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         work_size_opt: std::ffi::CString::new(format!("size={}", spec.limits.scratch_bytes))
             .map_err(|e| setup("scratch size", std::io::Error::other(format!("{e}"))))?,
         fsize_limit: spec.limits.scratch_bytes.max(1024),
-        seccomp_filter: crate::seccomp_profile::base_filter().as_slice().to_vec(),
+        unshare_flags: unshare_flags_for(&spec.network),
+        staging_dir: staging_dir.clone(),
+        seccomp_filter: crate::seccomp_profile::filter_for(&spec.network)
+            .as_slice()
+            .to_vec(),
+        binds: binds_for(spec),
     });
     let config_ptr = Box::into_raw(config) as *mut libc::c_void;
 
@@ -244,6 +269,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                     pid1,
                     None,
                     None,
+                    staging_cref,
                     config_ptr,
                     "cgroup limits",
                     e,
@@ -255,6 +281,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 pid1,
                 None,
                 None,
+                staging_cref,
                 config_ptr,
                 "cgroup limits",
                 std::io::Error::other("no delegated cgroup root found"),
@@ -280,6 +307,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
             pid1,
             None,
             Some(&cgroup_leaf),
+            staging_cref,
             config_ptr,
             "go signal",
             e,
@@ -313,6 +341,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                     pid1,
                     None,
                     Some(&cgroup_leaf),
+                    staging_cref,
                     config_ptr,
                     "handshake",
                     std::io::Error::other("stage-1 died before forking the payload"),
@@ -325,6 +354,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                     pid1,
                     None,
                     Some(&cgroup_leaf),
+                    staging_cref,
                     config_ptr,
                     "result pipe",
                     e,
@@ -338,6 +368,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
             pid1,
             None,
             Some(&cgroup_leaf),
+            staging_cref,
             config_ptr,
             "handshake",
             std::io::Error::other(format!("unexpected stage-1 message {}", notice.stage)),
@@ -356,6 +387,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 pid1,
                 Some(pid2),
                 Some(&cgroup_leaf),
+                staging_cref,
                 config_ptr,
                 "pidfd_open(payload)",
                 std::io::Error::other(format!("{e} (pid {pid2})")),
@@ -377,6 +409,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                     pid1,
                     Some(pid2),
                     Some(&cgroup_leaf),
+                    staging_cref,
                     config_ptr,
                     &format!("child setup at {stage_name}"),
                     std::io::Error::from_raw_os_error(report.errno),
@@ -387,6 +420,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                     pid1,
                     Some(pid2),
                     Some(&cgroup_leaf),
+                    staging_cref,
                     config_ptr,
                     "status pipe",
                     std::io::Error::other("short read"),
@@ -398,6 +432,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                     pid1,
                     Some(pid2),
                     Some(&cgroup_leaf),
+                    staging_cref,
                     config_ptr,
                     "status pipe",
                     e,
@@ -435,9 +470,43 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         killed_reason: Mutex::new(None),
         reaped: Mutex::new(None),
         cgroup_leaf: Some(cgroup_leaf),
+        staging_dir,
         overflow_wr,
         overflow_rd,
     })
+}
+
+/// Namespace flags by network mode: "full" shares the host network
+/// namespace (loud, opt-in); everything else gets a fresh empty one.
+fn unshare_flags_for(network: &carapace_core::NetworkMode) -> libc::c_int {
+    let mut flags = libc::CLONE_NEWUSER as libc::c_int
+        | libc::CLONE_NEWNS as libc::c_int
+        | libc::CLONE_NEWPID as libc::c_int
+        | libc::CLONE_NEWIPC as libc::c_int
+        | libc::CLONE_NEWUTS as libc::c_int;
+    if !matches!(network, carapace_core::NetworkMode::Full) {
+        flags |= libc::CLONE_NEWNET as libc::c_int;
+    }
+    flags
+}
+
+/// Policy bind mounts, prepared parent-side (validated paths as
+/// CStrings; existence re-checked where it matters).
+fn binds_for(spec: &SandboxSpec) -> Vec<crate::child::BindSpec> {
+    let mut out = Vec::new();
+    let mut push = |p: &std::path::Path, rw: bool| {
+        if let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) {
+            out.push(crate::child::BindSpec { path: c, rw });
+        }
+    };
+    for p in &spec.read_only {
+        push(p, false);
+    }
+    for p in &spec.read_write {
+        push(p, true);
+    }
+    out.truncate(16); // child-side buffer budget
+    out
 }
 
 fn release_config(p: *mut libc::c_void) {
@@ -454,10 +523,56 @@ fn release_config(p: *mut libc::c_void) {
 /// process of the half-built run (cgroup.kill covers both stages even when
 /// the payload pid is unknown), reap what we can, free the config, and
 /// return the Setup error.
+/// Creates the unique staging dir (mkdtemp): $XDG_RUNTIME_DIR first,
+/// /tmp fallback.
+fn mk_staging_dir() -> std::io::Result<std::ffi::CString> {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let mut tmpl = format!("{}/cara-staging.XXXXXX\0", base).into_bytes();
+    let p = unsafe {
+        // SAFETY: mkdtemp(3) with a mutable NUL-terminated template of the
+        // documented form; returns NULL on failure.
+        libc::mkdtemp(tmpl.as_mut_ptr().cast::<libc::c_char>())
+    };
+    if p.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    tmpl.truncate(tmpl.len() - 1); // drop the NUL for CString::new
+    std::ffi::CString::new(tmpl).map_err(|_| std::io::Error::other("unreachable NUL"))
+}
+
+/// Removes the staging dir: empty (child-ns dead) it rmdirs directly;
+/// retries briefly in a detached thread if kernel teardown lags.
+fn rm_staging_dir(dir: &std::ffi::CStr) {
+    if unsafe {
+        // SAFETY: rmdir(2) on our own NUL-terminated mkdtemp dir.
+        libc::rmdir(dir.as_ptr())
+    } == 0
+    {
+        return;
+    }
+    let path = dir.to_owned();
+    std::thread::Builder::new()
+        .stack_size(64 * 1024)
+        .spawn(move || {
+            for _ in 0..100 {
+                if unsafe {
+                    // SAFETY: as above; detached retry path.
+                    libc::rmdir(path.as_ptr())
+                } == 0
+                {
+                    return;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        })
+        .ok();
+}
+
 fn spawn_cleanup(
     pid1: libc::pid_t,
     pid2: Option<libc::pid_t>,
     leaf: Option<&crate::cgroup::CgroupLeaf>,
+    staging: &std::ffi::CStr,
     config_ptr: *mut libc::c_void,
     what: &str,
     e: std::io::Error,
@@ -485,6 +600,7 @@ fn spawn_cleanup(
             }
         }
     }
+    rm_staging_dir(staging);
     release_config(config_ptr);
     BackendError::Setup(format!("{what}: {e}"))
 }
@@ -506,6 +622,10 @@ fn stage_name(stage: u8) -> &'static str {
         stage::PIVOT_DETACH => "pivot detach",
         stage::VERIFY => "post-pivot verify",
         stage::NS_SETUP => "namespace unshare",
+        stage::BIND_OPEN => "bind open",
+        stage::BIND_MKDIR => "bind mkdir",
+        stage::BIND_MOUNT => "bind mount",
+        stage::BIND_REMOUNT => "bind remount",
         _ => "unknown",
     }
 }
@@ -733,5 +853,6 @@ impl Drop for NativeSandbox {
             libc::close(self.overflow_wr);
             libc::close(self.overflow_rd);
         }
+        rm_staging_dir(&self.staging_dir);
     }
 }

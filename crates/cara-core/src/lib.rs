@@ -15,11 +15,13 @@
 pub mod backend;
 pub mod doctor;
 pub mod error;
+pub mod policy;
 pub mod report;
 pub mod spec;
 
 pub use backend::{Backend, BackendError, SandboxHandle};
 pub use doctor::{Check, DoctorReport, Status};
 pub use error::CoreError;
+pub use policy::{NetworkMode, Policy, PolicyError};
 pub use report::{ExitReport, KillReason};
 pub use spec::{Limits, SandboxSpec};

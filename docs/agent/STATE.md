@@ -1,38 +1,35 @@
 # STATE — agent working state (overwritten every cycle)
 
-Last updated: cycle 4 done (C3 complete @ 5e23c89), C4 in progress.
+Last updated: cycle 5 done (C4 complete @ f4b4b02), C5 in progress.
 
-## Done (all green via scripts/check.sh — which self-bridges via
-systemd-run on WSL; see ADR-0003)
-- C0 (bcecc3a/75226dd), C1 (9714750), C2 (745dc0a), C3 (5e23c89).
-- C3: rootless cgroup v2 limits (memory.max+swap0, pids.max, cpu.max),
-  two-stage child (plain-fork stage-1 attaches to leaf then unshares;
-  stage-2 = pidns init), doctor attach-capability check + WSL remedy,
-  resource report (cpu/peak-mem/peak-pids/OOM->MemoryLimit), overflow
-  self-pipe (ms-kill), no waitpid(-1) sweeps. 24 integration tests.
+## Done (all green via scripts/check.sh)
+- C0-C4 complete. 68 tests. Full Tier 1 stack now active per run:
+  namespaces (7) -> private-ns rootfs/pivot -> cgroup limits ->
+  fd close_range -> rlimits (fsize/nofile/core) -> capset drop ->
+  no_new_privs -> Landlock (ABI-aware grants) -> seccomp allowlist ->
+  exec. Payload sees fds {0,1,2}, CapEff=0, NoNewPrivs=1, EPERM on
+  namespace/socket/io_uring syscalls, Landlock-denied writes outside
+  /work+/tmp+/dev, kernel OOM at memory limit.
 
-## In progress (C4 — syscall/fs hardening)
-- seccomp-bpf allowlist compiler (raw BPF in cara-sys; per-runtime
-  profiles; default-deny; ERRATADATA; log-mode for profile development).
-- Landlock ruleset: RW /work, R /usr + /proc + /dev nodes; ABI-aware.
-- Capability drop (capset all=0) + PR_SET_NO_NEW_PRIVS in stage-2 before
-  exec; rlimits (fsize=scratch, nofile cap); close_range fd sanitization
-  before exec (keep 0/1/2 only).
-- Fail-closed tests: blocked syscall kills with report; Landlock denies
-  /usr write despite mount RW... (already RO); fd leak scan from inside
-  (/proc/self/fd count == 3); no_new_privs observable (setuid binary
-  cannot elevate — /usr has none mounted, verify bit is set via
-  /proc/self/status NoNewPrivs).
+## In progress (C5 — policy + network + CLI)
+- cara-core/src/policy.rs: TOML policy parse+validate, presets strict/
+  dev/network-light; limits parsing (bytes "256MB", percents, durations).
+- SandboxSpec gains filesystem read_only/read_write binds + network mode.
+- Network: default none (netns empty — already enforced); `full` mode =
+  share host netns (opt-in; requires setns from parent — ADR); allowlist
+  mode deferred with ADR (design doc).
+- CLI: `cara run` (file or -c code, --policy), `cara policy check|explain`,
+  exit codes; JSON report output (--json).
+- Tests: policy parse/validation matrix; explain output contains key
+  facts; run with default policy works; unknown-field rejection.
 
 ## Known bugs / risks
-- none open; leftover cgroup leaves from debugging purged (218 dirs,
-  .wsl/purge-leaves.sh).
-- io.max not set (io controller delegated but per-device needed) —
-  TODO(C5+) document as optional.
+- none open.
+- io.max not set (optional; documented).
+- allowlist network mode = C5 ADR design only.
 
 ## How to run checks
 wsl -d Ubuntu-24.04 -u dev -- bash /mnt/p/Carapace/scripts/check.sh
-Per-suite: .wsl/run-{tests,rootfs,limits,full}.sh (all self-bridge).
 
 ## Last verified commit
-5e23c89
+f4b4b02

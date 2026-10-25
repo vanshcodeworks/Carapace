@@ -32,11 +32,25 @@ pub mod stage {
     pub const PIVOT_DETACH: u8 = 14;
     pub const VERIFY: u8 = 12;
     pub const NS_SETUP: u8 = 15;
+    pub const BIND_OPEN: u8 = 40;
+    pub const BIND_MKDIR: u8 = 41;
+    pub const BIND_MOUNT: u8 = 42;
+    pub const BIND_REMOUNT: u8 = 43;
     pub const FD_CLOSE: u8 = 30;
     pub const CAPS_DROP: u8 = 31;
     pub const NO_NEW_PRIVS: u8 = 32;
     pub const LANDLOCK: u8 = 33;
     pub const SECCOMP: u8 = 34;
+}
+
+/// One extra bind mount requested by the policy.
+#[derive(Debug, Clone)]
+pub(crate) struct BindSpec {
+    /// Absolute host path (also the in-sandbox path). NUL-terminated
+    /// CString, prepared parent-side.
+    pub path: CString,
+    /// Read-write (true) or read-only (false).
+    pub rw: bool,
 }
 
 /// Fixed-size pre-exec failure report written to the exec-status pipe.
@@ -82,6 +96,16 @@ pub(crate) struct ChildConfig {
     pub work_size_opt: CString,
     /// RLIMIT_FSIZE for the payload (the per-file size cap).
     pub fsize_limit: u64,
+    /// unshare(2) flag set for stage-1 (parent-computed: network mode
+    /// "full" omits CLONE_NEWNET so the payload shares the host netns).
+    pub unshare_flags: libc::c_int,
+    /// Absolute staging dir (parent-created via mkdtemp in a uid-writable
+    /// filesystem): the child mounts the new-root tmpfs over it. Removed
+    /// by the parent after the run.
+    pub staging_dir: CString,
+    /// Extra bind mounts, applied like the runtime ones: same absolute
+    /// path inside and outside, read-only or read-write.
+    pub binds: Vec<BindSpec>,
     /// Compiled seccomp filter (parent-side compilation; installed by
     /// stage-2 as the LAST setup step before exec).
     pub seccomp_filter: Vec<libc::sock_filter>,
@@ -224,25 +248,16 @@ fn setup_rootfs(cfg: &ChildConfig) {
         fail(cfg, stage::MOUNT_PRIVATE, e);
     }
 
-    // (b) Private tmpfs over /tmp, then the new root inside it. The mount
-    // exists only in this namespace: the host's /tmp is untouched and no
-    // host-side staging directory is ever created.
-    if let Err(e) = mount_raw(
-        c"tmpfs".to_bytes_with_nul(),
-        c"/tmp".to_bytes_with_nul(),
-        c"tmpfs".to_bytes_with_nul(),
-        (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
-        cfg.root_size_opt.as_ptr().cast(),
-    ) {
-        fail(cfg, stage::MOUNT_ROOT, e);
-    }
-    const ROOT_BASE: &[u8] = b"/tmp/cara-root";
+    // (b) The new root is a size-capped tmpfs mounted over the staging
+    // dir the parent created (mkdtemp, uid-writable). Plain dir, NOT an
+    // overmount of /tmp: host paths everywhere stay visible, so policy
+    // binds in (c2) resolve their sources with plain path-based mounts.
+    // The tmpfs (and everything on it) dies with this mount namespace;
+    // only the empty staging dir remains, which the parent removes.
+    let staging = cfg.staging_dir.as_bytes();
     let mut root = [0u8; 64];
-    assert!(ROOT_BASE.len() < 64);
-    root[..ROOT_BASE.len()].copy_from_slice(ROOT_BASE);
-    if let Err(e) = mkdir_raw(c"/tmp/cara-root".to_bytes_with_nul(), 0o700) {
-        fail(cfg, stage::MOUNT_ROOT, e);
-    }
+    assert!(staging.len() < 64);
+    root[..staging.len()].copy_from_slice(staging);
     if let Err(e) = mount_raw(
         c"tmpfs".to_bytes_with_nul(),
         &root,
@@ -266,6 +281,50 @@ fn setup_rootfs(cfg: &ChildConfig) {
         let p = join(&root, d);
         if let Err(e) = mkdir_raw(&p, 0o755) {
             fail(cfg, stage::MOUNT_ROOT, e);
+        }
+    }
+
+    // (c2) Policy-requested extra binds (paths already validated by the
+    // parent: absolute, no .., not shadowing sandbox internals). Same
+    // path inside the sandbox; read-only or read-write per policy. All
+    // host source paths are still fully visible here.
+    for b in &cfg.binds {
+        let bytes = b.path.as_bytes();
+        // Destination under the staging root, NUL-terminated (zero tail).
+        let n_root = root
+            .iter()
+            .position(|&c| c == 0)
+            .expect("root buffer is NUL-terminated");
+        let mut inner = [0u8; 256];
+        assert!(n_root + bytes.len() < 255);
+        inner[..n_root].copy_from_slice(&root[..n_root]);
+        inner[n_root..n_root + bytes.len()].copy_from_slice(bytes);
+        let inner_ref: &[u8] = &inner;
+        // mkdir -p so the attach point exists.
+        if let Err(e) = mkdir_p(&root, bytes) {
+            fail(cfg, stage::BIND_MKDIR, e);
+        }
+        let src = b.path.as_bytes_with_nul();
+        if let Err(e) = mount_raw(
+            src,
+            inner_ref,
+            b"",
+            (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+            std::ptr::null(),
+        ) {
+            fail(cfg, stage::BIND_MOUNT, e);
+        }
+        if !b.rw
+            && let Err(e) = mount_raw(
+                src,
+                inner_ref,
+                b"",
+                (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC)
+                    as libc::c_ulong,
+                std::ptr::null(),
+            )
+        {
+            fail(cfg, stage::BIND_REMOUNT, e);
         }
     }
 
@@ -501,9 +560,50 @@ fn verify_rootfs() -> Result<(), i32> {
 
 // ------------------------------------------------------------ mount helpers
 
-/// A 64-byte NUL-terminated path buffer (all sandbox paths fit). Buffers
-/// start zeroed, so copying without the NUL leaves one in place.
+/// A 64-byte NUL-terminated path buffer (core sandbox paths fit).
 type PathBuf64 = [u8; 64];
+/// mkdir -p under the new root for a full absolute guest path (bytes
+/// without NUL; must start with b"/").
+fn mkdir_p(root: &PathBuf64, path: &[u8]) -> Result<(), i32> {
+    debug_assert_eq!(path.first(), Some(&b'/'));
+    let mut buf = [0u8; 256];
+    // The staging root's real length (an arbitrary mkdtemp path).
+    let n = root
+        .iter()
+        .position(|&c| c == 0)
+        .expect("root buffer is NUL-terminated");
+    buf[..n].copy_from_slice(&root[..n]);
+    let mut depth = n;
+    // Join separator: path[0] ('/') was skipped, so restore it.
+    buf[depth] = b'/';
+    depth += 1;
+    let mut first_err = None;
+    for &b in &path[1..] {
+        if b == b'/'
+            && depth > n
+            && let Err(e) = mkdir_raw_slice(&buf[..depth])
+        {
+            first_err = first_err.or(Some(e));
+        }
+        buf[depth] = b;
+        depth += 1;
+    }
+    if let Err(e) = mkdir_raw_slice(&buf[..depth]) {
+        first_err = first_err.or(Some(e));
+    }
+    match first_err {
+        Some(e) if e != libc::EEXIST => Err(e),
+        _ => Ok(()),
+    }
+}
+
+/// mkdir(2) over a NON-NUL-terminated slice (adds the terminator).
+fn mkdir_raw_slice(path: &[u8]) -> Result<(), i32> {
+    let mut b = [0u8; 256];
+    assert!(path.len() < 256);
+    b[..path.len()].copy_from_slice(path);
+    mkdir_raw(&b, 0o755)
+}
 
 /// staging-dir bytes (NUL-terminated within the buffer) + suffix, where
 /// suffix INCLUDES its trailing NUL.
@@ -682,18 +782,12 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         fail(cfg, stage::SYNC, e);
     }
 
-    // 2. All namespaces at once. NEWUSER first in the flag set is what
-    //    makes this unprivileged-legal: the kernel creates the user
-    //    namespace, then the rest owned by it.
-    const UNSHARE_FLAGS: libc::c_int = libc::CLONE_NEWUSER as libc::c_int
-        | libc::CLONE_NEWNS as libc::c_int
-        | libc::CLONE_NEWPID as libc::c_int
-        | libc::CLONE_NEWNET as libc::c_int
-        | libc::CLONE_NEWIPC as libc::c_int
-        | libc::CLONE_NEWUTS as libc::c_int;
+    // 2. All namespaces at once (the parent-computed flag set; NEWUSER in
+    //    the set is what makes this unprivileged-legal: the kernel creates
+    //    the user namespace first, then the rest owned by it).
     let r = unsafe {
         // SAFETY: unshare(2) with a constant flag set; no memory args.
-        libc::unshare(UNSHARE_FLAGS)
+        libc::unshare(cfg.unshare_flags)
     };
     if r < 0 {
         fail(cfg, stage::NS_SETUP, unsafe { *libc::__errno_location() });
@@ -997,14 +1091,21 @@ fn apply_landlock(cfg: &ChildConfig) {
         Err(e) => fail(cfg, stage::LANDLOCK, e),
     };
     use carapace_sys::landlock::access_fs as fs;
-    for (path, access) in [
+    let mut grants: Vec<(&[u8], u64)> = vec![
         (c"/usr".to_bytes_with_nul(), fs::RO),
         (c"/proc".to_bytes_with_nul(), fs::RO),
         (c"/etc".to_bytes_with_nul(), fs::RO),
         (c"/dev".to_bytes_with_nul(), fs::RW_FILES),
         (c"/work".to_bytes_with_nul(), fs::RW_ALL),
         (c"/tmp".to_bytes_with_nul(), fs::RW_ALL),
-    ] {
+    ];
+    for b in &cfg.binds {
+        grants.push((
+            b.path.as_bytes_with_nul(),
+            if b.rw { fs::RW_ALL } else { fs::RO },
+        ));
+    }
+    for (path, access) in grants {
         let fd = unsafe {
             // SAFETY: openat(2) O_PATH on fixed literal paths inside the
             // pivoted root.

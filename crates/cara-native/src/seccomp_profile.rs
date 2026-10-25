@@ -172,11 +172,47 @@ fn base_allowed() -> &'static [libc::c_long] {
     })
 }
 
-/// Compiles the base profile. `CARA_SECCOMP_LOG=1` in the parent env
-/// switches the default action to log-and-allow (profile development).
-pub fn base_filter() -> seccomp::Filter {
+/// Socket-family syscalls, allowed ONLY when the policy says the run may
+/// use the network (`mode = "full"`; the empty netns already blocks
+/// everything in `mode = "none"`).
+const NETWORK_ALLOWED: &[libc::c_long] = &[
+    libc::SYS_socket,
+    libc::SYS_socketpair,
+    libc::SYS_connect,
+    libc::SYS_accept,
+    libc::SYS_accept4,
+    libc::SYS_bind,
+    libc::SYS_listen,
+    libc::SYS_shutdown,
+    libc::SYS_getsockname,
+    libc::SYS_getpeername,
+    libc::SYS_sendto,
+    libc::SYS_recvfrom,
+    libc::SYS_sendmsg,
+    libc::SYS_recvmsg,
+    libc::SYS_recvmmsg,
+    libc::SYS_sendmmsg,
+    libc::SYS_setsockopt,
+    libc::SYS_getsockopt,
+];
+
+/// Compiles the profile for a network mode. `CARA_SECCOMP_LOG=1` in the
+/// parent env switches the default action to log-and-allow (profile
+/// development).
+pub fn filter_for(network: &carapace_core::NetworkMode) -> seccomp::Filter {
     let log = std::env::var("CARA_SECCOMP_LOG").is_ok_and(|v| v == "1");
-    seccomp::compile_allowlist(base_allowed(), log)
+    let mut allowed: Vec<libc::c_long> = base_allowed().to_vec();
+    if matches!(network, carapace_core::NetworkMode::Full) {
+        allowed.extend_from_slice(NETWORK_ALLOWED);
+        allowed.sort_unstable();
+        allowed.dedup();
+    }
+    seccomp::compile_allowlist(&allowed, log)
+}
+
+/// The no-network base profile.
+pub fn base_filter() -> seccomp::Filter {
+    filter_for(&carapace_core::NetworkMode::None)
 }
 
 #[cfg(test)]
