@@ -239,6 +239,10 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
             .map_err(|e| setup("scratch size", std::io::Error::other(format!("{e}"))))?,
         fsize_limit: spec.limits.scratch_bytes.max(1024),
         unshare_flags: unshare_flags_for(&spec.network),
+        supervisor_pid: unsafe {
+            // SAFETY: plain getter with no failure mode.
+            libc::getpid()
+        },
         staging_dir: staging_dir.clone(),
         seccomp_filter: crate::seccomp_profile::filter_for(&spec.network)
             .as_slice()
@@ -635,6 +639,7 @@ fn stage_name(stage: u8) -> &'static str {
         stage::PIVOT_DETACH => "pivot detach",
         stage::VERIFY => "post-pivot verify",
         stage::NS_SETUP => "namespace unshare",
+        stage::PDEATHSIG => "parent-death signal",
         stage::BIND_OPEN => "bind open",
         stage::BIND_MKDIR => "bind mkdir",
         stage::BIND_MOUNT => "bind mount",

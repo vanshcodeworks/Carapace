@@ -32,6 +32,7 @@ pub mod stage {
     pub const PIVOT_DETACH: u8 = 14;
     pub const VERIFY: u8 = 12;
     pub const NS_SETUP: u8 = 15;
+    pub const PDEATHSIG: u8 = 50;
     pub const BIND_OPEN: u8 = 40;
     pub const BIND_MKDIR: u8 = 41;
     pub const BIND_MOUNT: u8 = 42;
@@ -99,6 +100,10 @@ pub(crate) struct ChildConfig {
     /// unshare(2) flag set for stage-1 (parent-computed: network mode
     /// "full" omits CLONE_NEWNET so the payload shares the host netns).
     pub unshare_flags: libc::c_int,
+    /// Supervisor pid, recorded pre-fork: if the parent dies between the
+    /// fork and the PDEATHSIG setup, getppid() changes and stage-1 kills
+    /// itself (fail closed — an orphaned sandbox must not keep running).
+    pub supervisor_pid: libc::pid_t,
     /// Absolute staging dir (parent-created via mkdtemp in a uid-writable
     /// filesystem): the child mounts the new-root tmpfs over it. Removed
     /// by the parent after the run.
@@ -793,13 +798,40 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         &*(arg as *const ChildConfig)
     };
 
-    // 1. Park until the parent has attached this process to the cgroup
+    // 1. Parent-death signal FIRST: if the supervisor dies for ANY reason
+    //    (crash, SIGKILL, Ctrl-C) the kernel SIGKILLs stage-1, whose death
+    //    destroys the whole PID namespace. Operational-leak defense: an
+    //    orphaned sandbox must not keep running (red-team cycle 2 found
+    //    this exact leak with a SIGKILLed supervisor).
+    let r = unsafe {
+        // SAFETY: prctl(PR_SET_PDEATHSIG, SIGKILL): plain attribute.
+        libc::prctl(
+            libc::PR_SET_PDEATHSIG,
+            libc::SIGKILL as u64,
+            0u64,
+            0u64,
+            0u64,
+        )
+    };
+    if r < 0 {
+        fail(cfg, stage::PDEATHSIG, errno());
+    }
+    // SAFETY: plain getter.
+    if unsafe { libc::getppid() } != cfg.supervisor_pid {
+        // The parent died before the prctl landed: nothing is watching.
+        unsafe {
+            // SAFETY: self-termination on the fail-closed path.
+            libc::_exit(1);
+        }
+    }
+
+    // 2. Park until the parent has attached this process to the cgroup
     //    leaf (limits must cover every descendant we are about to create).
     if let Err(e) = wait_for_go(cfg.go_rd) {
         fail(cfg, stage::SYNC, e);
     }
 
-    // 2. All namespaces at once (the parent-computed flag set; NEWUSER in
+    // 3. All namespaces at once (the parent-computed flag set; NEWUSER in
     //    the set is what makes this unprivileged-legal: the kernel creates
     //    the user namespace first, then the rest owned by it).
     let r = unsafe {
@@ -810,7 +842,7 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         fail(cfg, stage::NS_SETUP, errno());
     }
 
-    // 3. Deny setgroups, then write uid/gid maps: we are uid 0 inside the
+    // 4. Deny setgroups, then write uid/gid maps: we are uid 0 inside the
     //    new user namespace, mapped 1:1 onto the parent's unprivileged ids.
     //    Order matters: setgroups must be denied before gid_map is accepted.
     if let Err(e) = write_proc_file(c"/proc/self/setgroups".to_bytes_with_nul(), b"deny") {
@@ -835,7 +867,7 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         fail(cfg, stage::WRITE_GID_MAP, e);
     }
 
-    // 4. Fork stage-2: the payload's PID-namespace init.
+    // 5. Fork stage-2: the payload's PID-namespace init.
     let pid2 = unsafe {
         // SAFETY: fork(2); both halves below stay async-signal-safe.
         libc::fork()
