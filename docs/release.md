@@ -62,19 +62,18 @@ Work through in order; do not batch.
   `Cargo.lock`) or explicitly waived with a written reason in this
   runbook's release notes. Silent waivers are bugs.
 
-- [ ] **License / ban policy check** — also not in CI. First run
-      generates `deny.toml`; commit it to the repository so later runs
+- [ ] **License / ban policy check** — also not in CI. `deny.toml` is
+      committed at the repo root (generated once, then reviewed), so runs
       are reproducible:
 
   ```sh
-  cargo deny init && cargo deny check
+  cargo deny check
   ```
 
-  TODO(verify): `cargo-deny` has never been run in this repository
-  (there is no `deny.toml` at the repo root yet). The generated
-  `deny.toml` must be reviewed before first use — in particular the
-  license policy, since the workspace is `Apache-2.0 OR MIT` and every
-  dependency must be compatible with both.
+  Verified cycle 12: all four sections pass with a permissive-only
+  license allow list (each entry justified; copyleft fails by default).
+  `cargo audit` reported no advisories across 205 dependencies. Remaining
+  TODO(verify): add both commands to CI; re-run per release.
 
 - [ ] **Product demo green against a release build** (built in step 2):
 
@@ -115,7 +114,17 @@ rustup target add x86_64-unknown-linux-musl
 cargo build --release -p carapace-cli --target x86_64-unknown-linux-musl
 ```
 
-TODO(verify): a musl build has never been attempted in this repository.
+Verified cycle 15 (2026-10-27): this command builds successfully from a
+clean target dir on the reference env. The result is a static-pie binary
+(`file`: "static-pie linked"; `ldd`: "not a dynamic executable"). That
+binary then ran `cara doctor` (READY) and sandboxed `/bin/sh` and
+`python3` payloads on a Debian 12 (bookworm) userland under the same WSL2
+kernel (see docs/agent/ENV.md). The build required one portability fix:
+`statfs.f_type` is signed on glibc and unsigned on musl, so the cgroup2
+magic comparison now normalizes to u64.
+
+Still unverified: running the glibc build on hosts with older glibc,
+musl builds of Tier 2 (`carapace-wasm`), and non-x86_64 musl targets.
 
 Honest expectations: the `cara` dependency tree (carapace-core,
 carapace-sys, carapace-native, carapace-mcp, clap, serde/serde_json,
@@ -137,7 +146,7 @@ ldd target/x86_64-unknown-linux-musl/release/cara   # expect: not a dynamic exec
 
 ### 2b. glibc fallback
 
-If musl fails (or until it is verified), ship the ordinary release
+If musl fails, ship the ordinary release
 build:
 
 ```sh

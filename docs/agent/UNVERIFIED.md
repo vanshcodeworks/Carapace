@@ -45,9 +45,14 @@ test or measurement in this repository currently demonstrates it.
    after writing an explicit license policy in deny.toml (permissive-only
    allow list, each entry justified; copyleft fails the check by default).
    Remaining: add `cargo deny check` to CI (currently local-only).
-7. **musl static build** — documented as a recipe (docs/release.md) with
-   explicit TODO(verify); wasmtime/masa deps may not compile for musl.
-   Never attempted.
+7. ~~**musl static build**~~ **DONE (cycle 15).** `cargo build -p
+   carapace-cli --target x86_64-unknown-linux-musl` succeeds after fixing
+   a signedness difference in `statfs.f_type` (signed on glibc, unsigned
+   on musl). The result is `static-pie linked`; it ran `cara doctor`
+   (READY) and sandboxed `/bin/sh` and `python3` payloads on a Debian 12
+   (bookworm) userland under the same WSL2 kernel. Still unverified: musl
+   builds of Tier 2 (`carapace-wasm`), non-x86_64 musl targets, and the
+   glibc build on hosts with glibc < 2.39.
 8. **Non-merged-/usr and non-systemd hosts**: doctor now detects the
    merged-usr requirement, non-systemd PID 1 and missing delegation, and
    prints exact remedies (simulated-environment tests). No real
@@ -66,15 +71,21 @@ test or measurement in this repository currently demonstrates it.
     (`forced_pdeathsig_race_never_execs_payload`) kill stage-1 inside the
     window and assert the payload never execs. Release builds cannot enable
     the hook. RT16 still covers the end-to-end SIGKILL path.
-11. **Other distro/kernel environments are untested.** Every measurement
-    in this repository comes from one environment: WSL2, kernel
-    6.18.54.1-microsoft-standard-WSL2, Ubuntu 24.04.5, x86_64, systemd
-    user slice. No Docker daemon and no VM images are available here, so
-    Debian, Fedora, Arch, Alpine/musl, non-systemd, aarch64 and older
-    kernels (5.10/5.13/5.15 LTS) have never run the suite. Do not treat
-    any distro as supported until its row is measured. Verify by: booting
-    each target (VM or container with userns/cgroup delegation) and
-    running `scripts/check.sh`.
+11. **Other distro/kernel environments remain largely untested.** Every
+    baseline measurement in this repository comes from one environment:
+    WSL2, kernel 6.18.54.1-microsoft-standard-WSL2, Ubuntu 24.04.5,
+    x86_64, systemd user slice. Cycle 15 added **one** data point: a
+    Debian 12.15 (bookworm) minbase userland under the *same* WSL kernel,
+    entered with `pivot_root` in a private mount namespace (a plain
+    `chroot` cannot create user namespaces: `unshare(2)` returns `EPERM`
+    when the caller's root is not the mount namespace root). With the
+    static musl build, `cara doctor` was READY and `/bin/sh` (dash) plus
+    Python payloads ran. This is userland-only: no different kernel, no
+    Fedora/Arch/Alpine, no aarch64, no non-systemd or real
+    non-merged-/usr host, and the debootstrap tree was not
+    signature-verified. Do not treat any distro as supported until its row
+    is measured. Verify by: booting each target (VM or container with
+    userns/cgroup delegation) and running `scripts/check.sh`.
 12. **JVM security-config layout variants are untested.** The JVM column
     passes on Ubuntu 24.04 OpenJDK 21, whose `conf/security/java.security`
     links into `/etc/java-21-openjdk/security`; the planner exposes only

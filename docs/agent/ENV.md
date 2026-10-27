@@ -1,7 +1,8 @@
 # Development Environment (docs/agent/ENV.md)
 
 The reference dev environment for this repository. Everything below was
-measured or performed by the agent on 2026-10-24/25 and is the basis for
+measured or performed by the agent on 2026-10-24/25 (and 2026-10-27 for
+the Debian userland measurement and musl build) and is the basis for
 `cara doctor`'s checks and the strict tests (`CARA_STRICT_ENV_TESTS=1`).
 
 ## Host
@@ -106,4 +107,37 @@ wsl -d Ubuntu-24.04 -u dev -- bash -lc "bash /mnt/p/Carapace/scripts/check.sh"
   tests run — lingering fixes this.
 - `/proc/config.gz` is available on the WSL kernel — doctor and docs use it
   for kernel-config claims.
-strace
+
+## Alternate-userland measurement (cycle 15 — not a support claim)
+
+A Debian 12.15 (bookworm) `minbase` userland was bootstrapped with
+`debootstrap` at `/srv/debian-bookworm` and exercised under the **same**
+WSL2 kernel (6.18.54.1). This tests the runtime recipe against a different
+libc/userland; it is not a different-kernel test and not a claim that
+Debian is supported.
+
+- The sandbox binary was the static musl build of `carapace-cli` from this
+  tree (`x86_64-unknown-linux-musl`), because the glibc build needs
+  glibc 2.39 and bookworm ships 2.36.
+- A plain `chroot` cannot be used: `unshare(2)` returns `EPERM` when the
+  caller's root directory is not the mount namespace's root (documented in
+  `unshare(2)`), so `CLONE_NEWUSER` fails inside any chroot — even an empty
+  one. The test therefore enters a private mount namespace as root,
+  `--rbind`s the Debian tree (recursive bind so `/proc`, `/sys`, `/dev`
+  keep their nested mounts), `pivot_root`s into it, and drops to uid 1000
+  with `setpriv`. Script: `.wsl/debian-pivot-test.sh`.
+- Result: `cara doctor` → **READY** (userns, cgroup v2 + delegation,
+  Landlock ABI 7, seccomp, merged-usr layout, systemd init). `cara run`
+  executed `/bin/sh` (dash) and `/usr/bin/python3` successfully
+  (`42`); `/etc/debian_version` is correctly absent inside the sandbox
+  (sandbox-owned `/etc`).
+- Debian bookworm ships an **empty** `/usr/lib64` (with `/lib64 ->
+  usr/lib64`), so the host-layout gate accepts it; the earlier suspicion
+  that Debian lacks this path was wrong.
+- Caveats: `debootstrap` could not verify Release signatures (the host
+  keyring package was absent), so this chroot is not a trusted artifact;
+  only one Debian release was tested; Fedora/Arch/Alpine, other kernels,
+  aarch64, non-systemd and real non-merged-/usr hosts remain unmeasured.
+- `systemd-run --user --scope` returned 0 even when `cara doctor` exited
+  nonzero in this harness; readiness above was read from the printed
+  verdict. The CLI exit-code contract is covered by `tests/doctor_cli.rs`.

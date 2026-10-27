@@ -234,3 +234,60 @@ CARA_SECCOMP_LOG=1 + dmesg audit.
 Next: other distro/kernel environments (UNVERIFIED R2.11), JVM layout
 variants (R2.12), doctor remedies on real broken hosts (R2.13); then
 P3 sessions/upload/download/network allowlist/SDKs.
+
+## Cycle 15 (audit) - 2026-10-27 - claim audit, musl build, Debian userland
+
+Task: scheduled audit of P1/P2. Re-derive every claim from a test or a
+measurement; build the musl target; exercise the runtime against a
+different userland.
+
+Outcome: audit found and fixed real drift. `CLAIMS.md` still said 20
+payloads/21 suite tests/11 red-team tests/10 cara-vm tests and marked
+full-network and musl as TODO; corrected to 21 payloads, 23 suite tests,
+22 red-team tests, 9 cara-vm tests, and measured rows. `release.md`
+claimed cargo-deny had never run (there is a committed deny.toml and
+cycle 12 ran it) and carried a stale musl TODO; corrected. `demo/README`
+said 20 payloads. `ENV.md` ended with a stray `strace` line.
+ADR-0007 cited "seccomp_profile unit tests" for `getpgrp` and xattrs, but
+those tests did not assert either: `essentials_are_allowed` now asserts
+`SYS_getpgrp` plus all six read-only xattr syscalls, and
+`dangerous_syscalls_are_not_allowed` asserts all six mutation xattr
+syscalls are absent. Doctor's Debian remedy cited the wrong sysctl page:
+`unprivileged_userns_clone` is a Debian-specific knob, now cited to the
+Debian salsa patch (URL verified HTTP 200) and labelled Debian-specific.
+Every `unsafe` block still carries a SAFETY comment; no unqualified
+"secure" remains outside the disclaimer.
+
+The audit's missing proof was full-network mode: only the denial side was
+tested. Added `network_full_mode_permits_loopback_sockets`, an end-to-end
+positive control (host listener, payload connects/sends/receives over
+loopback under `mode = "full"`). It passes in 0.34 s.
+
+musl: `cargo build -p carapace-cli --target x86_64-unknown-linux-musl`
+now succeeds and produces a `static-pie linked` binary. It exposed a real
+portability bug: `statfs.f_type` is signed on glibc but unsigned on musl,
+so the cgroup2 magic comparison now normalizes to u64.
+
+Alternate userland: bootstrapped Debian 12.15 (bookworm) minbase with
+debootstrap and ran the static musl binary there under the same WSL2
+kernel. A plain chroot cannot be used - `unshare(2)` returns EPERM when
+the caller's root is not the mount-namespace root, so even an empty
+chroot cannot create a user namespace. The harness enters a private mount
+namespace, `--rbind`s the tree (recursive bind keeps nested /proc, /sys,
+/dev), `pivot_root`s, and drops to uid 1000. Result: `cara doctor`
+READY (userns, cgroup v2 + delegation, Landlock ABI 7, seccomp, merged
+usr, systemd); dash and Python 3.11 payloads ran (`42`);
+`/etc/debian_version` is correctly absent inside the sandbox. Debian
+bookworm ships an empty `/usr/lib64` with `/lib64 -> usr/lib64`, so the
+host-layout gate accepts it (an earlier suspicion that it lacked the path
+was wrong). This is a userland-only data point, not a support claim; the
+debootstrap tree was not signature-verified and only one release was
+tested. Recorded in ENV.md and UNVERIFIED R2.11.
+
+Full workspace: 220 passed / 0 failed (including 22 red-team tests and
+the new network control); clippy -D warnings clean; runtime matrix
+17/17. Escape suite 23/23 in 4.05 s. Cgroup/staging lists empty.
+Commands: scripts/check.sh, cargo build --target
+x86_64-unknown-linux-musl, debian-pivot-test.sh.
+Next: red-team cycle 16; then P3 (sessions, upload/download, network
+allowlist, SDKs) and P4 (external-review brief, escape challenge).

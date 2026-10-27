@@ -1,7 +1,7 @@
 //! Filesystem-type helpers built on `statfs(2)`.
 
 /// `CGROUP2_SUPER_MAGIC` — per `linux/magic.h`: `0x63677270`.
-const CGROUP2_SUPER_MAGIC: i64 = 0x6367_7270;
+const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
 /// Returns `true` if `path` is on a cgroup v2 (unified hierarchy) mount,
 /// i.e. `/sys/fs/cgroup` is `cgroup2`.
@@ -20,7 +20,9 @@ pub fn is_cgroup2_mount(path: &str) -> bool {
         // zero-initialized out-struct of the matching type.
         libc::statfs(c_path.as_ptr(), &mut st)
     };
-    ret == 0 && st.f_type == CGROUP2_SUPER_MAGIC
+    // `statfs.f_type` is signed on glibc and unsigned on musl; magic values
+    // are 32-bit positive, so normalizing to u64 is lossless on both.
+    ret == 0 && st.f_type as u64 == CGROUP2_SUPER_MAGIC
 }
 
 #[cfg(test)]
