@@ -349,3 +349,104 @@ Cgroup/staging lists empty.
 Commands: scripts/check.sh, .wsl/rt31-probe.sh (characterization).
 Next: P3 (sessions, upload/download, network allowlist, Python/TypeScript
 SDKs) and P4 (external-review brief, escape challenge).
+
+## Cycle 17 (P3) - 2026-10-27 - persistent sessions (keeper, shared tmpfs, MCP)
+
+Task: first P3 slice - persistent sessions with upload/download and MCP
+tools. Network allowlist and the Python/TypeScript SDKs stay deferred.
+
+Outcome: sessions work end to end through both `cara` and `cara-mcp`.
+Design recorded in ADR-0009; 13 new CLI integration tests, one new MCP
+e2e test and the expanded MCP unit suite are green.
+
+- One keeper per session, spawned as a fresh exec of
+  `<current_exe> __session-keeper <spec.json>` (both binaries understand
+  the hidden argument). The keeper parks on a go-pipe while the manager
+  creates the session cgroup leaf and writes the keeper pid into
+  `cgroup.procs`; this is the only moment delegation permits the move.
+  A fresh exec, not a fork, so the keeper may allocate after a
+  multi-threaded MCP parent forked it.
+- After the go byte the keeper `unshare(CLONE_NEWUSER|CLONE_NEWNS)`,
+  writes single-mapping `uid_map`/`gid_map`, makes `/` `MS_REC|MS_PRIVATE`
+  and mounts the session tmpfs at `/work` with
+  `size=<scratch_bytes>,mode=0700,MS_NOSUID|MS_NODEV`, plus `MS_NOEXEC`
+  unless `exec_on_write` is set. The tmpfs is the disk quota; the cgroup
+  leaf is the memory/CPU/process quota.
+- Every `session exec` is a fresh sandbox minus the user namespace:
+  `spawn_with(skip_userns = true, work_bind = <session tmpfs>,
+  cgroup = false)` gives it new mount, PID, IPC and UTS namespaces (and
+  net unless `network = "full"`), a fresh rootfs tmpfs, the usual
+  rlimits + Landlock + seccomp stack, and the session tmpfs at `/work`.
+  Processes do not survive an exec by design (PID-namespace teardown);
+  files do. A direct background-process probe is still open (R2.15).
+- Limits are session-wide: the keeper and every payload share one cgroup
+  leaf, so `memory`, `pids.max` and CPU apply to the whole session.
+  `SessionPolicy` adds floor checks (`memory >= 64 MiB`,
+  `max_processes >= 8`, `4 * max_output + 32 MiB < memory`) so output
+  buffering cannot OOM the payload, and refuses
+  `network = "allowlist"` (ADR-0004: not implemented).
+- Control socket: 4-byte big-endian length + JSON, mode 0600, under
+  `$XDG_RUNTIME_DIR/carapace/sessions/<id>` (fallback
+  `/tmp/cara-sessions-<uid>`, both 0700). One connection may carry
+  several requests (needed for put+exec); the keeper serves one
+  connection at a time, so concurrent execs serialize rather than race.
+- Paths are validated, not string-sanitized: relative, normalized,
+  resolved with
+  `openat2(RESOLVE_BENEATH|RESOLVE_NO_SYMLINKS|RESOLVE_NO_MAGICLINKS)`.
+  Uploads write a random temp file and `renameat(2)` it into place;
+  transfers are capped at 64 MiB, and MCP `session_download` rejects by
+  header at 8 MiB before allocating.
+- Lifecycle: the keeper is a `PR_SET_CHILD_SUBREAPER`; MCP keepers arm
+  PDEATHSIG against the server pid, CLI sessions are deliberately
+  detached (`parent_pid = 0`). `session close` is a graceful socket
+  close (1 s timeout) then SIGTERM/SIGKILL; `session prune` removes
+  directories whose keeper is gone; the cgroup sweeper recognizes
+  `cara-sess-<pid>-...` leaves.
+- CLI: `cara session start|exec|put|get|ls|list|close|prune`;
+  `start --json` prints id and dir; malformed or unknown ids exit 3.
+- MCP: `session_create`, `session_exec`, `session_upload`,
+  `session_download`, `session_list`, `session_close` (8 tools total).
+  Sessions are server-owned: a per-server `BTreeSet` allowlist refuses
+  foreign ids before touching the filesystem or socket. `session_exec`
+  stages code at `.__cara/code` and runs `sh FILE` - not `sh -c FILE` -
+  because `/work` is `MS_NOEXEC` by default.
+
+Tests added (`crates/cara-cli/tests/session.rs`, 13):
+`files_persist_across_execs_and_survive_the_cli_exit`,
+`upload_download_roundtrip_is_byte_exact`,
+`traversal_absolute_paths_and_symlinks_are_refused`,
+`timeout_kills_the_payload_tree_and_the_session_survives`,
+`disk_quota_is_enforced_inside_the_session`,
+`noexec_is_the_default_and_exec_on_write_opts_in` (EPERM 1 for
+`mmap(PROT_EXEC)`, `mapped` under `preset = "dev"`),
+`close_removes_the_socket_work_dir_and_meta`,
+`host_paths_and_network_stay_hidden`,
+`concurrent_execs_are_serialized_not_rejected`,
+`close_while_busy_kills_the_payload_and_returns`,
+`keeper_death_takes_the_payload_and_prune_reclaims_the_state`,
+`unknown_and_malformed_ids_are_rejected`,
+`session_start_requires_an_absolute_program`.
+MCP e2e `mcp_sessions_persist_files_and_close` covers create, persisted
+files across execs, upload/download, list, foreign-id refusal and close;
+`tools_list_has_exactly_eight_tools` pins the schema.
+
+One test-only fix: RT20 (`rt_zero_output_cap_kills_immediately`) was
+racy. A payload that wrote and exited in the same millisecond could be
+reaped before the supervisor observed the overflow byte, and the earlier
+assertion measured spawn time under load. The probe now runs
+`sh("echo hi; sleep 30")` with a 10 s timeout and asserts
+`wall_time < 3 s`; the overflow kill itself was correct. Stable over
+three consecutive red-team runs (31/31 each).
+
+Docs: `docs/decisions/ADR-0009-sessions.md`; `docs/mcp.md` (tool table,
+session caps, server-owned ids, P3 milestone row).
+
+Full workspace: **250 passed / 0 failed** (27 result lines: 31 red-team,
+23 escape, 41 hardening, 29 MCP unit, 13 session integration, 2 MCP e2e,
+plus the other suites); clippy `-D warnings` clean; runtime matrix 17/17.
+Housekeeping: the GitHub repository `vanshcodeworks/Carapace` was set to
+**private** (user request) before any push.
+
+Next: push `agent/work`; then network allowlist (seccomp user-notification
+`connect` broker, IP/CIDR + port), Python/TypeScript SDKs, and P4
+(external-review brief, draft escape challenge).

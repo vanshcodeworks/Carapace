@@ -1,9 +1,23 @@
 # STATE - agent working state (overwritten every cycle)
 
-Last updated: cycle 16 (red-team: kernel surfaces, inheritance, mmap exec) - 2026-10-27.
+Last updated: cycle 17 (P3: persistent sessions) - 2026-10-27.
 
 ## Done (all green via scripts/check.sh)
 - C0-C12 COMPLETE at 02044f0 (see FINAL_REPORT.md).
+- P3 sessions (first slice) COMPLETE per ADR-0009: one keeper process
+  per session, a session-wide cgroup leaf, a size-capped tmpfs at
+  `/work`, and a 0600 UNIX control socket. Each exec is a fresh sandbox
+  (new mount/PID/IPC/UTS, net unless `full`; shared user namespace) with
+  the session tmpfs bound at `/work`; each exec is a fresh sandbox, and
+  only files are intended to persist (a direct background-process probe
+  is still open, UNVERIFIED R2.15).
+  Uploads/downloads are path-validated with `openat2`, temp-file +
+  `renameat`, capped at 64 MiB (MCP download 8 MiB). CLI:
+  `session start|exec|put|get|ls|list|close|prune`. MCP: 6 server-owned
+  session tools (8 tools total), foreign ids refused. 13 CLI integration
+  tests + `mcp_sessions_persist_files_and_close`; `docs/mcp.md` and
+  ADR-0009 updated. Network allowlist and SDKs remain open (P3 rest).
+
 - P1.1 exec-on-write is an explicit policy field:
   `SandboxSpec::exec_on_write` / `Policy::exec_on_write` /
   `[filesystem] exec_on_write`, default **false**, **false** in `strict`,
@@ -77,11 +91,15 @@ Last updated: cycle 16 (red-team: kernel surfaces, inheritance, mmap exec) - 202
   memfd+execveat, mmap(PROT_EXEC) of written files). One real finding
   (mmap/dlopen bypass) fixed with noexec mounts. `tests/redteam.rs` now
   has **31 tests**.
-- Full workspace: **229 passed / 0 failed** (31 red-team tests);
-  clippy -D warnings clean; runtime matrix 17/17; escape suite 23/23.
+- Full workspace: **250 passed / 0 failed** (27 result lines; 31 red-team
+  tests); clippy -D warnings clean; runtime matrix 17/17; escape suite
+  23/23.
 
 ## In progress
-- (none)
+- P3 rest: network allowlist (seccomp user-notification `connect` broker,
+  IP/CIDR + port only; `network = "allowlist"` is currently refused), then
+  Python/TypeScript SDKs (MCP clients + smoke tests), then P4
+  (external-review brief, draft escape challenge).
 
 ## Known bugs / risks
 - Alternate environments: one Debian userland data point only; no
@@ -102,6 +120,23 @@ Last updated: cycle 16 (red-team: kernel surfaces, inheritance, mmap exec) - 202
   wrote *onto an executable mount it was granted* (e.g. an executable
   read-write bind). That is the documented `exec_on_write` trade-off, not
   a bypass of the default.
+- Sessions need cgroup delegation for the keeper leaf, so they do not
+  exist on Tier 2. Session memory/CPU/pids caps cover the keeper *and*
+  every payload; `peak_memory_bytes`/`peak_processes` in an exec report
+  are session-cumulative high-water marks, not per-exec peaks.
+- A CLI-started session is deliberately detached and outlives the CLI;
+  its directory is reclaimed only by explicit `session prune` (the cgroup
+  sweeper handles leaves by owner-pid liveness). MCP session ids are
+  process-owned and die with the server (PDEATHSIG), so ids are not
+  resumable across a restart.
+- Session testing is single-session: concurrent execs within one session
+  serialize (tested), but many simultaneous sessions on one host have not
+  been stress-tested. No aarch64/alternate-kernel session run.
+- Session-wide memory/CPU/output limits are not individually measured
+  (R2.14); the control socket authenticates by filesystem permissions
+  only, so any same-uid process can drive a session (not a privilege
+  boundary, R2.16); transfer-cap boundaries and the XDG fallback path are
+  untested (R3.25-R3.26).
 - mkdir_p lesson encoded: never hardcode prefix lengths; keep join
   separators (bind ENOENT debugging).
 

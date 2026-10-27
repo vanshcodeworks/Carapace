@@ -131,3 +131,21 @@ test lands at listed milestone.
 | Debian/Ubuntu OpenJDK starts because exactly the canonical `security` directory referenced by an in-tree JVM is bind-mounted read-only; foreign targets, regular files and dangling links are dropped | supervisor `security_planner_exposes_only_referenced_etc_security_dirs` + runtime matrix `jvm-compile-run`; ADR-0007 section 8 | verified P2 |
 | A static musl build of `carapace-cli` compiles and runs: `static-pie linked`, `cara doctor` READY, and sandboxed `/bin/sh` + `python3` payloads on a Debian 12 (bookworm) userland under the same WSL kernel | `cargo build -p carapace-cli --target x86_64-unknown-linux-musl`; Debian pivot_root harness (ENV.md); fixed signedness of `statfs.f_type` | measured cycle 15 (userland-only; not a support claim) |
 | Debian bookworm passes the host-layout gate: it ships an empty `/usr/lib64` with `/lib64 -> usr/lib64` | `cara doctor` READY inside the Debian pivot_root harness (ENV.md) | measured cycle 15 |
+
+## P3 claims (added cycle 17)
+| Claim | Basis | Status |
+|---|---|---|
+| A session keeps `/work` across separate `cara session exec` host processes and across the CLI's exit; later execs read earlier files | `cara-cli/tests/session.rs::files_persist_across_execs_and_survive_the_cli_exit`; `cara-mcp/tests/mcp_e2e.rs::mcp_sessions_persist_files_and_close` | ✅ verified P3 |
+| Upload/download is byte-exact in both directions | `session.rs::upload_download_roundtrip_is_byte_exact` (all 256 byte values + 1 MiB payload); MCP e2e upload/download | ✅ verified P3 |
+| Session paths are relative and normalized; `..`, absolute paths, empty/double components and symlink traversal are refused | `session.rs::traversal_absolute_paths_and_symlinks_are_refused`; `carapace-native::session::tests::relative_paths_are_strict` | ✅ verified P3 |
+| A per-exec timeout kills the payload tree and leaves the session usable | `session.rs::timeout_kills_the_payload_tree_and_the_session_survives` (background `sleep 30` + foreground `sleep 30`, 1 s timeout) | ✅ verified P3 |
+| The session tmpfs is a real disk quota: a 2 MiB session gets ENOSPC on the second 1.5 MiB write and stays usable | `session.rs::disk_quota_is_enforced_inside_the_session` | ✅ verified P3 |
+| Session `/work` is `MS_NOEXEC` by default: `execve` fails and `mmap(PROT_EXEC)` returns EPERM (1); `preset = "dev"` / `exec_on_write = true` runs and maps the same file | `session.rs::noexec_is_the_default_and_exec_on_write_opts_in` | ✅ verified P3 |
+| `session close` removes the control socket, work dir and metadata | `session.rs::close_removes_the_socket_work_dir_and_meta` | ✅ verified P3 |
+| A session exec hides host paths and, under `network = "none"`, `socket(2)` itself fails with EPERM before any connect | `session.rs::host_paths_and_network_stay_hidden` | ✅ verified P3 |
+| Concurrent execs against one session serialize (one connection at a time) and all complete | `session.rs::concurrent_execs_are_serialized_not_rejected` (3 parallel `cara session exec`) | ✅ verified P3 |
+| Closing a session while a payload is running kills the payload and returns | `session.rs::close_while_busy_kills_the_payload_and_returns` (bounded wait) | ✅ verified P3 |
+| Killing the keeper kills the running payload; `session prune` reclaims the dead session's directory | `session.rs::keeper_death_takes_the_payload_and_prune_reclaims_the_state` | ✅ verified P3 |
+| Unknown/malformed session ids exit 3; `session start` requires an absolute program path | `session.rs::unknown_and_malformed_ids_are_rejected`, `session_start_requires_an_absolute_program` | ✅ verified P3 |
+| Session policy is validated on the host and again in the keeper; `network = "allowlist"` is refused; memory < 64 MiB is refused; the policy round-trips through JSON | `carapace-native::session::tests::session_policy_rejects_allowlist_and_tiny_memory`, `session_policy_round_trips_through_json` | ✅ verified P3 |
+| MCP exposes exactly 8 tools including 6 session tools; session ids are server-owned, and foreign ids are refused before any filesystem/socket access | `cara-mcp` unit tests `tools_list_has_exactly_eight_tools`, `session_tools_validate_before_touching_a_sandbox`; e2e foreign-id refusal | ✅ verified P3 |

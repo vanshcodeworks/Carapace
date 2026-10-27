@@ -103,23 +103,79 @@ test or measurement in this repository currently demonstrates it.
     commands and upstream URLs were verified to exist, not executed.
     Verify by: snapshot a VM, break one capability at a time, apply the
     printed remedy, and re-run `cara doctor`.
+14. **Session-wide memory, CPU and output limits are not individually
+    measured.** The keeper and every payload share one cgroup leaf
+    (ADR-0009 §3), but the session tests cover the disk quota, the
+    per-exec timeout and the policy floors only; no test drives a session
+    payload into the memory cap or the CPU quota, and no test overflows
+    the session output cap. Verify by: session equivalents of
+    `limits.rs::memory_hog_is_oom_killed_at_limit`,
+    `cpu_quota_shapes_usage`, and the output-overflow probe.
+15. **Backgrounded processes across execs are not directly tested.** Each
+    exec gets a new PID namespace, so namespace teardown should kill a
+    background child when the exec ends; only the timeout/close/
+    keeper-kill tree kills are asserted. Verify by: run
+    `sh -c 'sleep 30 &'`, then assert no matching process exists in the
+    session cgroup after the exec returns.
+16. **The session control socket authenticates by filesystem permissions
+    only** (0600 socket inside a 0700 directory); there is no
+    `SO_PEERCRED` check. Any same-uid process can connect and issue
+    put/get/exec. This is not a privilege boundary (same-uid processes
+    can already signal or ptrace the keeper), but the MCP server-owned
+    id allowlist protects the tool surface, not the socket. Verify by: a
+    same-uid connection probe and an explicit threat-model note; add
+    peer-credential checks if sessions ever span trust domains.
+17. **Sessions require cgroup delegation and do not exist on Tier 2.**
+    `SessionManager::start` needs a delegated leaf; no wasm/vm session
+    equivalent is designed. Verify by: running the session suite on a
+    host without delegation (expected fail-closed) and documenting the
+    Tier 2 gap.
+18. **Multiple simultaneous sessions are untested.** The CLI tests run
+    one session at a time; three concurrent execs within one session are
+    tested. No stress test covers N sessions (each with a keeper and a
+    cgroup leaf) competing for memory/pids, nor `session prune` racing a
+    live keeper. Verify by: a multi-session stress test.
+19. **Stale CLI session directories are reclaimed only by explicit
+    `session prune`.** The cgroup sweeper removes dead-owner leaves, but
+    nothing automatically removes a session directory whose keeper is
+    gone; `session list` marks liveness. Verify by: a documented operator
+    workflow plus a long-running test, or an age-threshold reaper.
+
 
 ## R3 — Low risk (docs/ergonomics, unproven)
 
-14. **docs/mcp.md client config JSON** was written from the MCP spec shape,
+20. **docs/mcp.md client config JSON** was written from the MCP spec shape,
     not validated against current Claude Desktop / Cursor docs. Verify by:
     reading both products' current documentation (P3).
-15. **Benchmark comparability** (bubblewrap/nsjail/Docker) — never run;
+21. **Benchmark comparability** (bubblewrap/nsjail/Docker) — never run;
     docs make no comparative claims (correct). Verify by: P4 on the same
     machine with installable tools.
-16. **SBOM tooling output** (`cargo cyclonedx`) — command documented, never
+22. **SBOM tooling output** (`cargo cyclonedx`) — command documented, never
     run. Verify by: P8 release dry run.
-17. **`cara policy explain` wording quality** — tested for required
+23. **`cara policy explain` wording quality** — tested for required
     substrings, never reviewed by a human new to the project. Verify by:
     P6 new-user simulation.
-18. **Large-tree builds on DrvFs**: all builds here used the ext4 cache
+24. **Large-tree builds on DrvFs**: all builds here used the ext4 cache
     (CARGO_TARGET_DIR); a naive `cargo build` directly on /mnt/p has never
     been timed (documented in ENV.md as the reason for the cache).
+25. **Session transfer caps are code-enforced but not boundary-tested.**
+    `MAX_TRANSFER_BYTES` (64 MiB) and the MCP download cap (8 MiB) are
+    checked before allocation; no test uploads/downloads at or just over
+    either limit. Verify by: boundary tests with a sparse/large file.
+26. **The session socket fallback path is untested.** When
+    `XDG_RUNTIME_DIR` is unset, sessions use
+    `/tmp/cara-sessions-<uid>`; the primary path is exercised, the
+    fallback's 0700 directory / 0600 socket modes only by reading code.
+    Verify by: unset `XDG_RUNTIME_DIR` and run the session suite.
+27. **Session CLI ergonomics and the MCP six-tool flow have not been
+    reviewed by a new user.** They pass their tests, but no human
+    walkthrough exists. Verify by: P6 new-user simulation.
+28. **Session behavior on alternate environments is unmeasured.** All
+    session tests run on the reference WSL2 kernel/Ubuntu 24.04 with
+    cgroup delegation; no aarch64, no different kernel, no
+    Debian/Fedora/Arch session run. This extends R2.11 to the
+    keeper/tmpfs/cgroup path. Verify by: the same suite on each target.
+
 
 ## Verified-this-cycle (P0)
 
@@ -210,3 +266,39 @@ test or measurement in this repository currently demonstrates it.
   that ignores `MS_NOEXEC`, such as some FUSE mounts); measured on the
   reference WSL2 kernel only. An executable *writable* bind is the
   documented `exec_on_write` trade-off, not a bypass of the default.
+
+## Verified cycle 17 (P3 sessions)
+
+- Sessions were exercised end to end through the real `cara` binary
+  (13 integration tests) and through `cara-mcp` (one e2e test plus the
+  MCP unit suite). Measured: `/work` persists across separate host
+  processes and the CLI's exit; upload/download is byte-exact; `..`,
+  absolute paths and symlink traversal are refused; a 1 s exec timeout
+  kills the payload tree while the session survives; a 2 MiB tmpfs
+  returns ENOSPC and the session stays usable; `/work` is `MS_NOEXEC` by
+  default (`execve` fails, `mmap(PROT_EXEC)` returns EPERM 1) and
+  `preset = "dev"` runs/maps the same file; `close` removes the socket,
+  work dir and metadata; host paths and `socket(2)` stay hidden; three
+  concurrent execs serialize and all complete; `close` while busy kills
+  the payload; a SIGKILLed keeper takes the payload with it and `prune`
+  reclaims the directory; unknown/malformed ids exit 3.
+- The MCP e2e test covers create, persistence across execs,
+  upload/download, list, foreign-id refusal and close.
+- RT20 (`rt_zero_output_cap_kills_immediately`) was flaky for a
+  test-only reason: a payload that wrote and exited in the same
+  millisecond could be reaped before the overflow byte was observed, and
+  the assertion measured spawn time under load. It now runs
+  `sh("echo hi; sleep 30")` with a 10 s timeout and asserts
+  `wall_time < 3 s`; the product's overflow kill was correct. Stable
+  over three consecutive red-team runs (31/31 each).
+- Full workspace: **250 passed / 0 failed** across 27 result lines
+  (31 red-team, 23 escape, 41 hardening, 29 MCP unit, 13 session
+  integration, 2 MCP e2e, plus the other suites); clippy
+  `-D warnings` clean; runtime matrix 17/17; escape suite 23/23.
+- Still unverified for sessions: per-limit memory/CPU/output behavior
+  (R2.14), background-process persistence across execs (R2.15), socket
+  peer authentication (R2.16), Tier 2 availability (R2.17), multi-session
+  stress (R2.18), automatic stale-dir reaping (R2.19), transfer-cap
+  boundaries (R3.25), the socket fallback path (R3.26), new-user
+  ergonomics (R3.27), and alternate environments (R3.28).
+

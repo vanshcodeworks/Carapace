@@ -168,6 +168,8 @@ dependencies = [
  "carapace-core",
  "carapace-sys",
  "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

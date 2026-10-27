@@ -122,6 +122,7 @@ fn controllers_at(dir: &Path) -> Vec<String> {
 fn owner_pid(name: &str) -> Option<u32> {
     let rest = name
         .strip_prefix("cara-run-")
+        .or_else(|| name.strip_prefix("cara-sess-"))
         .or_else(|| name.strip_prefix("cara-cgroup-probe-"))?;
     rest.split_once('-')?.0.parse().ok()
 }
@@ -152,10 +153,31 @@ impl CgroupLeaf {
     /// Creates the leaf under `root`, applies the limits, and attaches the
     /// (still parked) child. Fails closed: any error aborts the sandbox.
     pub fn create(root: &Path, limits: &Limits, child_pid: libc::pid_t) -> std::io::Result<Self> {
+        Self::create_named(root, limits, child_pid, "cara-run", std::process::id())
+    }
+
+    /// Creates a session-wide leaf. The keeper is the owner and the only
+    /// process attached at creation time; every exec inherits the leaf.
+    /// The owner pid in the name is the keeper's, so the stale sweeper
+    /// leaves a live session alone and can reclaim it after keeper death.
+    pub fn create_session(
+        root: &Path,
+        limits: &Limits,
+        keeper_pid: libc::pid_t,
+    ) -> std::io::Result<Self> {
+        Self::create_named(root, limits, keeper_pid, "cara-sess", keeper_pid as u32)
+    }
+
+    fn create_named(
+        root: &Path,
+        limits: &Limits,
+        child_pid: libc::pid_t,
+        prefix: &str,
+        owner_pid: u32,
+    ) -> std::io::Result<Self> {
         sweep_stale(root);
         let unique = format!(
-            "cara-run-{}-{}",
-            std::process::id(),
+            "{prefix}-{owner_pid}-{}",
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -306,6 +328,15 @@ impl CgroupLeaf {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Detaches cleanup from the handle and returns the leaf path. Used by
+    /// the session manager: the short-lived `session start` process must
+    /// not remove a leaf the long-lived keeper still lives in. The caller
+    /// owns removal after the keeper exits (or the stale sweeper does).
+    pub fn into_path(mut self) -> PathBuf {
+        self.removed = true;
+        self.path.clone()
     }
 }
 

@@ -106,6 +106,16 @@ pub(crate) struct ChildConfig {
     /// child only passes pointers to mount(2)).
     pub root_size_opt: CString,
     pub work_size_opt: CString,
+    /// Session mode: an existing writable tmpfs owned by the session
+    /// keeper, bind-mounted at `/work` instead of a fresh per-run tmpfs.
+    /// The keeper's mount is size-capped and carries the noexec decision,
+    /// so the data and the quota survive between execs. `None` = one-shot
+    /// sandbox (fresh tmpfs).
+    pub work_bind: Option<CString>,
+    /// Session mode: stage-1 already runs inside the session user
+    /// namespace (uid 0 mapped to the invoking uid), so it must not create
+    /// a nested user namespace or rewrite uid/gid maps.
+    pub skip_userns: bool,
     /// RLIMIT_FSIZE for the payload (the per-file size cap).
     pub fsize_limit: u64,
     /// unshare(2) flag set for stage-1 (parent-computed: network mode
@@ -514,8 +524,31 @@ fn setup_rootfs(cfg: &ChildConfig) {
     }
 
     // (h) Size-capped scratch at /work (the only writable data area).
+    // Session mode binds the keeper's persistent tmpfs instead: the keeper
+    // mounted it with the same size cap and flags, and that mount outlives
+    // this exec. The bind is remounted with the writable flags so a source
+    // mounted executable can never leak into a strict session.
     let work = join(&root, c"/work".to_bytes_with_nul());
-    if let Err(e) = mount_raw(
+    if let Some(src) = &cfg.work_bind {
+        if let Err(e) = mount_raw(
+            src.as_bytes_with_nul(),
+            &work,
+            b"",
+            (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+            std::ptr::null(),
+        ) {
+            fail(cfg, stage::MOUNT_ROOT, e);
+        }
+        if let Err(e) = mount_raw(
+            src.as_bytes_with_nul(),
+            &work,
+            b"",
+            (libc::MS_BIND | libc::MS_REMOUNT | writable_flags) as libc::c_ulong,
+            std::ptr::null(),
+        ) {
+            fail(cfg, stage::MOUNT_ROOT, e);
+        }
+    } else if let Err(e) = mount_raw(
         c"tmpfs".to_bytes_with_nul(),
         &work,
         c"tmpfs".to_bytes_with_nul(),
@@ -1012,26 +1045,30 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
     // 4. Deny setgroups, then write uid/gid maps: we are uid 0 inside the
     //    new user namespace, mapped 1:1 onto the parent's unprivileged ids.
     //    Order matters: setgroups must be denied before gid_map is accepted.
-    if let Err(e) = write_proc_file(c"/proc/self/setgroups".to_bytes_with_nul(), b"deny") {
-        fail(cfg, stage::DENY_SETGROUPS, e);
-    }
-    // The parent captured its uid/gid BEFORE the fork: inside this
-    // namespace getuid() is meaningless (overflow) until the map exists.
-    let ruid = cfg.parent_uid;
-    let rgid = cfg.parent_gid;
-    let mut line = [0u8; 32];
-    if let Err(e) = write_proc_file(
-        c"/proc/self/uid_map".to_bytes_with_nul(),
-        map_line(ruid, &mut line),
-    ) {
-        fail(cfg, stage::WRITE_UID_MAP, e);
-    }
-    let mut line = [0u8; 32];
-    if let Err(e) = write_proc_file(
-        c"/proc/self/gid_map".to_bytes_with_nul(),
-        map_line(rgid, &mut line),
-    ) {
-        fail(cfg, stage::WRITE_GID_MAP, e);
+    //    Session execs are already inside the keeper's user namespace and
+    //    skip this block (the keeper wrote its maps once at session start).
+    if !cfg.skip_userns {
+        if let Err(e) = write_proc_file(c"/proc/self/setgroups".to_bytes_with_nul(), b"deny") {
+            fail(cfg, stage::DENY_SETGROUPS, e);
+        }
+        // The parent captured its uid/gid BEFORE the fork: inside this
+        // namespace getuid() is meaningless (overflow) until the map exists.
+        let ruid = cfg.parent_uid;
+        let rgid = cfg.parent_gid;
+        let mut line = [0u8; 32];
+        if let Err(e) = write_proc_file(
+            c"/proc/self/uid_map".to_bytes_with_nul(),
+            map_line(ruid, &mut line),
+        ) {
+            fail(cfg, stage::WRITE_UID_MAP, e);
+        }
+        let mut line = [0u8; 32];
+        if let Err(e) = write_proc_file(
+            c"/proc/self/gid_map".to_bytes_with_nul(),
+            map_line(rgid, &mut line),
+        ) {
+            fail(cfg, stage::WRITE_GID_MAP, e);
+        }
     }
 
     // 5. Fork stage-2: the payload's PID-namespace init.

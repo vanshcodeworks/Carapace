@@ -138,9 +138,35 @@ pub(crate) struct NativeSandbox {
 // the child is reaped, so moving the handle across threads cannot race.
 unsafe impl Send for NativeSandbox {}
 
+/// Options for a sandbox spawn. The default is the one-shot `cara run`
+/// behavior. Session execs disable the per-run cgroup leaf (the session
+/// keeper's leaf already covers them), skip the nested user namespace
+/// (they run inside the keeper's userns), and bind the keeper's persistent
+/// `/work` tmpfs.
+#[derive(Default)]
+pub(crate) struct SpawnOptions {
+    pub skip_userns: bool,
+    pub work_bind: Option<std::ffi::CString>,
+    pub cgroup: bool,
+}
+
 /// Spawns the sandbox child. Returns the live handle, or a `Setup` error
 /// when isolation could not be established (the payload never ran).
 pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
+    spawn_with(
+        spec,
+        SpawnOptions {
+            cgroup: true,
+            ..SpawnOptions::default()
+        },
+    )
+}
+
+/// Spawn with explicit session options; see [`SpawnOptions`].
+pub(crate) fn spawn_with(
+    spec: &SandboxSpec,
+    opts: SpawnOptions,
+) -> Result<NativeSandbox, BackendError> {
     // Honest wall-time origin: the very beginning of the spawn, not the
     // moment supervision begins (the payload may already be running by
     // then — the handshake overlaps the payload's first milliseconds).
@@ -242,7 +268,18 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         work_size_opt: std::ffi::CString::new(format!("size={}", spec.limits.scratch_bytes))
             .map_err(|e| setup("scratch size", std::io::Error::other(format!("{e}"))))?,
         fsize_limit: spec.limits.scratch_bytes.max(1024),
-        unshare_flags: unshare_flags_for(&spec.network),
+        unshare_flags: {
+            let mut flags = unshare_flags_for(&spec.network);
+            if opts.skip_userns {
+                // Session execs already run inside the keeper's user
+                // namespace; unsharing a nested one would invalidate the
+                // keeper's mounts and id map.
+                flags &= !(libc::CLONE_NEWUSER as libc::c_int);
+            }
+            flags
+        },
+        work_bind: opts.work_bind.clone(),
+        skip_userns: opts.skip_userns,
         supervisor_pid: unsafe {
             // SAFETY: plain getter with no failure mode.
             libc::getpid()
@@ -283,10 +320,26 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
     // C3: create the cgroup leaf and attach the PARKED stage-1 child. It
     // has no namespaces and no descendants yet, so the limits cover every
     // process this run will ever create. Failure is fatal (fail closed).
-    let cgroup_leaf = match crate::cgroup::delegated_root() {
-        Some(root) => match crate::cgroup::CgroupLeaf::create(&root, &spec.limits, pid1) {
-            Ok(leaf) => leaf,
-            Err(e) => {
+    //
+    // Session execs skip this: the keeper was attached to a session-wide
+    // leaf when it started, and every exec inherits that membership.
+    let cgroup_leaf = if opts.cgroup {
+        match crate::cgroup::delegated_root() {
+            Some(root) => match crate::cgroup::CgroupLeaf::create(&root, &spec.limits, pid1) {
+                Ok(leaf) => Some(leaf),
+                Err(e) => {
+                    return Err(spawn_cleanup(
+                        pid1,
+                        None,
+                        None,
+                        staging_cref,
+                        config_ptr,
+                        "cgroup limits",
+                        e,
+                    ));
+                }
+            },
+            None => {
                 return Err(spawn_cleanup(
                     pid1,
                     None,
@@ -294,21 +347,12 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                     staging_cref,
                     config_ptr,
                     "cgroup limits",
-                    e,
+                    std::io::Error::other("no delegated cgroup root found"),
                 ));
             }
-        },
-        None => {
-            return Err(spawn_cleanup(
-                pid1,
-                None,
-                None,
-                staging_cref,
-                config_ptr,
-                "cgroup limits",
-                std::io::Error::other("no delegated cgroup root found"),
-            ));
         }
+    } else {
+        None
     };
 
     // Release stage-1: it unshares everything and forks the payload init.
@@ -328,7 +372,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         return Err(spawn_cleanup(
             pid1,
             None,
-            Some(&cgroup_leaf),
+            cgroup_leaf.as_ref(),
             staging_cref,
             config_ptr,
             "go signal",
@@ -363,7 +407,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 return Err(spawn_cleanup(
                     pid1,
                     None,
-                    Some(&cgroup_leaf),
+                    cgroup_leaf.as_ref(),
                     staging_cref,
                     config_ptr,
                     "handshake",
@@ -376,7 +420,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 return Err(spawn_cleanup(
                     pid1,
                     None,
-                    Some(&cgroup_leaf),
+                    cgroup_leaf.as_ref(),
                     staging_cref,
                     config_ptr,
                     "result pipe",
@@ -391,7 +435,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         return Err(spawn_cleanup(
             pid1,
             None,
-            Some(&cgroup_leaf),
+            cgroup_leaf.as_ref(),
             staging_cref,
             config_ptr,
             "handshake",
@@ -410,7 +454,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
             return Err(spawn_cleanup(
                 pid1,
                 Some(pid2),
-                Some(&cgroup_leaf),
+                cgroup_leaf.as_ref(),
                 staging_cref,
                 config_ptr,
                 "pidfd_open(payload)",
@@ -433,7 +477,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 return Err(spawn_cleanup(
                     pid1,
                     Some(pid2),
-                    Some(&cgroup_leaf),
+                    cgroup_leaf.as_ref(),
                     staging_cref,
                     config_ptr,
                     &format!("child setup at {stage_name}"),
@@ -444,7 +488,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 return Err(spawn_cleanup(
                     pid1,
                     Some(pid2),
-                    Some(&cgroup_leaf),
+                    cgroup_leaf.as_ref(),
                     staging_cref,
                     config_ptr,
                     "status pipe",
@@ -456,7 +500,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
                 return Err(spawn_cleanup(
                     pid1,
                     Some(pid2),
-                    Some(&cgroup_leaf),
+                    cgroup_leaf.as_ref(),
                     staging_cref,
                     config_ptr,
                     "status pipe",
@@ -495,7 +539,7 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
         killed_reason: Mutex::new(None),
         reaped: Mutex::new(None),
         waited: Mutex::new(false),
-        cgroup_leaf: Some(cgroup_leaf),
+        cgroup_leaf,
         staging_dir,
         overflow_wr,
         overflow_rd,

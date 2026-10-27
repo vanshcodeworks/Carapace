@@ -1,17 +1,25 @@
-//! `carapace-mcp`: Model Context Protocol server exposing `run_code` and
-//! `explain_result` tools (milestone C7). MCP input is treated as hostile:
-//! every field is validated and size-capped before it reaches a sandbox.
+//! `carapace-mcp`: Model Context Protocol server exposing `run_code`,
+//! `explain_result`, and the `session_*` tools (milestone C7 / P3). MCP
+//! input is treated as hostile: every field is validated and size-capped
+//! before it reaches a sandbox.
 //!
 //! The wire protocol is line-delimited JSON-RPC 2.0 over stdio (one request
 //! per line, one response per line). The server is synchronous on purpose:
 //! a sandbox run blocks its `tools/call` until the run ends. The server
 //! NEVER runs code unsandboxed — every `run_code` goes through
 //! [`NativeBackend::spawn`], whose doctor gate fails closed.
+//!
+//! Sessions are additionally restricted to the ids this server created
+//! (see `McpServer::sessions`): an agent cannot reach the user's CLI
+//! sessions, only its own. Sessions die with the server process (PDEATHSIG
+//! on the keeper), so a crashed server never leaves a live sandbox behind.
 
 use carapace_core::{Backend, BackendError, ExitReport, KillReason, Policy, SandboxSpec};
 use carapace_native::NativeBackend;
+use carapace_native::session::{SessionError, SessionManager, SessionPolicy, base64};
 use serde::Deserialize;
 use serde_json::{Map, Value, json};
+use std::collections::BTreeSet;
 use std::io::{self, BufRead, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -42,6 +50,17 @@ pub const MAX_TIMEOUT_MS: u64 = 600_000;
 pub const MAX_MEMORY_MB: u64 = 2048;
 /// Maximum accepted `policy.max_processes`.
 pub const MAX_PROCESSES: u32 = 512;
+/// Maximum accepted session `disk_mb` (the session `/work` tmpfs).
+pub const MAX_SESSION_DISK_MB: u64 = 1024;
+/// Maximum decoded size of one `session_upload` payload. The base64 body
+/// must also fit inside [`MAX_LINE_BYTES`], which is the tighter bound in
+/// practice; larger files belong inside the session (write them with
+/// `session_exec`).
+pub const MAX_SESSION_UPLOAD_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum size of one `session_download` result. Larger files stay in the
+/// session: the agent can hash, split, or summarize them with
+/// `session_exec`.
+pub const MAX_SESSION_DOWNLOAD_BYTES: u64 = 8 * 1024 * 1024;
 /// Maximum size of one incoming JSON-RPC line (the `explain_result` report
 /// echoes back captured output, so this must exceed the sandbox output cap
 /// with room for JSON escaping).
@@ -55,6 +74,9 @@ pub struct McpServer<R: BufRead, W: Write> {
     input: R,
     output: W,
     backend: NativeBackend,
+    /// Session ids this server created. Anything else is refused, so an
+    /// agent cannot reach the user's CLI sessions (or another server's).
+    sessions: BTreeSet<String>,
 }
 
 impl<R: BufRead, W: Write> McpServer<R, W> {
@@ -63,6 +85,7 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             input,
             output,
             backend: NativeBackend::new(),
+            sessions: BTreeSet::new(),
         }
     }
 
@@ -187,6 +210,12 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
         match name {
             "run_code" => self.run_code(id, arguments),
             "explain_result" => self.explain_result(id, arguments),
+            "session_create" => self.session_create(id, arguments),
+            "session_exec" => self.session_exec(id, arguments),
+            "session_upload" => self.session_upload(id, arguments),
+            "session_download" => self.session_download(id, arguments),
+            "session_list" => self.session_list(id, arguments),
+            "session_close" => self.session_close(id, arguments),
             other => self.write_error(id, INVALID_PARAMS, &format!("unknown tool: {other:?}")),
         }
     }
@@ -220,6 +249,218 @@ impl<R: BufRead, W: Write> McpServer<R, W> {
             "content": [{"type": "text", "text": explain_report(&report)}],
         });
         self.write_result(id, result)
+    }
+
+    // ------------------------------------------------------------ sessions
+
+    /// Tool `session_create`: create a session owned by this server. The
+    /// keeper is armed with PDEATHSIG against the server, so the session
+    /// cannot outlive it.
+    fn session_create(&mut self, id: &Value, arguments: &Value) -> io::Result<()> {
+        let policy = match validate_session_create_args(arguments) {
+            Ok(p) => p,
+            Err(message) => return self.write_error(id, INVALID_PARAMS, &message),
+        };
+        let result = match SessionManager::new() {
+            Ok(manager) => match manager.start(policy, std::process::id()) {
+                Ok(meta) => {
+                    self.sessions.insert(meta.id.clone());
+                    let body = json!({
+                        "session_id": meta.id,
+                        "created_at_ms": meta.created_at_ms,
+                        "policy": {
+                            "timeout_ms": meta.policy.timeout_ms,
+                            "memory_bytes": meta.policy.memory_bytes,
+                            "scratch_bytes": meta.policy.scratch_bytes,
+                            "max_processes": meta.policy.max_processes,
+                            "network": meta.policy.network,
+                            "exec_on_write": meta.policy.exec_on_write,
+                        },
+                    });
+                    text_result(body.to_string(), false)
+                }
+                Err(e) => tool_error(session_error_text(e)),
+            },
+            Err(e) => tool_error(session_error_text(e)),
+        };
+        self.write_result(id, result)
+    }
+
+    /// Tool `session_exec`: stage `code` inside the session, run it in a
+    /// fresh sandbox whose `/work` is the session's persistent tmpfs, and
+    /// return the usual run report.
+    fn session_exec(&mut self, id: &Value, arguments: &Value) -> io::Result<()> {
+        let params = match validate_session_exec_args(arguments) {
+            Ok(p) => p,
+            Err(message) => return self.write_error(id, INVALID_PARAMS, &message),
+        };
+        if params.python3 && !Path::new("/usr/bin/python3").exists() {
+            return self.write_result(
+                id,
+                tool_error("python3 is not available at /usr/bin/python3 on this host".to_string()),
+            );
+        }
+        let mut client = match self.connect_session(&params.session_id) {
+            Ok(c) => c,
+            Err(message) => return self.write_result(id, tool_error(message)),
+        };
+        if let Err(e) = client.put(SESSION_CODE_PATH, params.code.as_bytes(), 0o600) {
+            return self.write_result(
+                id,
+                tool_error(format!(
+                    "staging the program inside the session failed: {}",
+                    session_error_text(e)
+                )),
+            );
+        }
+        let staged = format!("/work/{SESSION_CODE_PATH}");
+        let (program, args): (&str, Vec<String>) = if params.python3 {
+            ("/usr/bin/python3", vec![staged])
+        } else {
+            // `sh FILE` reads the script; `sh -c FILE` would require the
+            // file to be executable, which /work is not (MS_NOEXEC).
+            ("/bin/sh", vec![staged])
+        };
+        match client.exec(program, &args, params.timeout_ms) {
+            Ok(result) => self.write_result(id, exec_result_json(&params.session_id, &result)),
+            Err(e) => self.write_result(id, tool_error(session_error_text(e))),
+        }
+    }
+
+    /// Tool `session_upload`: write base64 content into the session work
+    /// dir. The keeper validates the path (relative, no `..`, no symlinks).
+    fn session_upload(&mut self, id: &Value, arguments: &Value) -> io::Result<()> {
+        let params = match validate_session_upload_args(arguments) {
+            Ok(p) => p,
+            Err(message) => return self.write_error(id, INVALID_PARAMS, &message),
+        };
+        let data = match base64::decode(&params.content_base64) {
+            Ok(d) => d,
+            Err(e) => {
+                return self.write_error(
+                    id,
+                    INVALID_PARAMS,
+                    &format!("session_upload: content_base64: {e}"),
+                );
+            }
+        };
+        if data.len() > MAX_SESSION_UPLOAD_BYTES {
+            return self.write_error(
+                id,
+                INVALID_PARAMS,
+                &format!(
+                    "session_upload: decoded content is {} bytes; the maximum is \
+                     {MAX_SESSION_UPLOAD_BYTES}",
+                    data.len()
+                ),
+            );
+        }
+        let mut client = match self.connect_session(&params.session_id) {
+            Ok(c) => c,
+            Err(message) => return self.write_result(id, tool_error(message)),
+        };
+        match client.put(&params.path, &data, 0o600) {
+            Ok(()) => {
+                let body = json!({"path": params.path, "size": data.len()});
+                self.write_result(id, text_result(body.to_string(), false))
+            }
+            Err(e) => self.write_result(id, tool_error(session_error_text(e))),
+        }
+    }
+
+    /// Tool `session_download`: read a session file back as base64.
+    fn session_download(&mut self, id: &Value, arguments: &Value) -> io::Result<()> {
+        let params = match validate_session_download_args(arguments) {
+            Ok(p) => p,
+            Err(message) => return self.write_error(id, INVALID_PARAMS, &message),
+        };
+        let mut client = match self.connect_session(&params.session_id) {
+            Ok(c) => c,
+            Err(message) => return self.write_result(id, tool_error(message)),
+        };
+        match client.get_with_limit(&params.path, MAX_SESSION_DOWNLOAD_BYTES) {
+            Ok(data) => {
+                let body = json!({
+                    "path": params.path,
+                    "size": data.len(),
+                    "content_base64": base64::encode(&data),
+                });
+                self.write_result(id, text_result(body.to_string(), false))
+            }
+            Err(e) => self.write_result(id, tool_error(session_error_text(e))),
+        }
+    }
+
+    /// Tool `session_list`: the sessions this server created.
+    fn session_list(&mut self, id: &Value, arguments: &Value) -> io::Result<()> {
+        if !matches!(arguments, Value::Object(_)) {
+            return self.write_error(
+                id,
+                INVALID_PARAMS,
+                "session_list: arguments must be an object",
+            );
+        }
+        let result = match SessionManager::new() {
+            Ok(manager) => match manager.list() {
+                Ok(all) => {
+                    let sessions: Vec<Value> = all
+                        .into_iter()
+                        .filter(|s| self.sessions.contains(&s.meta.id))
+                        .map(|s| {
+                            json!({
+                                "session_id": s.meta.id,
+                                "alive": s.alive,
+                                "created_at_ms": s.meta.created_at_ms,
+                                "timeout_ms": s.meta.policy.timeout_ms,
+                                "network": s.meta.policy.network,
+                            })
+                        })
+                        .collect();
+                    text_result(json!({"sessions": sessions}).to_string(), false)
+                }
+                Err(e) => tool_error(session_error_text(e)),
+            },
+            Err(e) => tool_error(session_error_text(e)),
+        };
+        self.write_result(id, result)
+    }
+
+    /// Tool `session_close`: stop the keeper and remove its work dir.
+    fn session_close(&mut self, id: &Value, arguments: &Value) -> io::Result<()> {
+        let session_id = match validate_session_id_arg(arguments, "session_close") {
+            Ok(s) => s,
+            Err(message) => return self.write_error(id, INVALID_PARAMS, &message),
+        };
+        if !self.sessions.contains(&session_id) {
+            return self.write_result(id, tool_error(unknown_session_text(&session_id)));
+        }
+        let result = match SessionManager::new() {
+            Ok(manager) => match manager.close(&session_id) {
+                Ok(()) => {
+                    self.sessions.remove(&session_id);
+                    text_result(
+                        json!({"session_id": session_id, "closed": true}).to_string(),
+                        false,
+                    )
+                }
+                Err(e) => tool_error(session_error_text(e)),
+            },
+            Err(e) => tool_error(session_error_text(e)),
+        };
+        self.write_result(id, result)
+    }
+
+    /// Connects to a session this server created. A foreign id is refused
+    /// without touching the filesystem or the socket.
+    fn connect_session(
+        &self,
+        session_id: &str,
+    ) -> Result<carapace_native::session::SessionClient, String> {
+        if !self.sessions.contains(session_id) {
+            return Err(unknown_session_text(session_id));
+        }
+        let manager = SessionManager::new().map_err(session_error_text)?;
+        manager.connect(session_id).map_err(session_error_text)
     }
 
     fn write_result(&mut self, id: &Value, result: Value) -> io::Result<()> {
@@ -271,7 +512,7 @@ fn initialize_result() -> Value {
     })
 }
 
-/// `tools/list` result: exactly two tools.
+/// `tools/list` result: the two one-shot tools plus the six session tools.
 fn tools_list_result() -> Value {
     json!({
         "tools": [
@@ -336,6 +577,126 @@ fn tools_list_result() -> Value {
                     },
                 },
             },
+            {
+                "name": "session_create",
+                "description": "Create a persistent sandbox session: a size-capped, \
+                                quota-enforced /work that survives across calls, plus one \
+                                cgroup covering every exec. The session dies with this server. \
+                                Returns its session_id.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "policy": {
+                            "type": "object",
+                            "additionalProperties": false,
+                            "description": "Optional overrides on top of the strict policy.",
+                            "properties": {
+                                "timeout_ms": {
+                                    "type": "integer",
+                                    "maximum": MAX_TIMEOUT_MS,
+                                    "description": "Default per-exec wall-clock limit.",
+                                },
+                                "memory_mb": {
+                                    "type": "integer",
+                                    "maximum": MAX_MEMORY_MB,
+                                    "description": "Memory cap shared by the session (minimum 64).",
+                                },
+                                "max_processes": {
+                                    "type": "integer",
+                                    "maximum": MAX_PROCESSES,
+                                    "description": "Process cap shared by the session (minimum 8).",
+                                },
+                                "disk_mb": {
+                                    "type": "integer",
+                                    "maximum": MAX_SESSION_DISK_MB,
+                                    "description": "Size of the session /work tmpfs in MiB.",
+                                },
+                            },
+                        },
+                    },
+                },
+            },
+            {
+                "name": "session_exec",
+                "description": "Run a short shell or Python program in a fresh sandbox whose \
+                                /work is the session's persistent directory. Files written by \
+                                earlier calls are visible; processes and background jobs are \
+                                not (each call gets a new PID namespace).",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["session_id", "code"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "code": {
+                            "type": "string",
+                            "maxLength": MAX_CODE_BYTES,
+                            "description": "The code to execute. Must not contain NUL bytes.",
+                        },
+                        "language": {
+                            "type": "string",
+                            "enum": ["sh", "python3"],
+                            "description": "Interpreter for `code`. Defaults to \"sh\".",
+                        },
+                        "timeout_ms": {
+                            "type": "integer",
+                            "maximum": MAX_TIMEOUT_MS,
+                            "description": "Wall-clock limit for this exec only.",
+                        },
+                    },
+                },
+            },
+            {
+                "name": "session_upload",
+                "description": "Write base64-encoded content to a file inside the session work \
+                                dir. Paths are relative, must be normalized, and may not be \
+                                symlinks. Uploads are capped at 4 MiB.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["session_id", "path", "content_base64"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path inside the session work dir.",
+                        },
+                        "content_base64": {
+                            "type": "string",
+                            "description": "Standard base64 (RFC 4648) file content.",
+                        },
+                    },
+                },
+            },
+            {
+                "name": "session_download",
+                "description": "Read a file from the session work dir as base64. Downloads are \
+                                capped at 8 MiB; larger files can be hashed or summarized with \
+                                session_exec.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["session_id", "path"],
+                    "properties": {
+                        "session_id": {"type": "string"},
+                        "path": {
+                            "type": "string",
+                            "description": "Relative path inside the session work dir.",
+                        },
+                    },
+                },
+            },
+            {
+                "name": "session_list",
+                "description": "List the sessions this server created, with liveness.",
+                "inputSchema": {"type": "object", "properties": {}},
+            },
+            {
+                "name": "session_close",
+                "description": "Stop a session created by this server and remove its work dir.",
+                "inputSchema": {
+                    "type": "object",
+                    "required": ["session_id"],
+                    "properties": {"session_id": {"type": "string"}},
+                },
+            },
         ],
     })
 }
@@ -344,6 +705,250 @@ fn tools_list_result() -> Value {
 /// shows it to the model instead of treating it as a transport failure.
 fn tool_error(message: String) -> Value {
     json!({"content": [{"type": "text", "text": message}], "isError": true})
+}
+
+/// A successful text result.
+fn text_result(text: String, is_error: bool) -> Value {
+    json!({"content": [{"type": "text", "text": text}], "isError": is_error})
+}
+
+// ---------------------------------------------------------------- sessions
+
+/// Where `session_exec` stages the program inside the session work dir.
+/// Dot-prefixed and in its own directory so it does not clutter `ls`.
+const SESSION_CODE_PATH: &str = ".__cara/code";
+
+fn session_error_text(e: SessionError) -> String {
+    match e {
+        SessionError::Environment(m) => format!(
+            "the session could not be used because the sandbox environment is not ready \
+             ({m}); run `cara doctor` on the host"
+        ),
+        other => format!("session error: {other}"),
+    }
+}
+
+fn unknown_session_text(session_id: &str) -> String {
+    format!(
+        "unknown session {session_id:?}: this server only accepts session ids it created \
+         (call session_create first)"
+    )
+}
+
+/// The `session_exec` tool result: same shape as `run_code`, plus the id.
+fn exec_result_json(session_id: &str, result: &carapace_native::session::ExecResult) -> Value {
+    let body = json!({
+        "session_id": session_id,
+        "exit_code": result.exit_code,
+        "signal": result.signal,
+        "kill_reason": result.kill_reason,
+        "stdout": String::from_utf8_lossy(&result.stdout()),
+        "stderr": String::from_utf8_lossy(&result.stderr()),
+        "wall_time_ms": result.wall_time_ms,
+        "cpu_time_usec": result.cpu_usec,
+        "peak_memory_bytes": result.peak_memory_bytes,
+        "peak_processes": result.peak_processes,
+    });
+    text_result(body.to_string(), result.kill_reason.is_some())
+}
+
+/// The `policy` object of `session_create`: strict surface, unknown fields
+/// rejected, every value bounded.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SessionOverrides {
+    timeout_ms: Option<u64>,
+    memory_mb: Option<u64>,
+    max_processes: Option<u32>,
+    disk_mb: Option<u64>,
+}
+
+fn validate_session_create_args(args: &Value) -> Result<SessionPolicy, String> {
+    let Some(obj) = args.as_object() else {
+        return Err("session_create: arguments must be an object".to_string());
+    };
+    let mut policy = Policy::strict();
+    if let Some(overrides) = obj.get("policy").filter(|v| !v.is_null()) {
+        let overrides: SessionOverrides = serde_json::from_value(overrides.clone())
+            .map_err(|e| format!("session_create: policy: {e}"))?;
+        if let Some(t) = overrides.timeout_ms {
+            if t == 0 || t > MAX_TIMEOUT_MS {
+                return Err(format!(
+                    "session_create: policy.timeout_ms must be 1..={MAX_TIMEOUT_MS}"
+                ));
+            }
+            policy.limits.timeout = Duration::from_millis(t);
+        }
+        if let Some(m) = overrides.memory_mb {
+            if m == 0 || m > MAX_MEMORY_MB {
+                return Err(format!(
+                    "session_create: policy.memory_mb must be 1..={MAX_MEMORY_MB}"
+                ));
+            }
+            policy.limits.memory_bytes = m * 1024 * 1024;
+        }
+        if let Some(n) = overrides.max_processes {
+            if n == 0 || n > MAX_PROCESSES {
+                return Err(format!(
+                    "session_create: policy.max_processes must be 1..={MAX_PROCESSES}"
+                ));
+            }
+            policy.limits.max_processes = n;
+        }
+        if let Some(d) = overrides.disk_mb {
+            if d == 0 || d > MAX_SESSION_DISK_MB {
+                return Err(format!(
+                    "session_create: policy.disk_mb must be 1..={MAX_SESSION_DISK_MB}"
+                ));
+            }
+            policy.limits.scratch_bytes = d * 1024 * 1024;
+        }
+    }
+    SessionPolicy::from_policy(&policy).map_err(|e| format!("session_create: {e}"))
+}
+
+#[derive(Debug)]
+struct SessionExecParams {
+    session_id: String,
+    code: String,
+    python3: bool,
+    timeout_ms: Option<u64>,
+}
+
+fn validate_session_exec_args(args: &Value) -> Result<SessionExecParams, String> {
+    let session_id = validate_session_id_arg(args, "session_exec")?;
+    let obj = args.as_object().expect("validated above");
+    let Some(code) = obj.get("code") else {
+        return Err("session_exec: missing required parameter \"code\"".to_string());
+    };
+    let Some(code) = code.as_str() else {
+        return Err("session_exec: \"code\" must be a string".to_string());
+    };
+    if code.len() > MAX_CODE_BYTES {
+        return Err(format!(
+            "session_exec: \"code\" is {} bytes; the maximum is {MAX_CODE_BYTES}",
+            code.len()
+        ));
+    }
+    if code.as_bytes().contains(&0) {
+        return Err("session_exec: \"code\" must not contain NUL bytes".to_string());
+    }
+    let python3 = match obj.get("language") {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => match s.as_str() {
+            "sh" => false,
+            "python3" => true,
+            other => {
+                return Err(format!(
+                    "session_exec: unknown language {other:?} (expected \"sh\" or \"python3\")"
+                ));
+            }
+        },
+        Some(_) => return Err("session_exec: \"language\" must be a string".to_string()),
+    };
+    let timeout_ms = match obj.get("timeout_ms") {
+        None | Some(Value::Null) => None,
+        Some(Value::Number(n)) => {
+            let t = n
+                .as_u64()
+                .ok_or_else(|| "session_exec: timeout_ms must be a positive integer".to_string())?;
+            if t == 0 || t > MAX_TIMEOUT_MS {
+                return Err(format!(
+                    "session_exec: timeout_ms must be 1..={MAX_TIMEOUT_MS}"
+                ));
+            }
+            Some(t)
+        }
+        Some(_) => return Err("session_exec: timeout_ms must be a number".to_string()),
+    };
+    Ok(SessionExecParams {
+        session_id,
+        code: code.to_string(),
+        python3,
+        timeout_ms,
+    })
+}
+
+#[derive(Debug)]
+struct SessionUploadParams {
+    session_id: String,
+    path: String,
+    content_base64: String,
+}
+
+fn validate_session_upload_args(args: &Value) -> Result<SessionUploadParams, String> {
+    let session_id = validate_session_id_arg(args, "session_upload")?;
+    let obj = args.as_object().expect("validated above");
+    let path = validate_session_path(obj, "session_upload")?;
+    let Some(content) = obj.get("content_base64") else {
+        return Err("session_upload: missing required parameter \"content_base64\"".to_string());
+    };
+    let Some(content) = content.as_str() else {
+        return Err("session_upload: \"content_base64\" must be a string".to_string());
+    };
+    Ok(SessionUploadParams {
+        session_id,
+        path,
+        content_base64: content.to_string(),
+    })
+}
+
+#[derive(Debug)]
+struct SessionDownloadParams {
+    session_id: String,
+    path: String,
+}
+
+fn validate_session_download_args(args: &Value) -> Result<SessionDownloadParams, String> {
+    let session_id = validate_session_id_arg(args, "session_download")?;
+    let obj = args.as_object().expect("validated above");
+    let path = validate_session_path(obj, "session_download")?;
+    Ok(SessionDownloadParams { session_id, path })
+}
+
+fn validate_session_id_arg(args: &Value, tool: &str) -> Result<String, String> {
+    let Some(obj) = args.as_object() else {
+        return Err(format!("{tool}: arguments must be an object"));
+    };
+    let Some(id) = obj.get("session_id") else {
+        return Err(format!("{tool}: missing required parameter \"session_id\""));
+    };
+    let Some(id) = id.as_str() else {
+        return Err(format!("{tool}: \"session_id\" must be a string"));
+    };
+    Ok(id.to_string())
+}
+
+/// Path validation mirrors the keeper's rules so obviously bad input is
+/// rejected before a socket round-trip. The keeper re-validates everything.
+fn validate_session_path(obj: &Map<String, Value>, tool: &str) -> Result<String, String> {
+    let Some(path) = obj.get("path") else {
+        return Err(format!("{tool}: missing required parameter \"path\""));
+    };
+    let Some(path) = path.as_str() else {
+        return Err(format!("{tool}: \"path\" must be a string"));
+    };
+    if path.is_empty() || path.len() > 4096 {
+        return Err(format!(
+            "{tool}: \"path\" must be 1..=4096 bytes (relative to the session work dir)"
+        ));
+    }
+    if path.as_bytes().contains(&0) {
+        return Err(format!("{tool}: \"path\" must not contain NUL bytes"));
+    }
+    if path.starts_with('/') {
+        return Err(format!(
+            "{tool}: \"path\" must be relative to the session work dir (got {path:?})"
+        ));
+    }
+    for part in path.split('/') {
+        if part.is_empty() || part == "." || part == ".." {
+            return Err(format!(
+                "{tool}: \"path\" must be normalized (no empty, \".\", or \"..\" components)"
+            ));
+        }
+    }
+    Ok(path.to_string())
 }
 
 // ------------------------------------------------------------------ run_code
@@ -758,14 +1363,29 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_has_exactly_two_tools() {
+    fn tools_list_has_exactly_eight_tools() {
         let responses = serve_requests(&[r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#]);
         let tools = responses[0]["result"]["tools"]
             .as_array()
             .expect("tools must be an array");
-        assert_eq!(tools.len(), 2);
-        assert_eq!(tools[0]["name"], "run_code");
-        assert_eq!(tools[1]["name"], "explain_result");
+        assert_eq!(tools.len(), 8);
+        let names: Vec<&str> = tools
+            .iter()
+            .map(|t| t["name"].as_str().expect("tool name is a string"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "run_code",
+                "explain_result",
+                "session_create",
+                "session_exec",
+                "session_upload",
+                "session_download",
+                "session_list",
+                "session_close",
+            ]
+        );
         let schema = &tools[0]["inputSchema"];
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"], json!(["code"]));
@@ -782,6 +1402,51 @@ mod tests {
             600_000
         );
         assert_eq!(tools[1]["inputSchema"]["required"], json!(["report"]));
+
+        // Session schemas: every one is an object, and the transfer tools
+        // require both a session id and a path.
+        assert_eq!(
+            tools[2]["inputSchema"]["properties"]["policy"]["additionalProperties"],
+            false
+        );
+        assert_eq!(
+            tools[3]["inputSchema"]["required"],
+            json!(["session_id", "code"])
+        );
+        assert_eq!(
+            tools[4]["inputSchema"]["required"],
+            json!(["session_id", "path", "content_base64"])
+        );
+        assert_eq!(
+            tools[5]["inputSchema"]["required"],
+            json!(["session_id", "path"])
+        );
+        assert_eq!(tools[6]["inputSchema"]["type"], "object");
+        assert_eq!(tools[7]["inputSchema"]["required"], json!(["session_id"]));
+    }
+
+    #[test]
+    fn session_tools_validate_before_touching_a_sandbox() {
+        // Unknown/foreign session ids are refused by the tool itself; these
+        // run without a cgroup delegation, so reaching the keeper would fail
+        // differently — an isError result, not a JSON-RPC error.
+        let responses = serve_requests(&[
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"session_exec","arguments":{"session_id":"deadbeefdeadbeefdeadbeefdeadbeef","code":"true"}}}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"session_upload","arguments":{"session_id":"x","path":"../etc/passwd","content_base64":"aGk="}}}"#,
+            r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"session_download","arguments":{"session_id":"x","path":"/etc/passwd"}}}"#,
+            r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"session_exec","arguments":{"session_id":"x","code":"true","language":"perl"}}}"#,
+            r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"session_create","arguments":{"policy":{"bogus":1}}}}"#,
+        ]);
+        assert_eq!(responses[0]["result"]["isError"], true);
+        assert!(
+            responses[0]["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("only accepts session ids it created")
+        );
+        for (i, response) in responses.iter().enumerate().skip(1) {
+            assert_eq!(response["error"]["code"], -32602, "response {i}");
+        }
     }
 
     #[test]
@@ -1116,6 +1781,6 @@ mod tests {
             assert!(server.serve_once().expect("one line handled"));
         }
         let r: Value = serde_json::from_str(&String::from_utf8_lossy(&out)).unwrap();
-        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(r["result"]["tools"].as_array().unwrap().len(), 8);
     }
 }

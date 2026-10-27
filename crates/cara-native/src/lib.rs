@@ -15,6 +15,7 @@ pub mod doctor;
 #[cfg(test)]
 mod pdeathsig_test;
 pub mod seccomp_profile;
+pub mod session;
 mod supervisor;
 
 pub use backend::NativeBackend;
