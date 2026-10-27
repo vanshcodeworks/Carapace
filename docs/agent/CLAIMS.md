@@ -63,7 +63,7 @@ test lands at listed milestone.
 | All 21 escape payloads exhibit their documented safe outcome through the real sandbox | tests/suite.rs 23 tests green (bridged run ~4.1s) | verified C6/P1 |
 | No host env var leaks into the sandbox (PATH shared by design) | suite.rs env_leak (asserts against live host env) | verified C6 |
 | setuid bits are inert: CapEff=0, NoNewPrivs=1, uid changes EPERM | suite.rs setuid_escalation | verified C6 |
-| Red-team: chroot/mknod/sethostname//proc/sys/cross-hierarchy-rename denied; zombie hoards + dual floods + slow-drip contained | tests/redteam.rs 22 tests green | verified C6/P1 |
+| Red-team: chroot/mknod/sethostname//proc/sys/cross-hierarchy-rename denied; zombie hoards + dual floods + slow-drip contained; new mount API, cross-hierarchy link/exchange, tmpfs isolation, thread/exec inheritance, info-leak syscalls and memfd/mmap exec closed | tests/redteam.rs 31 tests green | verified C6/P1, extended cycle 16 |
 | Cold start: /bin/true median 6.71ms p95 9.27ms (n=100, WSL2 6.18) | examples/bench.rs | verified (machine-specific) |
 
 ## C7 claims (added cycle 7)
@@ -116,12 +116,12 @@ test lands at listed milestone.
 | /etc/alternatives resolves through recreated symlinks only when the host link's canonical target is under /usr; the host directory is never bind-mounted, so regular files (Ubuntu README) are invisible | supervisor planner unit test + rootfs.rs::etc_alternatives_work_when_host_has_them | verified P1/P2 |
 | bash job control and coreutils ACL probes work: getpgrp + read-only xattr syscalls are allowlisted | runtime matrix bash/coreutils cases + seccomp profile | verified P2 |
 | A normal `cara run` and `cara doctor` remove their run/attach-probe cgroup leaves synchronously before the CLI exits; stale empty leaves from hard-killed supervisors are swept by owner-PID liveness on the next create, and empty staging dirs older than 60s are swept on the next spawn | cli_run.rs::run_removes_its_cgroup_leaf_before_exit + doctor_removes_its_cgroup_probe_leaf_before_exit; cgroup unit sweep test; staging unit sweep test; limits.rs::cgroup_leaves_are_always_removed | verified P2 |
-| Executing a binary the payload wrote into a read-write bind works only when the policy opts in (`preset = "dev"` or `filesystem.exec_on_write = true`); strict denies it | runtime matrix gcc-compile-run + rust-binary (dev preset); escape suite write_then_exec (strict) | verified P2/P1 |
+| Executing a binary the payload wrote into a read-write bind works only when the policy opts in (`preset = "dev"` or `filesystem.exec_on_write = true`); strict denies it | runtime matrix gcc-compile-run + rust-binary (dev preset); escape suite write_then_exec (strict); red-team `rt_mmap_exec_of_written_file_denied` | verified P2/P1, extended cycle 16 |
 
 ## P1 hardening claims (added cycle 14)
 | Claim | Basis | Status |
 |---|---|---|
-| Strict denies `execve` on files written to `/work`, `/tmp`, `/dev/shm` and read-write binds; `dev` and explicit `filesystem.exec_on_write = true` opt in | escape suite `write_then_exec` (denied, rc=126) + `write_then_exec_allowed_when_spec_opts_in` (positive control); landlock `RW_ALL_NO_EXEC` unit test | verified P1 |
+| Strict denies execution of files written to `/work`, `/tmp`, `/dev/shm` and read-write binds — `execve`, `mmap(PROT_EXEC)` and `dlopen` — via Landlock `RW_ALL_NO_EXEC` plus `noexec` mounts; `dev` and explicit `filesystem.exec_on_write = true` opt in | escape suite `write_then_exec` (denied, rc=126) + `write_then_exec_allowed_when_spec_opts_in` (positive control); red-team `rt_mmap_exec_of_written_file_denied` (EPERM mapping; anonymous exec mappings still allowed; opt-in maps successfully); landlock `RW_ALL_NO_EXEC` unit test | verified P1/cycle 16 |
 | `/etc/alternatives` is recreated as symlinks only when the host link resolves under `/usr`; host regular files and out-of-/usr targets are never exposed | supervisor planner unit test + rootfs `etc_alternatives_work_when_host_has_them` (asserts README invisible) | verified P1 |
 | The fork->PDEATHSIG interleaving is forced deterministically: when the supervisor dies inside the window, stage-2 sees stage-1 dead and never execs the payload | `forced_pdeathsig_race_never_execs_payload` (cfg(test)-only pause hook; release builds cannot enable it) | verified P1 |
 | Concurrent sandboxes with long-lived payloads cannot deadlock on inherited pipe fds: stage-1 closes every descriptor except its result pipe before proxying | `redteam.rs::rt_concurrent_long_running_sandboxes_do_not_deadlock` (4 infinite payloads, 1 s timeout, 30 s watchdog; deadlocked before the fix, passes in ~1 s) | verified P1 |

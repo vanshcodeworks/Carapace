@@ -35,7 +35,7 @@ Rules applied throughout:
 | 4 | read-only xattr family | `ls -l` POSIX-ACL queries; coreutils works | Metadata disclosure on files already visible; no mutation | **Keep read-only**; all `setxattr`/`removexattr` stay denied | `seccomp_profile::tests::essentials_are_allowed` (read side) + `dangerous_syscalls_are_not_allowed` (mutation side); runtime matrix `bash-find-grep` |
 | 5 | `PATH`/`HOME` defaults | runtimes find helpers; `$HOME` is writable | Predictable env, not host-inherited; no host paths | **Keep**, documented defaults, overridable by policy only | `run_provides_default_path_and_home`, `to_spec_maps_everything` |
 | 6 | `clone3 → ENOSYS` | glibc/musl fall back to filtered `clone(2)`; threads work | None: `clone3` never executes; fallback keeps `CLONE_NEW*` filtering | **Keep**, documented as an ABI contract | `filter_semantics_interpreted`, `seccomp_blocks_clone_with_namespace_flags` |
-| 7 | `exec_on_write` | Compile-and-run workflows (`gcc`, `rustc`) | Payload can execute code it just wrote; write-then-exec staging | **New explicit field, default `false`, `false` in `strict`**; `dev`/explicit opt-in only | `write_then_exec`, `write_then_exec_allowed_when_spec_opts_in` |
+| 7 | `exec_on_write` | Compile-and-run workflows (`gcc`, `rustc`) | Payload can execute code it just wrote; write-then-exec staging | **New explicit field, default `false`, `false` in `strict`**; `dev`/explicit opt-in only | `write_then_exec`, `write_then_exec_allowed_when_spec_opts_in`, `rt_mmap_exec_of_written_file_denied` |
 | 8 | OpenJDK `/etc/.../security` | JVM starts on Debian/Ubuntu (config is packaged outside `/usr`) | Read-only exposure of world-readable crypto policy; no secrets, no mutation | **Narrowed**: bind only the canonical `security` directory that an in-tree JVM links to; never `/etc/java-*` as a whole | `security_planner_exposes_only_referenced_etc_security_dirs`, matrix `jvm-compile-run` |
 
 ## 1. `/etc/alternatives`: bind mount → recreated symlinks
@@ -181,6 +181,18 @@ concede it to every run.
   documented dev workflow); `network-light` inherits `dev`.
 - Landlock uses `RW_ALL` when true and `RW_ALL_NO_EXEC` when false. The
   no-exec mask is exactly `RW_ALL & !EXECUTE`.
+- **Mount-level enforcement (red-team cycle 16):** Landlock's `EXECUTE`
+  right is checked on `execve(2)` but **not** on `mmap(PROT_EXEC)`; a
+  payload could therefore write a file to `/work`, map it executable, and
+  jump into it without `execve` (and `dlopen` of a copied `.so` worked).
+  Measured with `rt_mmap_exec_of_written_file_denied`. The fix is
+  `MS_NOEXEC` on every writable mount — the root tmpfs (`/tmp`), `/work`,
+  `/dev/shm` and read-write binds — whenever `exec_on_write` is false.
+  `noexec` denies both `execve` and `mmap(PROT_EXEC)` at the VFS layer,
+  while `/usr` keeps its own executable read-only bind and anonymous
+  executable mappings (JITs) remain allowed. The same test's positive
+  control runs with `exec_on_write(true)` and requires the mapping to
+  succeed.
 - `cara policy explain` prints which posture is in force in both directions,
   so a reader cannot miss the denial or the grant.
 
@@ -189,7 +201,10 @@ script in `/work`, runs it, and asserts the marker never appears and
 `execve` fails with `EACCES`/`rc=126`. The positive control
 `write_then_exec_allowed_when_spec_opts_in` runs the same payload with
 `exec_on_write(true)` and asserts the marker appears — proving the denial is
-the policy field, not an unrelated failure. The runtime matrix uses
+the policy field, not an unrelated failure. Red-team
+`rt_mmap_exec_of_written_file_denied` covers the `mmap(PROT_EXEC)` path
+(strict: EPERM from the noexec mount; opt-in: mapping succeeds) and keeps
+anonymous executable mappings working. The runtime matrix uses
 `preset = "dev"` so `gcc-compile-run` and `rust-binary` keep passing.
 
 ## 8. OpenJDK `security` config: one referenced directory, read-only

@@ -125,9 +125,11 @@ pub(crate) struct ChildConfig {
     /// `/etc/alternatives` symlinks to recreate inside the sandbox
     /// (symlinks only, targets restricted to `/usr` by the parent).
     pub alternatives: Vec<AltLink>,
-    /// Whether `execve` is allowed on files in writable locations:
+    /// Whether execution is allowed on files in writable locations:
     /// `/work`, `/tmp`, `/dev/shm` and read-write binds. Mirrors
-    /// [`carapace_core::SandboxSpec::exec_on_write`].
+    /// [`carapace_core::SandboxSpec::exec_on_write`]. When false, those
+    /// mounts get `MS_NOEXEC` (Landlock's `EXECUTE` right only covers
+    /// `execve`, not `mmap(PROT_EXEC)`/`dlopen`).
     pub exec_on_write: bool,
     /// Test-only: socketpair fd used to force the fork->PDEATHSIG
     /// interleaving. `-1` in production builds; the field does not exist
@@ -288,6 +290,20 @@ fn setup_rootfs(cfg: &ChildConfig) {
     // binds in (c2) resolve their sources with plain path-based mounts.
     // The tmpfs (and everything on it) dies with this mount namespace;
     // only the empty staging dir remains, which the parent removes.
+    //
+    // Writable areas are also non-executable unless the policy opts in.
+    // Landlock's EXECUTE right is enforced on execve(2) but NOT on
+    // mmap(PROT_EXEC)/dlopen (landlock(7): "Execute a file"), so without
+    // MS_NOEXEC a payload could map a written file executable and jump
+    // into it. This covers /tmp (on the root tmpfs), /work, /dev/shm and
+    // read-write binds; /usr keeps its own executable bind mount.
+    let writable_flags = (libc::MS_NOSUID
+        | libc::MS_NODEV
+        | if cfg.exec_on_write {
+            0
+        } else {
+            libc::MS_NOEXEC
+        }) as libc::c_ulong;
     let staging = cfg.staging_dir.as_bytes();
     let mut root = [0u8; 64];
     assert!(staging.len() < 64);
@@ -296,7 +312,7 @@ fn setup_rootfs(cfg: &ChildConfig) {
         c"tmpfs".to_bytes_with_nul(),
         &root,
         c"tmpfs".to_bytes_with_nul(),
-        (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+        writable_flags,
         cfg.root_size_opt.as_ptr().cast(),
     ) {
         fail(cfg, stage::MOUNT_ROOT, e);
@@ -356,6 +372,21 @@ fn setup_rootfs(cfg: &ChildConfig) {
                 inner_ref,
                 b"",
                 (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC)
+                    as libc::c_ulong,
+                std::ptr::null(),
+            )
+        {
+            fail(cfg, stage::BIND_REMOUNT, e);
+        }
+        // A read-write bind is a writable area too: without the policy
+        // opt-in it must not be executable (mmap(PROT_EXEC)/dlopen).
+        if b.rw
+            && !cfg.exec_on_write
+            && let Err(e) = mount_raw(
+                src,
+                inner_ref,
+                b"",
+                (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_NOEXEC | libc::MS_REC)
                     as libc::c_ulong,
                 std::ptr::null(),
             )
@@ -437,7 +468,7 @@ fn setup_rootfs(cfg: &ChildConfig) {
         c"tmpfs".to_bytes_with_nul(),
         &shm,
         c"tmpfs".to_bytes_with_nul(),
-        (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+        writable_flags,
         cfg.work_size_opt.as_ptr().cast(),
     ) {
         fail(cfg, stage::MOUNT_RUNTIME, e);
@@ -488,7 +519,7 @@ fn setup_rootfs(cfg: &ChildConfig) {
         c"tmpfs".to_bytes_with_nul(),
         &work,
         c"tmpfs".to_bytes_with_nul(),
-        (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+        writable_flags,
         cfg.work_size_opt.as_ptr().cast(),
     ) {
         fail(cfg, stage::MOUNT_ROOT, e);
@@ -1338,9 +1369,11 @@ fn set_no_new_privs(cfg: &ChildConfig) {
 /// shm/semaphores), and file-level write on /dev (only our four safe device
 /// nodes live there). Writable grants include `EXECUTE` only when the spec
 /// opted in (`exec_on_write`); the default strict posture lets the payload
-/// write files but not run them. ABI-aware; fails closed if the
-/// kernel lacks Landlock (doctor gates this environment class, so an
-/// error here is a real anomaly, not noise).
+/// write files but not run them. Because Landlock's EXECUTE right covers
+/// `execve(2)` but not `mmap(PROT_EXEC)`/`dlopen`, the writable mounts are
+/// also `MS_NOEXEC` in setup_rootfs unless the policy opts in. ABI-aware;
+/// fails closed if the kernel lacks Landlock (doctor gates this environment
+/// class, so an error here is a real anomaly, not noise).
 fn apply_landlock(cfg: &ChildConfig) {
     let Some(abi) = carapace_sys::landlock::abi_version() else {
         fail(cfg, stage::LANDLOCK, libc::ENOSYS);
