@@ -283,7 +283,9 @@ fn setup_rootfs(cfg: &ChildConfig) {
     for d in [
         c"/usr".to_bytes_with_nul(),
         c"/dev".to_bytes_with_nul(),
+        c"/dev/shm".to_bytes_with_nul(),
         c"/etc".to_bytes_with_nul(),
+        c"/etc/alternatives".to_bytes_with_nul(),
         c"/proc".to_bytes_with_nul(),
         c"/work".to_bytes_with_nul(),
         c"/tmp".to_bytes_with_nul(),
@@ -403,6 +405,21 @@ fn setup_rootfs(cfg: &ChildConfig) {
         }
     }
 
+    // (f2) /dev/shm: tmpfs for POSIX shared memory and named semaphores.
+    // Python's multiprocessing uses sem_open(3), which lives here; without
+    // it, Pool/Lock/Queue fail with FileNotFoundError. Same size cap as
+    // /work so the total scratch budget stays bounded (P2 runtime matrix).
+    let shm = join(&root, c"/dev/shm".to_bytes_with_nul());
+    if let Err(e) = mount_raw(
+        c"tmpfs".to_bytes_with_nul(),
+        &shm,
+        c"tmpfs".to_bytes_with_nul(),
+        (libc::MS_NOSUID | libc::MS_NODEV) as libc::c_ulong,
+        cfg.work_size_opt.as_ptr().cast(),
+    ) {
+        fail(cfg, stage::MOUNT_RUNTIME, e);
+    }
+
     // (g) Minimal /etc: our own passwd/group (never the host's users). The
     // "cara" entry doubles as a sandbox marker the tests assert on.
     let etc_passwd = join(&root, c"/etc/passwd".to_bytes_with_nul());
@@ -414,6 +431,38 @@ fn setup_rootfs(cfg: &ChildConfig) {
     .or_fail(cfg, stage::MOUNT_RUNTIME);
     let etc_group = join(&root, c"/etc/group".to_bytes_with_nul());
     write_new_file(&etc_group, b"root:x:0:\nnobody:x:65534:\n").or_fail(cfg, stage::MOUNT_RUNTIME);
+
+    // (g2) /etc/alternatives: a read-only view of distro symlinks
+    // (e.g. /usr/bin/awk -> /etc/alternatives/awk -> /usr/bin/gawk).
+    // Only symlink entries are exposed; absolute targets resolve inside
+    // the pivoted root, so nothing beyond the already-mounted /usr becomes
+    // reachable. Absent on non-Debian hosts: skip, don't fail.
+    let alt_src = c"/etc/alternatives".to_bytes_with_nul();
+    let alt_present = unsafe {
+        // SAFETY: access(2) with a NUL-terminated literal path.
+        libc::access(alt_src.as_ptr().cast::<libc::c_char>(), libc::F_OK)
+    } == 0;
+    if alt_present {
+        let alt_dst = join(&root, c"/etc/alternatives".to_bytes_with_nul());
+        if let Err(e) = mount_raw(
+            alt_src,
+            &alt_dst,
+            b"",
+            (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+            std::ptr::null(),
+        ) {
+            fail(cfg, stage::MOUNT_RUNTIME, e);
+        }
+        if let Err(e) = mount_raw(
+            alt_src,
+            &alt_dst,
+            b"",
+            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC) as libc::c_ulong,
+            std::ptr::null(),
+        ) {
+            fail(cfg, stage::MOUNT_RUNTIME, e);
+        }
+    }
 
     // (h) Size-capped scratch at /work (the only writable data area).
     let work = join(&root, c"/work".to_bytes_with_nul());
@@ -570,6 +619,39 @@ fn verify_rootfs() -> Result<(), i32> {
 }
 
 // ------------------------------------------------------------ mount helpers
+
+/// `access("/proc/<pid>", F_OK)` — async-signal-safe parent-liveness check
+/// for the fork->prctl window. Runs before the fresh procfs is mounted, so
+/// /proc is still the host's procfs and the host pid is meaningful.
+fn proc_pid_exists(pid: libc::pid_t) -> bool {
+    let mut buf = [0u8; 32];
+    let prefix = b"/proc/";
+    buf[..prefix.len()].copy_from_slice(prefix);
+    let mut n = prefix.len();
+    let mut v = pid.unsigned_abs();
+    if v == 0 {
+        buf[n] = b'0';
+        n += 1;
+    } else {
+        let mut digits = [0u8; 10]; // u32::MAX has 10 digits
+        let mut d = 0;
+        while v > 0 {
+            digits[d] = b'0' + (v % 10) as u8;
+            v /= 10;
+            d += 1;
+        }
+        for i in (0..d).rev() {
+            buf[n] = digits[i];
+            n += 1;
+        }
+    }
+    buf[n] = 0;
+    unsafe {
+        // SAFETY: NUL-terminated path in a local buffer; access(2) has no
+        // memory effects beyond reading it.
+        libc::access(buf.as_ptr().cast::<libc::c_char>(), libc::F_OK) == 0
+    }
+}
 
 /// A 64-byte NUL-terminated path buffer (core sandbox paths fit).
 type PathBuf64 = [u8; 64];
@@ -868,6 +950,12 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
     }
 
     // 5. Fork stage-2: the payload's PID-namespace init.
+    // Capture stage-1's pid in the host namespace for stage-2's
+    // parent-death race check below.
+    let stage1_host_pid = unsafe {
+        // SAFETY: plain getter; unshare(CLONE_NEWPID) does not move us.
+        libc::getpid()
+    };
     let pid2 = unsafe {
         // SAFETY: fork(2); both halves below stay async-signal-safe.
         libc::fork()
@@ -877,6 +965,32 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
     }
     if pid2 == 0 {
         // ---- stage-2: the actual sandbox init ----
+        // The parent-death signal is NOT inherited by the child of fork(2)
+        // (prctl(2)); stage-1's setting only covers stage-1. Re-arm it here
+        // so a dead supervisor/stage-1 kills the PID-namespace init, which
+        // tears down every payload process. Red-team cycle 13 found the
+        // gap: a SIGKILLed test harness left `while :; do echo drip...`
+        // payloads alive for two days as pidns init.
+        let r = unsafe {
+            // SAFETY: prctl(PR_SET_PDEATHSIG, SIGKILL): plain attribute.
+            libc::prctl(
+                libc::PR_SET_PDEATHSIG,
+                libc::SIGKILL as u64,
+                0u64,
+                0u64,
+                0u64,
+            )
+        };
+        if r < 0 {
+            fail(cfg, stage::PDEATHSIG, errno());
+        }
+        // Close the fork->prctl race: if stage-1 died in between, setting
+        // PDEATHSIG has no retroactive effect. /proc is still the host's
+        // procfs here (the fresh sandbox /proc is mounted later in
+        // run_payload), so stage-1's host pid is observable.
+        if !proc_pid_exists(stage1_host_pid) {
+            fail(cfg, stage::PDEATHSIG, libc::ESRCH);
+        }
         run_payload(cfg);
     }
 
@@ -1124,8 +1238,9 @@ fn set_no_new_privs(cfg: &ChildConfig) {
 }
 
 /// Landlock: deny-by-default across the whole filesystem; explicit grants:
-/// read-only /usr, /proc, /etc; read-write /work, /tmp, /dev (only our
-/// four safe device nodes live there). ABI-aware; fails closed if the
+/// read-only /usr, /proc, /etc; read-write /work, /tmp, /dev/shm (POSIX
+/// shm/semaphores), and file-level write on /dev (only our four safe device
+/// nodes live there). ABI-aware; fails closed if the
 /// kernel lacks Landlock (doctor gates this environment class, so an
 /// error here is a real anomaly, not noise).
 fn apply_landlock(cfg: &ChildConfig) {
@@ -1146,6 +1261,7 @@ fn apply_landlock(cfg: &ChildConfig) {
         (c"/proc".to_bytes_with_nul(), fs::RO),
         (c"/etc".to_bytes_with_nul(), fs::RO),
         (c"/dev".to_bytes_with_nul(), fs::RW_FILES),
+        (c"/dev/shm".to_bytes_with_nul(), fs::RW_ALL),
         (c"/work".to_bytes_with_nul(), fs::RW_ALL),
         (c"/tmp".to_bytes_with_nul(), fs::RW_ALL),
     ];

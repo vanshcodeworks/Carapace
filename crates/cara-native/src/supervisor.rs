@@ -540,14 +540,44 @@ fn release_config(p: *mut libc::c_void) {
     }
 }
 
-/// Fail-closed teardown for a spawn that could not complete: kill every
-/// process of the half-built run (cgroup.kill covers both stages even when
-/// the payload pid is unknown), reap what we can, free the config, and
-/// return the Setup error.
+/// Removes empty `cara-staging.*` dirs left behind by a supervisor that was
+/// killed before it could clean up. Only empty dirs older than 60s are
+/// considered: a live spawn may have just run mkdtemp and not mounted the
+/// rootfs yet, and a mounted rootfs is never empty. Best effort.
+fn sweep_stale_staging(base: &str) {
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("cara-staging.") {
+            continue;
+        }
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if !meta.is_dir() {
+            continue;
+        }
+        let old = meta
+            .modified()
+            .ok()
+            .and_then(|m| m.elapsed().ok())
+            .is_some_and(|age| age.as_secs() >= 60);
+        if old {
+            let _ = std::fs::remove_dir(entry.path());
+        }
+    }
+}
+
 /// Creates the unique staging dir (mkdtemp): $XDG_RUNTIME_DIR first,
 /// /tmp fallback.
 fn mk_staging_dir() -> std::io::Result<std::ffi::CString> {
     let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    sweep_stale_staging(&base);
     let mut tmpl = format!("{}/cara-staging.XXXXXX\0", base).into_bytes();
     let p = unsafe {
         // SAFETY: mkdtemp(3) with a mutable NUL-terminated template of the
@@ -589,6 +619,10 @@ fn rm_staging_dir(dir: &std::ffi::CStr) {
         .ok();
 }
 
+/// Fail-closed teardown for a spawn that could not complete: kill every
+/// process of the half-built run (cgroup.kill covers both stages even when
+/// the payload pid is unknown), reap what we can, free the config, and
+/// return the Setup error.
 fn spawn_cleanup(
     pid1: libc::pid_t,
     pid2: Option<libc::pid_t>,
@@ -817,12 +851,22 @@ impl NativeSandbox {
             None
         };
 
-        // Accounting (leaf must still exist; it is removed on Drop).
+        // Accounting (leaf must still exist; it is removed below).
         let stats = self
             .cgroup_leaf
             .as_ref()
             .map(crate::cgroup::CgroupLeaf::stats)
             .unwrap_or_default();
+
+        // Remove the leaf synchronously on the normal path. Drop's async
+        // remover is a safety net, but a short-lived CLI process exits
+        // before its detached thread can run — which leaked one empty
+        // cgroup directory per `cara run` in the P2 cycle. Waiting here is
+        // bounded (normally instant) and keeps the "always removed" claim
+        // true across process exit.
+        if let Some(leaf) = self.cgroup_leaf.take() {
+            leaf.remove();
+        }
 
         let stdout = self
             .stdout_reader
@@ -886,5 +930,46 @@ impl Drop for NativeSandbox {
             libc::close(self.overflow_rd);
         }
         rm_staging_dir(&self.staging_dir);
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn stale_staging_sweep_removes_only_old_empty_dirs() {
+        let base = std::env::temp_dir().join(format!(
+            "cara-staging-sweep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir(&base).expect("temp base");
+        let old = base.join("cara-staging.old");
+        let fresh = base.join("cara-staging.fresh");
+        let nonempty = base.join("cara-staging.nonempty");
+        let other = base.join("not-cara-staging");
+        for d in [&old, &fresh, &nonempty, &other] {
+            std::fs::create_dir(d).expect("probe dir");
+        }
+        std::fs::write(nonempty.join("x"), b"x").expect("probe file");
+        for d in [&old, &nonempty] {
+            std::fs::File::open(d)
+                .expect("open dir")
+                .set_modified(SystemTime::now() - Duration::from_secs(120))
+                .expect("set mtime");
+        }
+
+        sweep_stale_staging(base.to_str().expect("utf-8 temp path"));
+
+        assert!(!old.exists(), "old empty staging dir is swept");
+        assert!(fresh.exists(), "fresh staging dir is kept (mkdir race)");
+        assert!(nonempty.exists(), "non-empty staging dir is kept");
+        assert!(other.exists(), "unrelated directory is kept");
+        std::fs::remove_dir_all(&base).ok();
     }
 }

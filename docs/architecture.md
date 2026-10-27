@@ -54,9 +54,9 @@ always includes a remedy (tested: every failing check carries one).
 
 `Policy::to_spec()` lowers the policy into a `SandboxSpec`: program (absolute
 path), args, an **allowlist-only environment** (`BTreeMap` — nothing is
-inherited from the parent), the limits, extra read-only/read-write paths,
-and the network mode. The spec is platform-agnostic; enforcement is
-entirely in the backend.
+inherited from the parent; policy runs default `PATH` and `HOME=/work`),
+the limits, extra read-only/read-write paths, and the network mode. The
+spec is platform-agnostic; enforcement is entirely in the backend.
 
 ## 3. Two-stage child (ADR-0003)
 
@@ -97,12 +97,19 @@ everything left in the namespace. Stage 2 builds the sandbox filesystem:
 | policy binds | extra read-only/read-write paths, same path inside and outside, bind + recursive read-only remount |
 | `/usr` | host `/usr` bound recursively, remounted `RDONLY\|NODEV`; `/bin`, `/lib`, `/lib64` symlinks (merged-usr) |
 | `/dev` | exactly `null`, `zero`, `urandom`, `random`, bound from the host (mknod is impossible rootless) |
-| `/etc` | sandbox-owned minimal `passwd`/`group` — never the host's users |
+| `/dev/shm` | fresh tmpfs sized like `/work` (POSIX shared memory / named semaphores) |
+| `/etc` | sandbox-owned minimal `passwd`/`group` — never the host's users; plus a read-only `/etc/alternatives` bind when the host has one |
 | `/work` | fresh tmpfs, size = `limits.disk`; becomes the payload's cwd |
 | `/proc` | fresh procfs for *this* pid namespace |
 | pivot | `pivot_root` + `umount2(MNT_DETACH)` of the old root |
 | verify | fail-closed self-check: `/usr/bin/sh` present, fresh `/proc/self/status`, `/.cara-old` gone, `/home` and `/root` unresolvable, `/work` writable — the payload never starts in a half-built sandbox |
 | stdio | `dup2` to fds 0/1/2 (clears CLOEXEC on exactly those) |
+
+Both stages set `PR_SET_PDEATHSIG(SIGKILL)`: stage 2 re-arms it after
+`fork(2)` clears the attribute and re-checks that stage 1 is still alive via
+the host `/proc` (the sandbox procfs is not mounted yet). A supervisor or
+stage-1 death therefore tears down the PID-namespace init, and the kernel
+tears down every payload process with it.
 
 Then the hardening chain, in order (tests in `hardening.rs`):
 
@@ -118,7 +125,7 @@ Then the hardening chain, in order (tests in `hardening.rs`):
 5. Landlock — deny-by-default ruleset; grants: `/usr`, `/proc`, `/etc`
    read-only (execute + read incl. directories); `/dev` file-level
    read/write/truncate only (no rights to create nodes, dirs or symlinks
-   there); `/work`, `/tmp` full read-write; plus the
+   there); `/dev/shm`, `/work`, `/tmp` full read-write; plus the
    policy binds at their declared access. ABI-aware (handled-access bits
    scale with the kernel's ABI), fails closed if absent
    (`landlock_denies_writes_outside_grants`, `landlock_denies_writes_to_proc`),
@@ -189,9 +196,21 @@ returns an `ExitReport`:
 `limits.rs::resource_report_is_populated`, `memory_hog_is_oom_killed_at_limit`,
 `run_ui.rs::json_has_stable_shape`.
 
-The cgroup leaf is removed asynchronously (bounded retries, ~10 s) on every
-teardown path including supervisor drop; the staging dir is removed and the
+The cgroup leaf is removed **synchronously** before the CLI exits — on the
+normal `wait()` path (bounded retries; usually instant) and in the doctor's
+attach probe — so a short-lived process cannot exit before cleanup; `Drop`
+keeps the asynchronous remover (~10 s) as a safety net. Before creating a
+leaf, `CgroupLeaf::create` sweeps empty `cara-run-*`/`cara-cgroup-probe-*`
+directories whose owning PID is gone — `rmdir` only, never kill or move
+processes — so a hard-killed supervisor leaves at most a transient empty
+directory. `mk_staging_dir` applies the same rule to empty
+`cara-staging.*` dirs older than 60s (the age guard keeps a concurrent
+spawn between `mkdtemp` and mount safe). The staging dir is removed and the
 config freed. Tests: `cgroup_leaves_are_always_removed`,
+`run_removes_its_cgroup_leaf_before_exit`,
+`doctor_removes_its_cgroup_probe_leaf_before_exit`,
+`sweep_removes_only_leaves_with_dead_owners`,
+`stale_staging_sweep_removes_only_old_empty_dirs`,
 `no_staging_dirs_leak_on_host`.
 
 ## Syscall stance
@@ -200,8 +219,11 @@ The seccomp profile (`cara-native/src/seccomp_profile.rs`) is **default
 deny**: everything a plain interpreter needs (fd/file ops, memory, fork and
 plain `clone`, signals, time, futex/epoll, `getrandom`, `ioctl`,
 `arch_prctl`, `prctl`) is allowlisted; everything else returns `EPERM`.
-Deliberately absent: `mount`, `umount2`, `ptrace`, `bpf`, `unshare`,
-`setns`, `reboot`, module loading, `kexec_load`, `swapon`, keyring
+Read-only xattr syscalls (`getxattr` family, for coreutils ACL probes) and
+`getpgrp` (bash job control) were added after the P2 runtime matrix; neither
+crosses a privilege boundary. Deliberately absent: `mount`, `umount2`,
+`ptrace`, `bpf`, `unshare`, `setns`, `reboot`, module loading,
+`kexec_load`, `swapon`, keyring
 syscalls, `open_by_handle_at`, `process_vm_readv`, `io_uring_setup`,
 `pivot_root`, `socket`/`connect`/`bind` (unless `mode = "full"`),
 `clone3`. `clone(2)` gets a dedicated BPF path: allowed without

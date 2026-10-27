@@ -95,7 +95,7 @@ test lands at listed milestone.
 ## C11 claims (added cycle 10)
 | Claim | Basis | Status |
 |---|---|---|
-| Supervisor death by ANY route (crash/SIGKILL) destroys the sandbox tree — no orphaned payloads | redteam.rs rt_cara_binary_sigkilled_midrun_orphans_nothing + PR_SET_PDEATHSIG in stage-1 | verified C11 (found + fixed this cycle) |
+| Supervisor death by ANY route (crash/SIGKILL) destroys the sandbox tree - no orphaned payloads | redteam.rs rt_cara_binary_sigkilled_midrun_orphans_nothing + PR_SET_PDEATHSIG in stage-1, re-armed in stage-2 with a host /proc parent check | verified C11 (found + fixed this cycle); stage-2 gap re-verified P2 |
 | perf_event_open, openat2 denied (EPERM); core_pattern surface closed (RLIMIT_CORE=0, /proc/sys RO) | redteam.rs RT12-RT14 | verified C11 |
 | Landlock defeats symlink indirection from writable scratch into /proc/sys | redteam.rs rt_symlink_into_proc_sys_denied | verified C11 |
 
@@ -106,3 +106,14 @@ test lands at listed milestone.
 | No descriptor/resource leaks across many sequential runs | redteam.rs rt_no_resource_leaks_over_many_runs (30 runs, fd count) | verified C11 |
 | wait() is one-shot; double call errors cleanly (no silent re-report) | redteam.rs rt_double_wait_is_clean_error | verified C11 (found + fixed) |
 | Zero output cap kills immediately; stdin reads EOF without hanging | redteam.rs rt_zero_output_cap_kills_immediately, rt_stdin_reads_eof | verified C11 |
+
+## P2 claims (added cycle 13)
+| Claim | Basis | Status |
+|---|---|---|
+| Real runtimes run end to end: bash/coreutils, Python stdlib (json/re/hashlib, sqlite3, ssl, threads, concurrent.futures), Python multiprocessing, Node JSON + worker_threads, gcc compile-and-run, host-built Rust binary | scripts/runtime-matrix.py: 15 passed, 0 failed, 0 skipped on the reference WSL env | verified P2 |
+| Policy-driven runs get a usable PATH and HOME=/work without inheriting host env | policy unit test + cli_run.rs::run_provides_default_path_and_home | verified P2 |
+| POSIX shared memory / named semaphores work: /dev/shm is a writable size-capped tmpfs; Python multiprocessing.Pool works | rootfs.rs::dev_shm_is_writable, python_multiprocessing_semaphores | verified P2 |
+| /etc/alternatives is exposed read-only when the host has it, so distro symlinks (awk -> gawk) resolve | rootfs.rs::etc_alternatives_work_when_host_has_them | verified P2 |
+| bash job control and coreutils ACL probes work: getpgrp + read-only xattr syscalls are allowlisted | runtime matrix bash/coreutils cases + seccomp profile | verified P2 |
+| A normal `cara run` and `cara doctor` remove their run/attach-probe cgroup leaves synchronously before the CLI exits; stale empty leaves from hard-killed supervisors are swept by owner-PID liveness on the next create, and empty staging dirs older than 60s are swept on the next spawn | cli_run.rs::run_removes_its_cgroup_leaf_before_exit + doctor_removes_its_cgroup_probe_leaf_before_exit; cgroup unit sweep test; staging unit sweep test; limits.rs::cgroup_leaves_are_always_removed | verified P2 |
+| Executing a binary the payload wrote into a read-write bind works (gcc/Rust); Landlock RW grant includes EXECUTE | runtime matrix gcc-compile-run + rust-binary | verified P2 |

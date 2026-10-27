@@ -132,6 +132,61 @@ fn dev_has_only_safe_devices() {
 }
 
 #[test]
+fn dev_shm_is_writable() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let (code, out, _) = sh_out("echo shm-ok > /dev/shm/probe && cat /dev/shm/probe");
+    assert_eq!(code, 0, "/dev/shm must be writable: {out}");
+    assert!(out.contains("shm-ok"), "/dev/shm round-trip failed: {out}");
+}
+
+#[test]
+fn etc_alternatives_work_when_host_has_them() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if std::fs::metadata("/etc/alternatives").is_err() || std::fs::metadata("/usr/bin/awk").is_err()
+    {
+        eprintln!("skipping: host has no /etc/alternatives (non-Debian layout)");
+        return;
+    }
+    let (code, out, err) = sh_out("awk 'BEGIN { print \"awk-ok\" }' 2>&1");
+    assert_eq!(code, 0, "awk (via /etc/alternatives) must run: {err}");
+    assert!(out.contains("awk-ok"), "awk output: {out}");
+}
+
+#[test]
+fn python_multiprocessing_semaphores() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if std::fs::metadata("/usr/bin/python3").is_err() {
+        eprintln!("skipping: no python3 on host");
+        return;
+    }
+    let spec = SandboxSpec::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import multiprocessing as mp; print(mp.Pool(2).map(abs, [-1, -2]))",
+        ])
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/work")
+        .timeout(Duration::from_secs(30));
+    let r = run(spec);
+    let out = String::from_utf8_lossy(&r.stdout);
+    let err = String::from_utf8_lossy(&r.stderr);
+    assert_eq!(r.exit_code, Some(0), "multiprocessing failed: {err}");
+    assert!(out.contains("[1, 2]"), "unexpected output: {out}");
+}
+
+#[test]
 fn work_is_writable_and_capped() {
     let b = backend();
     if maybe_skip(&b) {

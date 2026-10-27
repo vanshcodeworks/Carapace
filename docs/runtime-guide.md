@@ -13,14 +13,16 @@ ships is already inside.
 | `/bin`, `/lib`, `/lib64` | symlinks into `/usr` (merged-usr layout; the host must be merged-usr or spawn refuses) | no |
 | `/work` | fresh size-capped tmpfs; the payload's working directory | yes |
 | `/tmp` | fresh tmpfs, same cap | yes |
-| `/etc` | minimal sandbox-owned `passwd`/`group` (`root`, `nobody`) — not the host's | no |
+| `/etc` | minimal sandbox-owned `passwd`/`group` (`root`, `nobody`) — not the host's; `/etc/alternatives` is a read-only view of the host's distro symlinks when present | no |
 | `/dev` | exactly `null`, `zero`, `urandom`, `random` | device files only |
+| `/dev/shm` | fresh tmpfs, same size cap as `/work`; POSIX shared memory / named semaphores | yes |
 | `/proc` | fresh procfs for the sandbox's own PID namespace | no |
 
 `/sys` is not mounted at all. No host paths outside `/usr` (and your policy
 binds) are visible. Tests that prove this table:
 `rootfs.rs::usr_is_read_only`, `work_is_writable_and_capped`,
 `etc_is_sandbox_owned_not_host`, `dev_has_only_safe_devices`,
+`dev_shm_is_writable`, `etc_alternatives_work_when_host_has_them`,
 `sys_is_not_mounted`, `host_paths_are_absent`.
 
 ## Requirements for a runtime
@@ -39,13 +41,19 @@ binds) are visible. Tests that prove this table:
    `supervisor.rs::child_runs_in_fresh_namespaces`). `mode = "full"` shares
    the host network (loud opt-in). `allowlist` fails closed today
    (ADR-0004).
-3. **Environment is allowlist-only.** Nothing is inherited: the payload
-   sees exactly the variables the caller sets on the spec (or none). In
-   practice set at least `PATH` (`/usr/bin:/bin`), and `HOME=/work` for
-   interpreters that want a home (Python writes caches there).
+3. **Environment is allowlist-only, with usable defaults.** No host
+   environment is inherited. Policy-driven runs (`cara run`, including the
+   default policy) inject
+   `PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` and
+   `HOME=/work` unless the policy/spec overrides them: compilers, Node, and
+   Python subprocesses resolve their helpers through `PATH`. Direct
+   `SandboxSpec` callers get exactly the variables they set. A bare program
+   name is still rejected — pass an absolute executable path.
 4. **The runtime's writable state must fit the scratch.** `/work` + `/tmp`
-   tmpfs size = `limits.disk`; caches, `__pycache__`, venvs, build outputs
-   all land there (or in a policy-granted read-write host directory).
+   are tmpfs sized by `limits.disk`; `/dev/shm` has the same cap. Caches,
+   `__pycache__`, venvs, build outputs all land there (or in a policy-granted
+   read-write host directory). POSIX semaphores used by Python
+   `multiprocessing` live in `/dev/shm`.
 
 ## Working examples
 
@@ -114,6 +122,24 @@ Both land at the same paths inside the sandbox, read-only, and Landlock
 grants exactly that access. At most 16 extra bind paths are applied per
 run (a current implementation limit of the child's fixed buffers).
 
+## What has actually been run (P2 runtime matrix)
+
+`scripts/runtime-matrix.py` spawns real workloads through the real Tier 1
+sandbox and asserts their output (not just exit status). 15/15 pass on the
+reference WSL environment, and `scripts/check.sh` runs the matrix after the
+workspace tests:
+
+| Runtime | Exercised |
+|---|---|
+| bash + coreutils | pipelines, `sort`/`head`, `sed`/`awk`, `find`/`grep`, `date`/`expr` |
+| Python 3 | stdlib JSON/re/hashlib, subprocess, sqlite3, `ssl` context (no network), threads, `concurrent.futures`, `multiprocessing.Pool` (semaphores in `/dev/shm`) |
+| Node.js | inline JSON, `worker_threads` worker loaded from a read-write bind |
+| gcc | compile a C program into a read-write bind, then exec the result inside the sandbox |
+| Rust | run a host-built binary, exec from a read-write bind |
+
+Go and JVM runtimes remain unverified (see `docs/agent/UNVERIFIED.md` R1.2);
+the matrix skips optional runtimes (Node, gcc, rustc) that are not installed.
+
 ## Adding a *new* runtime (the general recipe)
 
 You almost never need one — if the interpreter is under `/usr`, it already
@@ -124,8 +150,8 @@ works. When something is genuinely missing:
    mounted too).
 2. If it needs host data, add a `read_only`/`read_write` policy entry.
 3. If it needs specific environment variables, set them explicitly in the
-   spec/policy — the allowlist-only env means defaults you take for
-   granted (`HOME`, `LC_ALL`, `PYTHONPATH`) do not exist.
+   spec/policy — only `PATH` and `HOME=/work` are defaulted; everything else
+   (`LC_ALL`, `LANG`, `PYTHONPATH`, tokens) is absent unless set.
 4. If a syscall is denied (`EPERM` from an unusual runtime), that is the
    seccomp allowlist doing its job. For *development*, set `CARA_SECCOMP_LOG=1`
    in the parent environment to log-and-allow and read what the runtime

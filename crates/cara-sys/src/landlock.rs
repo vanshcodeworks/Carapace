@@ -88,7 +88,12 @@ pub mod access_fs {
     /// ABI 3 (kernel 6.2+): truncate.
     pub const TRUNCATE: u64 = 1 << 14;
     /// Everything an unprivileged program may plausibly need in /work.
-    pub const RW_ALL: u64 = WRITE_FILE
+    /// EXECUTE included: compile-and-run workflows exec binaries the
+    /// payload itself wrote — no privilege boundary is crossed (caps
+    /// dropped, no_new_privs set). Found by the P2 runtime matrix
+    /// (rust-binary/gcc EPERM at execve from rw binds).
+    pub const RW_ALL: u64 = EXECUTE
+        | WRITE_FILE
         | READ_FILE
         | READ_DIR
         | REMOVE_DIR

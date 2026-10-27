@@ -42,13 +42,14 @@ artifacts never touch the slow DrvFs mount — see `scripts/check.sh`.
 2. rustup nightly (profile minimal, for cargo-fuzz); `cargo install
    cargo-fuzz --locked`; `cargo install cargo-audit cargo-deny --locked`
    (P0, cycle 12).
-3. apt: `build-essential curl git pkg-config libseccomp-dev libseccomp2
+3. apt: `nodejs npm` (P2 runtime matrix, cycle 13).
+4. apt: `build-essential curl git pkg-config libseccomp-dev libseccomp2
    ca-certificates uidmap fuse3`.
-4. rustup for user `dev` (stable toolchain).
-5. `/etc/sudoers.d/dev` — `dev ALL=(ALL) NOPASSWD:ALL` (dev convenience only).
-6. `/etc/systemd/system/user@.service.d/delegate.conf` — `Delegate=cpu memory pids io`
+5. rustup for user `dev` (stable toolchain).
+6. `/etc/sudoers.d/dev` — `dev ALL=(ALL) NOPASSWD:ALL` (dev convenience only).
+7. `/etc/systemd/system/user@.service.d/delegate.conf` — `Delegate=cpu memory pids io`
    (adds io delegation; default user slices delegate cpu memory pids only).
-7. `loginctl enable-linger dev` — keeps `user@1000.service` (and its delegated
+8. `loginctl enable-linger dev` — keeps `user@1000.service` (and its delegated
    cgroup subtree) alive across WSL session churn.
 
 Nothing outside the WSL distro and the repository directory was modified.
@@ -84,7 +85,7 @@ gitignored.
 From the repository root **inside WSL**:
 
 ```sh
-bash scripts/check.sh   # fmt --check + clippy -D warnings + test --workspace, strict env tests on
+bash scripts/check.sh   # fmt --check + clippy -D warnings + test --workspace + runtime matrix
 ```
 
 From the Windows side, a quick single command:

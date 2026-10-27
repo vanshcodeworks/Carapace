@@ -120,6 +120,9 @@ fn base_allowed() -> &'static [libc::c_long] {
             libc::SYS_getpid,
             libc::SYS_getppid,
             libc::SYS_gettid,
+            // bash-as-pidns-init calls getpgrp during job control setup
+            // (P2 runtime matrix); pure read of the caller's own pgid.
+            libc::SYS_getpgrp,
             libc::SYS_getuid,
             libc::SYS_geteuid,
             libc::SYS_getgid,
@@ -159,6 +162,16 @@ fn base_allowed() -> &'static [libc::c_long] {
             libc::SYS_timerfd_create,
             libc::SYS_timerfd_settime,
             libc::SYS_timerfd_gettime,
+            // xattr reads: coreutils ls -l queries POSIX ACLs via
+            // getxattr on every file argument (P2 runtime matrix: ls -l
+            // reported EPERM on files while os.stat succeeded). Read-only;
+            // the kernel enforces ownership/namespace rules regardless.
+            libc::SYS_getxattr,
+            libc::SYS_lgetxattr,
+            libc::SYS_fgetxattr,
+            libc::SYS_listxattr,
+            libc::SYS_llistxattr,
+            libc::SYS_flistxattr,
             // misc runtime needs
             libc::SYS_ioctl, // isatty & friends
             libc::SYS_getrandom,
