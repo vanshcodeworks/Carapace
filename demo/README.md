@@ -63,7 +63,7 @@ tool `explain_result` (docs/mcp.md).
 ## Where the proof lives
 
 - **Escape suite (the authoritative tests):** `crates/cara-escape-tests`
-  — the catalog `src/lib.rs` (20 payloads, each with its documented
+  — the catalog `src/lib.rs` (21 payloads, each with its documented
   expected outcome) and `tests/suite.rs` (every payload executed through
   the real sandbox, plus a host `/proc` scan asserting no straggler
   processes survive).

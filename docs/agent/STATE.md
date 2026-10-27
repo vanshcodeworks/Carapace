@@ -1,6 +1,6 @@
 # STATE - agent working state (overwritten every cycle)
 
-Last updated: cycle 14 (P1 hardening + doctor + Go/JVM) - 2026-10-27.
+Last updated: cycle 15 (audit: claims, musl, Debian userland) - 2026-10-27.
 
 ## Done (all green via scripts/check.sh)
 - C0-C12 COMPLETE at 02044f0 (see FINAL_REPORT.md).
@@ -20,12 +20,16 @@ Last updated: cycle 14 (P1 hardening + doctor + Go/JVM) - 2026-10-27.
   treats `Z`/`X` as dead. Release builds cannot enable the hook.
 - ADR-0007 audits every compatibility concession (alternatives, /dev/shm,
   getpgrp, xattrs, PATH/HOME, clone3, exec_on_write, OpenJDK security
-  config) with risk, narrowing and test evidence.
+  config) with risk, narrowing and test evidence. Cycle 15 strengthened
+  the getpgrp/xattr proof: the seccomp unit tests now assert the read-only
+  xattr syscalls are allowed and all mutation xattrs are denied.
 - `cara doctor` refactored into measured `Facts::collect()` + pure
   `classify()`: AppArmor/sysctl/user-max userns, cgroup v1/hybrid,
   delegation/controllers, non-merged-/usr, Landlock/seccomp/pidfd/
   close_range. Remedies are print-only, exact, and cite verified upstream
-  URLs. 21 doctor tests, including 17 simulated-environment blockers.
+  URLs. 21 doctor tests, including 17 simulated-environment blockers. The
+  Debian `unprivileged_userns_clone` remedy now cites the Debian salsa
+  patch and says the knob is Debian-specific.
 - README "What Carapace stops" table is pinned to the escape catalog by
   `table::tests::readme_table_matches_the_catalog`; it found and fixed 9
   already-drifted rows.
@@ -36,27 +40,47 @@ Last updated: cycle 14 (P1 hardening + doctor + Go/JVM) - 2026-10-27.
   one narrow read-only `/etc/java-*-openjdk/security` bind, audited in
   ADR-0007 §8 and unit-tested.
 - Concurrency: stage-1 now closes every inherited descriptor except its
-  result pipe (`close_fds_except`). The first full gate exposed a
-  deadlock: long-lived parallel sandboxes held each other's pipe write
-  ends and blocked in `spawn` before their timeouts started. RT22 failed
-  before the fix and passes in ~1 s; the escape suite finishes 23/23 in
-  ~4 s.
+  result pipe (`close_fds_except`). RT22 covers the deadlock: long-lived
+  parallel sandboxes held each other's pipe write ends and blocked in
+  `spawn` before their timeouts started. RT22 failed before the fix and
+  passes in ~1 s; the escape suite finishes 23/23 in ~4 s.
 - Cgroup hygiene: synchronous leaf removal in wait() and doctor attach
   probe; sweep empty dead-owner leaves on create; sweep empty staging
   dirs older than 60s. Leaf/staging lists empty after a full check.
-- Full workspace: 219 passed / 0 failed (22 red-team tests); clippy -D
-  warnings clean; runtime matrix 17/17.
+- Cycle 15 audit: `CLAIMS.md`, `release.md`, `demo/README.md`, `ENV.md`,
+  `UNVERIFIED.md` and ADR-0007 corrected where they had drifted (payload/
+  test counts, cargo-deny status, musl TODO, a stray `strace` line,
+  getpgrp/xattr proof rows).
+- Full-network positive control added: `network_full_mode_permits_loopback_sockets`
+  performs a real loopback round-trip under `mode = "full"` (0.34 s);
+  `seccomp_blocks_socket_creation` remains the denial side.
+- musl: `cargo build -p carapace-cli --target x86_64-unknown-linux-musl`
+  succeeds; binary is `static-pie linked`. Fixed a real portability bug:
+  `statfs.f_type` is signed on glibc and unsigned on musl, so the cgroup2
+  comparison normalizes to u64.
+- Debian 12.15 (bookworm) minbase userland measured under the same WSL2
+  kernel via private mount namespace + rbind + pivot_root (a plain chroot
+  cannot create userns: unshare(2) EPERM when fs->root != mnt_ns->root).
+  `cara doctor` READY; dash and Python 3.11 payloads ran; `/etc/debian_version`
+  correctly absent. `/usr/lib64` exists (empty) in bookworm, so the
+  host-layout gate accepts it. Userland-only data point, not support.
+- Full workspace: **220 passed / 0 failed** (22 red-team tests);
+  clippy -D warnings clean; runtime matrix 17/17; escape suite 23/23.
 
 ## In progress
 - (none)
 
 ## Known bugs / risks
-- Other distro/kernel environments remain unmeasured (UNVERIFIED R2.11);
-  do not call any distro supported.
+- Alternate environments: one Debian userland data point only; no
+  different kernel, Fedora/Arch/Alpine, aarch64, non-systemd or real
+  non-merged-/usr host (UNVERIFIED R2.11). Do not call any distro
+  supported.
 - JVM config layout variants (Fedora/Arch, other JDK vendors) untested
   (UNVERIFIED R2.12).
 - Doctor remedies are simulated, not applied on real broken hosts
   (UNVERIFIED R2.13).
+- The debootstrap tree was not signature-verified; it is a test fixture,
+  not a trusted artifact.
 - Hard-killed supervisor can leave an empty leaf/staging dir; swept on
   the next run, never force-removed or killed by the sweeper.
 - aarch64 seccomp table absent (filter kills by design); Landlock nested

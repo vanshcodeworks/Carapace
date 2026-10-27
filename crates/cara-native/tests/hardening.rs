@@ -84,6 +84,72 @@ fn seccomp_blocks_socket_creation() {
     assert_ne!(r.exit_code, Some(0));
 }
 
+/// Positive control for `seccomp_blocks_socket_creation`: with `mode = "full"`
+/// the socket-family allowlist is added and the payload shares the host
+/// network namespace, so a real loopback round-trip must work. This is the
+/// end-to-end test the "full mode permits sockets" claim previously lacked.
+#[test]
+fn network_full_mode_permits_loopback_sockets() {
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener
+        .set_nonblocking(true)
+        .expect("nonblocking listener");
+    let port = listener.local_addr().expect("local addr").port();
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            match listener.accept() {
+                Ok((mut conn, _)) => {
+                    let mut req = [0u8; 4];
+                    conn.read_exact(&mut req).expect("read request");
+                    conn.write_all(b"pong").expect("write reply");
+                    return req;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("loopback accept failed: {e}"),
+            }
+        }
+    });
+    let mut spec = py(&format!(
+        "import socket\n\
+         s = socket.create_connection(('127.0.0.1', {port}), timeout=5)\n\
+         s.sendall(b'ping')\n\
+         print(s.recv(4).decode())"
+    ));
+    spec.network = carapace_core::NetworkMode::Full;
+    let r = run(spec);
+    assert_eq!(
+        r.exit_code,
+        Some(0),
+        "full-mode loopback round-trip failed: {r:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&r.stdout).contains("pong"),
+        "payload did not receive the reply: {r:?}"
+    );
+    assert_eq!(
+        server.join().expect("server thread"),
+        *b"ping",
+        "server did not receive the payload's request"
+    );
+}
+
 #[test]
 fn seccomp_blocks_unshare() {
     let b = backend();

@@ -24,6 +24,10 @@ settings or applies them for you.";
 
 const URL_APPARMOR_USERNS: &str =
     "https://gitlab.com/apparmor/apparmor/-/wikis/unprivileged_userns_restriction";
+/// `kernel.unprivileged_userns_clone` is a Debian kernel patch, not a
+/// mainline sysctl; the authoritative description is the patch itself.
+/// (Debian's wiki page for it sits behind an anti-bot challenge.)
+const URL_DEBIAN_USERNS_PATCH: &str = "https://salsa.debian.org/kernel-team/linux/-/blob/master/debian/patches/debian/add-sysctl-to-disallow-unprivileged-CLONE_NEWUSER-by-default.patch";
 const URL_USER_NAMESPACES: &str = "https://docs.kernel.org/admin-guide/sysctl/user.html";
 const URL_CGROUP2: &str = "https://docs.kernel.org/admin-guide/cgroup-v2.html";
 const URL_CGROUP_DELEGATION: &str = "https://systemd.io/CGROUP_DELEGATION/";
@@ -262,8 +266,10 @@ fn check_userns(f: &Facts) -> Check {
                  Exact remedy: sudo sysctl -w kernel.unprivileged_userns_clone=1\n\
                  Persist: create /etc/sysctl.d/60-cara-userns.conf containing\n\
                  kernel.unprivileged_userns_clone=1\n\
-                 then reboot or run sudo sysctl --system.",
-                URL_APPARMOR_USERNS,
+                 then reboot or run sudo sysctl --system.\n\
+                 This knob is Debian-specific (a Debian kernel patch); the upstream\n\
+                 patch is linked below. Modern kernels use user.max_user_namespaces.",
+                URL_DEBIAN_USERNS_PATCH,
             ),
         );
     }
@@ -773,7 +779,8 @@ mod tests {
         let rem = remedy_of(&r, "userns");
         assert!(rem.contains("sudo sysctl -w kernel.unprivileged_userns_clone=1"));
         assert!(rem.contains("60-cara-userns.conf"));
-        assert!(rem.contains(URL_APPARMOR_USERNS));
+        assert!(rem.contains(URL_DEBIAN_USERNS_PATCH));
+        assert!(rem.contains("Debian-specific"));
     }
 
     #[test]

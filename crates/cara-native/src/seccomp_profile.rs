@@ -264,6 +264,12 @@ mod tests {
             libc::SYS_clone3,
             libc::SYS_pivot_root,
             libc::SYS_name_to_handle_at,
+            libc::SYS_setxattr,
+            libc::SYS_lsetxattr,
+            libc::SYS_fsetxattr,
+            libc::SYS_removexattr,
+            libc::SYS_lremovexattr,
+            libc::SYS_fremovexattr,
         ] {
             assert!(!v.contains(&banned), "syscall {banned} must not be allowed");
         }
@@ -278,6 +284,15 @@ mod tests {
             libc::SYS_execve,
             libc::SYS_futex,
             libc::SYS_getrandom,
+            // bash job-control setup as pidns init (ADR-0007 §3).
+            libc::SYS_getpgrp,
+            // Read-only xattr queries for coreutils (ADR-0007 §4).
+            libc::SYS_getxattr,
+            libc::SYS_lgetxattr,
+            libc::SYS_fgetxattr,
+            libc::SYS_listxattr,
+            libc::SYS_llistxattr,
+            libc::SYS_flistxattr,
         ] {
             assert!(v.contains(&needed));
         }

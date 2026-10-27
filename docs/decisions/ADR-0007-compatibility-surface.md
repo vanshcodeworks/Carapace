@@ -4,7 +4,7 @@ Date: 2026-10-27 · Status: accepted · Milestone: P1 (hardening) · Supersedes 
 
 ## Context
 
-The P2 runtime matrix (15/15 on the reference env) forced a series of
+The P2 runtime matrix (17/17 on the reference env) forced a series of
 compatibility changes: each one made a real runtime work, and each one
 widened the sandbox by some amount. "It made Python work" is not a security
 argument. This ADR audits every such change from the last cycle, states the
@@ -31,8 +31,8 @@ Rules applied throughout:
 |---|---|---|---|---|---|
 | 1 | `/etc/alternatives` | Debian/Ubuntu alternatives resolve (`awk → gawk`, etc.) | Host directory content (regular files, symlinks out of `/usr`) exposed read-only | **Narrowed**: recreate only symlinks whose canonical target is under `/usr`; no bind mount | `alternatives_planner_exposes_only_usr_symlinks`, `etc_alternatives_work_when_host_has_them` |
 | 2 | `/dev/shm` tmpfs | POSIX shm + named semaphores; Python `multiprocessing` | Shared memory as an intra-sandbox channel; memory/disk consumption | **Keep**, size-capped, fresh per mount namespace, never the host's | `dev_shm_is_writable`, `python_multiprocessing_semaphores` |
-| 3 | `getpgrp(2)` | bash job-control setup at pidns init | None identified: no arguments, reads caller's own pgid | **Keep** (allowlisted) | runtime matrix `bash-*`; `seccomp_profile` unit tests |
-| 4 | read-only xattr family | `ls -l` POSIX-ACL queries; coreutils works | Metadata disclosure on files already visible; no mutation | **Keep read-only**; all `setxattr`/`removexattr` stay denied | `base_profile_compiles_and_is_sized_sanely`; runtime matrix `bash-find-grep` |
+| 3 | `getpgrp(2)` | bash job-control setup at pidns init | None identified: no arguments, reads caller's own pgid | **Keep** (allowlisted) | runtime matrix `bash-*`; `seccomp_profile::tests::essentials_are_allowed` asserts `SYS_getpgrp` |
+| 4 | read-only xattr family | `ls -l` POSIX-ACL queries; coreutils works | Metadata disclosure on files already visible; no mutation | **Keep read-only**; all `setxattr`/`removexattr` stay denied | `seccomp_profile::tests::essentials_are_allowed` (read side) + `dangerous_syscalls_are_not_allowed` (mutation side); runtime matrix `bash-find-grep` |
 | 5 | `PATH`/`HOME` defaults | runtimes find helpers; `$HOME` is writable | Predictable env, not host-inherited; no host paths | **Keep**, documented defaults, overridable by policy only | `run_provides_default_path_and_home`, `to_spec_maps_everything` |
 | 6 | `clone3 → ENOSYS` | glibc/musl fall back to filtered `clone(2)`; threads work | None: `clone3` never executes; fallback keeps `CLONE_NEW*` filtering | **Keep**, documented as an ABI contract | `filter_semantics_interpreted`, `seccomp_blocks_clone_with_namespace_flags` |
 | 7 | `exec_on_write` | Compile-and-run workflows (`gcc`, `rustc`) | Payload can execute code it just wrote; write-then-exec staging | **New explicit field, default `false`, `false` in `strict`**; `dev`/explicit opt-in only | `write_then_exec`, `write_then_exec_allowed_when_spec_opts_in` |

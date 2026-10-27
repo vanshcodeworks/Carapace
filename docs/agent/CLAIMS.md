@@ -11,10 +11,10 @@ test lands at listed milestone.
 | `cara doctor` reports each capability by measuring it at runtime and exits 4 when Tier 1 is impossible (fail closed) | cara-native doctor tests; cara-cli tests/doctor_cli.rs | ✅ C0 |
 | Landlock ABI on dev machine is exactly v7 | carapace-sys landlock strict test (`strict_env_has_landlock`) | ✅ C0 |
 | seccomp-bpf available on dev machine | carapace-sys seccomp strict test | ✅ C0 |
-| Kernel config: CONFIG_SECURITY_LANDLOCK=y, CONFIG_SECCOMP_FILTER=y, CONFIG_LSM includes landlock (dev machine) | /proc/config.gz read in ENV.md (manual, cycle 1) | ✅ manual; TODO(test): doctor reads /proc/config.gz where available |
-| Isolation claims (fs, network, caps, limits) | escape suite | ⏳ C1–C6 (see docs/threat-model.md §8) |
-| Performance claims (cold/warm start) | benches/ | ⏳ C8 (will state machine specs) |
-| "What Carapace stops" README table | generated from cara-escape-tests | ⏳ C6 |
+| Kernel config: CONFIG_SECURITY_LANDLOCK=y, CONFIG_SECCOMP_FILTER=y, CONFIG_LSM includes landlock (dev machine) | /proc/config.gz read in ENV.md (manual, cycle 1); doctor probes the features themselves (Landlock ABI, seccomp action availability) | ✅ manual + runtime probes |
+| Isolation claims (fs, network, caps, limits) | escape suite (21 payloads, 23 tests) + hardening.rs + limits.rs | ✅ verified C6/P2 (see docs/threat-model.md §8) |
+| Performance claims (cold start; warm pool deferred) | examples/bench.rs; ADR-0005 defers the zygote pool by measurement | ✅ cold measured C8; warm pool not built |
+| "What Carapace stops" README table | generated from cara-escape-tests; pinned by table::tests::readme_table_matches_the_catalog | ✅ verified C6/P1 |
 
 ## Retractions / corrections
 (none yet)
@@ -47,7 +47,7 @@ test lands at listed milestone.
 | Policy files reject unknown fields/units/presets (fail closed) | cara-core policy tests + cli_run policy_check_valid_and_invalid | verified C5 |
 | read_write binds expose exactly the listed host dirs inside the sandbox | cli_run run_with_read_write_bind_sees_host_dir | verified C5 |
 | network mode allowlist fails closed at run time (not implemented) | cli_run run_fails_closed_on_unknown_network_mode_in_policy | verified C5 |
-| network mode full permits sockets; none denies (seccomp + netns) | hardening.rs socket test + seccomp_profile filter_for branch | ⏳ full-mode e2e TODO(test) C6 |
+| network mode full permits sockets end to end (loopback round-trip); none denies them | hardening.rs::network_full_mode_permits_loopback_sockets + seccomp_blocks_socket_creation | ✅ verified cycle 15 |
 | cara run --json has a stable report schema | run_ui json tests (kill_reason strings) | verified C5 |
 | cara run exit codes documented (0/2/3/4) | exit_codes.rs + cli tests | verified C5 |
 
@@ -60,10 +60,10 @@ test lands at listed milestone.
 | Claim | Basis | Status |
 |---|---|---|
 | "What Carapace stops" README table is generated from the tested catalog | carapace-escape-tests table::markdown + README section | verified C6 |
-| All 20 escape payloads exhibit their documented safe outcome through the real sandbox | tests/suite.rs 21 tests green (bridged run 4.25s) | verified C6 |
+| All 21 escape payloads exhibit their documented safe outcome through the real sandbox | tests/suite.rs 23 tests green (bridged run ~4.1s) | verified C6/P1 |
 | No host env var leaks into the sandbox (PATH shared by design) | suite.rs env_leak (asserts against live host env) | verified C6 |
 | setuid bits are inert: CapEff=0, NoNewPrivs=1, uid changes EPERM | suite.rs setuid_escalation | verified C6 |
-| Red-team: chroot/mknod/sethostname//proc/sys/cross-hierarchy-rename denied; zombie hoards + dual floods + slow-drip contained | tests/redteam.rs 11 tests green | verified C6 |
+| Red-team: chroot/mknod/sethostname//proc/sys/cross-hierarchy-rename denied; zombie hoards + dual floods + slow-drip contained | tests/redteam.rs 22 tests green | verified C6/P1 |
 | Cold start: /bin/true median 6.71ms p95 9.27ms (n=100, WSL2 6.18) | examples/bench.rs | verified (machine-specific) |
 
 ## C7 claims (added cycle 7)
@@ -87,8 +87,8 @@ test lands at listed milestone.
 | Claim | Basis | Status |
 |---|---|---|
 | MicroVM tier evaluation: libkrun first (in-process, bundled kernel, directory rootfs), Firecracker second, cloud-hypervisor rejected for v1 — all versions/facts sourced | ADR-0006 with inline URLs | verified C10 (research) |
-| cara-vm fails closed both with and without KVM; VmPlan mapping clamps and rejects zero budgets | cara-vm 10 unit tests | verified C10 |
-| Release runbook: topological publish order core -> sys -> native -> {mcp,wasm,vm} -> cli; audit/deny/SBOM commands real | docs/release.md (agent verified against Cargo.tomls) | verified C12 (docs; musl TODO(verify)) |
+| cara-vm fails closed both with and without KVM; VmPlan mapping clamps and rejects zero budgets | cara-vm 9 unit tests | verified C10 |
+| Release runbook: topological publish order core -> sys -> native -> {mcp,wasm,vm} -> cli; audit/deny/SBOM commands real | docs/release.md (agent verified against Cargo.tomls) | verified C12 (docs); musl build verified cycle 15 |
 | Product demo: 6 scenarios, 9 checks, all PASS on the reference env; host untouched after every scenario | demo/demo.sh run cycle 9 | verified C12 |
 | Caps may hold by denial (fork denial, MemoryError) as well as by kill — both accepted and documented | demo/demo.sh checks d + f | verified C12 |
 
@@ -125,7 +125,9 @@ test lands at listed milestone.
 | `/etc/alternatives` is recreated as symlinks only when the host link resolves under `/usr`; host regular files and out-of-/usr targets are never exposed | supervisor planner unit test + rootfs `etc_alternatives_work_when_host_has_them` (asserts README invisible) | verified P1 |
 | The fork->PDEATHSIG interleaving is forced deterministically: when the supervisor dies inside the window, stage-2 sees stage-1 dead and never execs the payload | `forced_pdeathsig_race_never_execs_payload` (cfg(test)-only pause hook; release builds cannot enable it) | verified P1 |
 | Concurrent sandboxes with long-lived payloads cannot deadlock on inherited pipe fds: stage-1 closes every descriptor except its result pipe before proxying | `redteam.rs::rt_concurrent_long_running_sandboxes_do_not_deadlock` (4 infinite payloads, 1 s timeout, 30 s watchdog; deadlocked before the fix, passes in ~1 s) | verified P1 |
-| `cara doctor` detects AppArmor/sysctl/user-max userns blockers, cgroup v1/hybrid, missing delegation or controllers, non-merged /usr, missing Landlock/seccomp/pidfd/close_range; each remedy is exact, print-only, and cites upstream docs | doctor pure `classify()` + 17 simulated-environment tests; real doctor still READY on the reference env | verified P1 |
+| `cara doctor` detects AppArmor/sysctl/user-max userns blockers, cgroup v1/hybrid, missing delegation or controllers, non-merged /usr, missing Landlock/seccomp/pidfd/close_range; each remedy is exact, print-only, and cites upstream docs | doctor pure `classify()` + 21 doctor tests (17 simulated-environment blockers); real doctor READY on the reference env and on the Debian bookworm userland (cycle 15) | verified P1/P2 |
 | The README "What Carapace stops" table cannot silently drift from the escape catalog | `table::tests::readme_table_matches_the_catalog` (found and fixed 9 already-drifted rows) | verified P1 |
 | Go and JVM complete in strict mode with **zero new syscalls**; the six syscalls they attempt but the profile lacks (socket, connect, getpeername, statfs, fadvise64, fallocate) stay denied, each with an attack-surface review | scripts/runtime-matrix.py go-build-run + jvm-compile-run (17/17 strict); CARA_SECCOMP_LOG=1 run: 20 audit records, 6 distinct syscalls; ADR-0008 | verified P2 |
 | Debian/Ubuntu OpenJDK starts because exactly the canonical `security` directory referenced by an in-tree JVM is bind-mounted read-only; foreign targets, regular files and dangling links are dropped | supervisor `security_planner_exposes_only_referenced_etc_security_dirs` + runtime matrix `jvm-compile-run`; ADR-0007 section 8 | verified P2 |
+| A static musl build of `carapace-cli` compiles and runs: `static-pie linked`, `cara doctor` READY, and sandboxed `/bin/sh` + `python3` payloads on a Debian 12 (bookworm) userland under the same WSL kernel | `cargo build -p carapace-cli --target x86_64-unknown-linux-musl`; Debian pivot_root harness (ENV.md); fixed signedness of `statfs.f_type` | measured cycle 15 (userland-only; not a support claim) |
+| Debian bookworm passes the host-layout gate: it ships an empty `/usr/lib64` with `/lib64 -> usr/lib64` | `cara doctor` READY inside the Debian pivot_root harness (ENV.md) | measured cycle 15 |
