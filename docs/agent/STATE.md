@@ -1,36 +1,33 @@
-# STATE — agent working state (overwritten every cycle)
+# STATE - agent working state (overwritten every cycle)
 
-Last updated: cycle 10 — ALL MILESTONES C0-C12 COMPLETE @ 02044f0. See FINAL_REPORT.md.
+Last updated: cycle 13 (P2) - 2026-10-27.
 
 ## Done (all green via scripts/check.sh)
-- C0-C5 COMPLETE. eae8a2b = policy TOML (deny_unknown_fields, presets,
-  unit parsing), filesystem binds (rw + ro) via staging-dir design,
-  network modes none/full + honest allowlist refusal (ADR-0004),
-  `cara run` / `cara policy check|explain` CLI with JSON reports.
-- Test suites: supervisor (9), rootfs (10), limits (5), hardening (10),
-  cli_run (6), doctor (8+), core policy (9). Full workspace green.
+- C0-C12 COMPLETE at 02044f0 (see FINAL_REPORT.md).
+- P2 runtime matrix (cycle 13): 15/15 through the real Tier 1 sandbox -
+  bash/coreutils, Python stdlib + multiprocessing, Node JSON +
+  worker_threads, gcc compile-and-run, host-built Rust binary.
+- P2 fixes: policy PATH/HOME defaults; /dev/shm tmpfs; read-only
+  /etc/alternatives; getpgrp + read-only xattr syscalls; Landlock RW
+  includes EXECUTE; stage-2 re-arms PDEATHSIG + host /proc race check.
+- Cgroup hygiene: synchronous leaf removal in wait() and doctor attach
+  probe; sweep empty dead-owner leaves on create; sweep empty staging
+  dirs older than 60s. Leaf/staging lists empty after a full check.
+- Full workspace: 191 passed / 0 failed; clippy -D warnings clean.
 
-## Done since C5
-- C6 escape suite (20 payloads, 21 tests) + redteam.rs (11 probes) +
-  generated README table (3ae2e4d, b3501b7). C7 MCP server via cara mcp
-  (335b8bb) + full docs set (9c56935). C9 Wasm tier with parity tests
-  (0dbb190) — wasmtime 50, fuel/epoch/limiter, state-based kill
-  classification. ADR-0005 pool deferred by measurement (bbc0493).
-
-## In progress (parallel subagents)
-- SUBAGENT: C10 microVM ADR + cara-vm KVM-free logic (ADR-0006).
-- SUBAGENT: C12 release runbook + demo script + release-dry-run workflow.
-- ME (main thread): C8 fuzz runs, integration, commits.
+## In progress
+- (none)
 
 ## Known bugs / risks
+- Go and JVM runtimes remain unverified (UNVERIFIED R1.2).
+- Hard-killed supervisor can leave an empty leaf/staging dir; swept on
+  the next run, never force-removed or killed by the sweeper.
+- Microsecond PDEATHSIG interleaving is closed in code but has no
+  targeted loop test (UNVERIFIED R2.10).
 - mkdir_p lesson encoded: never hardcode prefix lengths; keep join
   separators (bind ENOENT debugging).
-- Stale staging dirs from debugging sessions may exist under
-  /run/user/1000/cara-staging.* — .wsl/purge-leaves.sh pattern applies.
 
 ## How to run checks
 wsl -d Ubuntu-24.04 -u dev -- bash /mnt/p/Carapace/scripts/check.sh
-(.wsl/run-full.sh = tests only, self-bridging; per-suite runners exist)
-
-## Last verified commit
-eae8a2b
+(check.sh self-bridges via systemd-run --user --scope and now runs the
+runtime matrix after cargo test)

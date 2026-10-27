@@ -8,6 +8,12 @@ use crate::spec::{Limits, SandboxSpec};
 use serde::Deserialize;
 use std::time::Duration;
 
+/// Default `PATH` for policy-driven runs. Kept in sync with the runtime
+/// layout baked into the Tier 1 rootfs (`/usr` + merged-usr symlinks) and
+/// P2 runtime-matrix findings: compilers, Node, and Python subprocess code
+/// all resolve helpers through the inherited `PATH`.
+pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
 /// Network access mode.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NetworkMode {
@@ -239,12 +245,20 @@ impl Policy {
     }
 
     /// Builds a spawnable spec for `program` with this policy.
+    ///
+    /// The environment stays allowlist-only, but policy-driven runs always
+    /// get a usable `PATH` and `HOME`: child processes (compilers, package
+    /// tooling, shells inside scripts) inherit the child's environment, and
+    /// without a PATH they cannot find their own helpers. See the P2 runtime
+    /// matrix findings in docs/agent/LOG.md.
     pub fn to_spec(&self, program: &str, args: &[String]) -> SandboxSpec {
         let mut spec = SandboxSpec::new(program).args(args);
         spec.limits = self.limits.clone();
         spec.read_only = self.read_only.clone();
         spec.read_write = self.read_write.clone();
         spec.network = self.network.clone();
+        spec.env.insert("PATH".into(), DEFAULT_PATH.into());
+        spec.env.insert("HOME".into(), "/work".into());
         spec
     }
 
@@ -632,5 +646,7 @@ language = "python3.12"
         assert_eq!(spec.limits.memory_bytes, 256 * 1000 * 1000);
         assert_eq!(spec.read_only, vec![std::path::PathBuf::from("/usr")]);
         assert_eq!(spec.args.len(), 2);
+        assert_eq!(spec.env.get("PATH").unwrap(), DEFAULT_PATH);
+        assert_eq!(spec.env.get("HOME").unwrap(), "/work");
     }
 }

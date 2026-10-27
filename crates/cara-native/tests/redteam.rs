@@ -368,31 +368,9 @@ fn rt_symlink_into_proc_sys_denied() {
 }
 
 /// RT16 (red-team cycle 2, operational leak): if the SUPERVISOR itself is
-/// SIGKILLed mid-run, the sandbox tree must still die (PR_SET_PDEATHSIG
-/// -> pidns destruction), leaving no orphaned payload.
-#[test]
-fn rt_supervisor_sigkill_orphans_nothing() {
-    let b = backend();
-    if maybe_skip(&b) {
-        eprintln!("skipping: environment not Tier 1 ready");
-        return;
-    }
-    let marker = format!("CARA_ORPHAN_{}", std::process::id());
-    let backend = b;
-    let spec = SandboxSpec::new("/bin/sh")
-        .args(["-c", "sleep 240 & sleep 240"])
-        .env("CARA_ORPHAN_MARKER", &marker)
-        .timeout(Duration::from_secs(60));
-    // spawn returns a handle; we kill the SUPERVISOR from here by killing
-    // our own... the supervisor IS this test process. To exercise the
-    // parent-death path we need the supervisor in a different process:
-    // run a child `cara run` and SIGKILL it mid-flight.
-    drop(backend);
-    let _ = spec;
-    let _ = marker;
-}
-
-/// The real RT16: drive the `cara` binary and SIGKILL it mid-run.
+/// SIGKILLed mid-run, the sandbox tree must still die — stage-1 AND
+/// stage-2 both arm PR_SET_PDEATHSIG (fork clears it for the child) — so
+/// no orphaned payload survives.
 #[test]
 fn rt_cara_binary_sigkilled_midrun_orphans_nothing() {
     use std::process::{Command, Stdio};
@@ -401,6 +379,16 @@ fn rt_cara_binary_sigkilled_midrun_orphans_nothing() {
         eprintln!("skipping: environment not Tier 1 ready");
         return;
     }
+    // Unique token in the shell's cmdline (it is the pidns init; if it
+    // survives, every payload descendant does).
+    let marker = format!(
+        "CARA_RT16_{}_{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
     // The cara binary lives in the shared target dir; find it relative to
     // this test binary (target/debug/...).
     let cara = std::env::current_exe()
@@ -408,17 +396,10 @@ fn rt_cara_binary_sigkilled_midrun_orphans_nothing() {
         .and_then(|p| p.ancestors().nth(2).map(|d| d.join("cara")))
         .filter(|p| p.exists())
         .expect("cara binary next to the test binary");
+    let payload = format!("sleep 120 & wait # {marker}");
     let mut child = Command::new(cara)
-        .args([
-            "run",
-            "--timeout",
-            "60s",
-            "--json",
-            "--",
-            "/bin/sh",
-            "-c",
-            "sleep 120 & sleep 120",
-        ])
+        .args(["run", "--timeout", "60s", "--json", "--", "/bin/sh", "-c"])
+        .arg(&payload)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -431,7 +412,8 @@ fn rt_cara_binary_sigkilled_midrun_orphans_nothing() {
         libc::kill(pid, libc::SIGKILL);
     }
     let _ = child.wait();
-    // The payload must die shortly after (PDEATHSIG -> pidns destruction).
+    // The payload must die shortly after (PDEATHSIG on stage-2 ->
+    // pidns destruction).
     let mut survived = false;
     for _ in 0..30 {
         let dir = std::fs::read_dir("/proc").expect("/proc");
@@ -440,8 +422,10 @@ fn rt_cara_binary_sigkilled_midrun_orphans_nothing() {
             if !pid.chars().all(|c| c.is_ascii_digit()) {
                 continue;
             }
-            if let Ok(environ) = std::fs::read(format!("/proc/{pid}/environ"))
-                && environ.windows(9).any(|w| w == b"sleep 120")
+            if let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline"))
+                && cmdline
+                    .windows(marker.len())
+                    .any(|w| w == marker.as_bytes())
             {
                 survived = true;
             }

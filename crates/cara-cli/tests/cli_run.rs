@@ -82,6 +82,115 @@ fn run_echo_through_full_stack() {
 }
 
 #[test]
+fn run_removes_its_cgroup_leaf_before_exit() {
+    if !env_ready() {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let mut child = cara()
+        .args(["run", "--json", "--", "/bin/true"])
+        .spawn()
+        .unwrap();
+    let supervisor_pid = child.id();
+    assert!(child.wait().unwrap().success());
+    // Drop's async remover cannot outlive a short-lived CLI process; the
+    // leaf must be gone before exit (normally-path removal in wait()).
+    let needle = format!("cara-run-{supervisor_pid}-");
+    let leftovers = find_cgroup_names(&needle);
+    assert!(
+        leftovers.is_empty(),
+        "cgroup leaf left behind after process exit: {leftovers:?}"
+    );
+}
+
+#[test]
+fn doctor_removes_its_cgroup_probe_leaf_before_exit() {
+    if !env_ready() {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    // The doctor gate creates an attach-probe leaf named like a run leaf.
+    // A detached Drop remover would die with this short-lived process.
+    let mut child = cara()
+        .args(["doctor", "--json"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let doctor_pid = child.id();
+    assert!(child.wait().unwrap().success());
+    let leftovers = find_cgroup_names(&format!("cara-run-{doctor_pid}-"));
+    assert!(
+        leftovers.is_empty(),
+        "doctor probe leaf left behind after process exit: {leftovers:?}"
+    );
+}
+
+/// Recursively scans the unified cgroup tree for directory names starting
+/// with `needle` (the CLI's own leaf names embed the supervisor PID).
+fn find_cgroup_names(needle: &str) -> Vec<String> {
+    fn walk(dir: &std::path::Path, needle: &str, out: &mut Vec<String>, depth: u8) {
+        if depth == 0 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let Ok(ft) = entry.file_type() else {
+                continue;
+            };
+            if !ft.is_dir() {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(needle) {
+                out.push(entry.path().display().to_string());
+            }
+            walk(&entry.path(), needle, out, depth - 1);
+        }
+    }
+    let mut out = Vec::new();
+    walk(std::path::Path::new("/sys/fs/cgroup"), needle, &mut out, 6);
+    out
+}
+
+#[test]
+fn run_provides_default_path_and_home() {
+    if !env_ready() {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let out = cara()
+        .args([
+            "run",
+            "--json",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'PATH=%s\\nHOME=%s\\n' \"$PATH\" \"$HOME\"; echo probe > /work/probe",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let stdout = report["stdout"].as_str().unwrap();
+    assert!(
+        stdout.contains("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"),
+        "default PATH missing: {stdout}"
+    );
+    assert!(
+        stdout.contains("HOME=/work"),
+        "default HOME missing: {stdout}"
+    );
+}
+
+#[test]
 fn run_timeout_kills_with_reason() {
     if !env_ready() {
         eprintln!("skipping: environment not Tier 1 ready");

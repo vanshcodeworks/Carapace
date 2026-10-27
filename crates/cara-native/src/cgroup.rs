@@ -88,13 +88,20 @@ pub fn attach_capable_root() -> Option<PathBuf> {
         }
     }
     let limits = carapace_core::Limits::default();
-    let ok = CgroupLeaf::create(&root, &limits, pid).is_ok();
+    let leaf = CgroupLeaf::create(&root, &limits, pid);
+    let ok = leaf.is_ok();
     // Clean up whether or not the attach worked.
     unsafe {
         // SAFETY: signal and reap our probe child.
         libc::kill(pid, libc::SIGKILL);
         let mut st: libc::c_int = 0;
         libc::waitpid(pid, &mut st, 0);
+    }
+    // Remove the probe leaf synchronously: this function runs in short-lived
+    // CLI processes (doctor gates `cara run`), where Drop's detached remover
+    // would die with the process and leak one empty cgroup per invocation.
+    if let Ok(leaf) = leaf {
+        leaf.remove();
     }
     if ok { Some(root) } else { None }
 }
@@ -111,10 +118,41 @@ fn controllers_at(dir: &Path) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Extracts the owning supervisor PID from a leaf or probe directory name.
+fn owner_pid(name: &str) -> Option<u32> {
+    let rest = name
+        .strip_prefix("cara-run-")
+        .or_else(|| name.strip_prefix("cara-cgroup-probe-"))?;
+    rest.split_once('-')?.0.parse().ok()
+}
+
+/// Removes empty leaves left behind by supervisors that were killed before
+/// they could clean up. Only directories whose owning PID is gone are
+/// considered, and only `rmdir` is attempted: a leaf that still holds
+/// processes or nested cgroups is left untouched. Best effort, never fatal.
+fn sweep_stale(root: &Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(owner_pid) else {
+            continue;
+        };
+        // A live PID means the owner may still be using the leaf. PID reuse
+        // can only cause us to skip, never to remove someone else's leaf.
+        if Path::new(&format!("/proc/{pid}")).exists() {
+            continue;
+        }
+        let _ = std::fs::remove_dir(entry.path());
+    }
+}
+
 impl CgroupLeaf {
     /// Creates the leaf under `root`, applies the limits, and attaches the
     /// (still parked) child. Fails closed: any error aborts the sandbox.
     pub fn create(root: &Path, limits: &Limits, child_pid: libc::pid_t) -> std::io::Result<Self> {
+        sweep_stale(root);
         let unique = format!(
             "cara-run-{}-{}",
             std::process::id(),
@@ -358,5 +396,41 @@ mod tests {
         let path = leaf.path().to_path_buf();
         leaf.remove();
         assert!(!path.exists(), "leaf must be removed");
+    }
+
+    #[test]
+    fn leaf_owner_parses_run_and_probe_names() {
+        assert_eq!(owner_pid("cara-run-123-456"), Some(123));
+        assert_eq!(owner_pid("cara-cgroup-probe-42-7"), Some(42));
+        assert_eq!(owner_pid("cara-run-not-a-pid-456"), None);
+        assert_eq!(owner_pid("unrelated-123-456"), None);
+    }
+
+    #[test]
+    fn sweep_removes_only_leaves_with_dead_owners() {
+        let root = std::env::temp_dir().join(format!(
+            "cara-sweep-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir(&root).expect("temp root");
+        let dead = root.join("cara-run-999999999-1");
+        let live = root.join(format!("cara-run-{}-1", std::process::id()));
+        let malformed = root.join("cara-run-not-a-pid-1");
+        let unrelated = root.join("other-999999999-1");
+        for p in [&dead, &live, &malformed, &unrelated] {
+            std::fs::create_dir(p).expect("probe dir");
+        }
+
+        sweep_stale(&root);
+
+        assert!(!dead.exists(), "leaf with a dead owner is swept");
+        assert!(live.exists(), "leaf with a live owner is kept");
+        assert!(malformed.exists(), "unparsable names are ignored");
+        assert!(unrelated.exists(), "unrelated directories are ignored");
+        std::fs::remove_dir_all(&root).ok();
     }
 }

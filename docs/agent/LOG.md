@@ -293,3 +293,26 @@ workflow since C0. UNVERIFIED.md written (15 items, R1-R3 ranked).
 Commands: count-tests.sh (new), run-full.sh, run-rt.sh x3, check.sh.
 Results: baseline green; audit/deny pending install (background).
 Next: triage audit/deny output, then P1 compat matrix.
+
+## Cycle 13 (P2) - 2026-10-27 - runtime matrix
+Task: P2 - prove real runtimes (not just sh/python3) work through Tier 1,
+and fix what the matrix finds.
+Outcome: `scripts/runtime-matrix.py` (tracked, also run by check.sh):
+15 passed / 0 failed / 0 skipped - bash/coreutils, Python stdlib
+(json/re/hashlib, sqlite3, ssl, threads, concurrent.futures),
+Python multiprocessing, Node JSON + worker_threads, gcc compile-and-run,
+host-built Rust binary. Fixes: policy runs default PATH and HOME=/work;
+writable size-capped /dev/shm (POSIX semaphores); read-only
+/etc/alternatives for distro symlinks; getpgrp + read-only xattr syscalls
+(bash job control, ls -l ACL probes); Landlock RW grant includes EXECUTE
+(exec payload-built binaries). RT16 exposed a real remaining orphan gap:
+fork(2) clears PDEATHSIG, so stage-2 now re-arms it and checks
+/proc/<stage1_pid>; RT16 leaves no processes. Cgroup hygiene: leaf
+removal is synchronous in wait() and in doctor's attach probe (the probe
+was leaking one empty leaf per CLI invocation); create() sweeps empty
+dead-owner leaves, mk_staging_dir sweeps empty staging dirs older than
+60s. After a full check the leaf and staging lists are empty.
+Full workspace: 191 passed / 0 failed; clippy -D warnings clean.
+Commands: scripts/runtime-matrix.py, scripts/check.sh.
+Next: Go/JVM matrix columns (UNVERIFIED R1.2), microsecond PDEATHSIG
+loop, P1 compat matrix.

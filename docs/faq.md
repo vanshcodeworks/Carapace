@@ -74,20 +74,22 @@ host `/usr` read-only, so `/bin/sh`, `/usr/bin/python3`, `/usr/bin/perl`,
 `node`, `gcc`-built binaries — whatever your distro ships — work without
 any per-language setup (docs/runtime-guide.md). Requirements: the program
 path must be absolute (Carapace does no PATH search), the environment is
-allowlist-only, and network access requires an explicit policy. The test
-suites exercise POSIX shell and Python 3 end to end
-(`rootfs.rs::python3_hello_world`, `hardening.rs::normal_python_still_works`).
+allowlist-only (policy runs default `PATH` + `HOME=/work`), and network
+access requires an explicit policy. The P2 runtime matrix exercises bash,
+Python, Node, gcc and Rust end to end; Go and the JVM are still unverified
+(`scripts/runtime-matrix.py`, docs/agent/UNVERIFIED.md).
 
 ## What does the payload see?
 
 A minimal root: read-only `/usr` (the runtime), fresh `/proc` showing only
-its own process tree, a sandbox-owned minimal `/etc`, four safe device
-nodes in `/dev` (`null`, `zero`, `urandom`, `random`), a writable
-size-capped `/work` (its cwd) and `/tmp`. No host `/home`, `/root`, `/var`,
-no host users, no `/sys`. Host paths appear only if the policy lists them
-(read-only or read-write). Verified by the rootfs suite, e.g.
-`rootfs.rs::host_paths_are_absent`, `etc_is_sandbox_owned_not_host`,
-`dev_has_only_safe_devices`.
+its own process tree, a sandbox-owned minimal `/etc` (plus read-only
+`/etc/alternatives` on distros that use it), four safe device nodes in
+`/dev` (`null`, `zero`, `urandom`, `random`), a writable size-capped `/work`
+(its cwd), `/tmp`, and `/dev/shm` for POSIX shared memory. No host `/home`,
+`/root`, `/var`, no host users, no `/sys`. Host paths appear only if the
+policy lists them (read-only or read-write). Verified by the rootfs suite,
+e.g. `rootfs.rs::host_paths_are_absent`, `etc_is_sandbox_owned_not_host`,
+`dev_has_only_safe_devices`, `dev_shm_is_writable`.
 
 ## What happens when a limit is hit?
 

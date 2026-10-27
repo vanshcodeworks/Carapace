@@ -36,4 +36,11 @@ cargo clippy --all-targets --all-features -- -D warnings
 echo "==> cargo test"
 cargo test --workspace
 
+# P2 integration: real runtimes, not just the unit suite. Skips cleanly
+# when the environment cannot isolate (e.g. hosted CI).
+if command -v python3 >/dev/null 2>&1; then
+  echo "==> runtime matrix"
+  CARA="$CARGO_TARGET_DIR/debug/cara" python3 scripts/runtime-matrix.py
+fi
+
 echo "==> all green"
