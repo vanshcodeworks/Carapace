@@ -8,6 +8,10 @@ use std::io::BufReader;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    // Hidden session keeper entry point (spawned by the session manager).
+    if std::env::args().nth(1).as_deref() == Some(carapace_native::session::KEEPER_ARG) {
+        carapace_native::session::keeper_main_from_args();
+    }
     let stdin = std::io::stdin();
     let stdout = std::io::stdout();
     let mut server = carapace_mcp::McpServer::new(BufReader::new(stdin.lock()), stdout.lock());

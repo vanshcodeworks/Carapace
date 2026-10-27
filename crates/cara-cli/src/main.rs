@@ -4,6 +4,7 @@ use std::process::ExitCode;
 mod doctor_ui;
 mod exit_codes;
 mod run_ui;
+mod session_ui;
 
 #[derive(Parser)]
 #[command(name = "cara", version, about, long_about)]
@@ -56,6 +57,16 @@ enum Cmd {
 
     /// Serve the MCP (Model Context Protocol) server on stdio.
     Mcp,
+
+    /// Manage persistent sandbox sessions (persistent /work, no daemon).
+    Session {
+        #[command(subcommand)]
+        cmd: SessionCmd,
+    },
+
+    /// Internal: session keeper process. Not a public command.
+    #[command(name = "__session-keeper", hide = true)]
+    SessionKeeper { spec: String },
 }
 
 #[derive(Subcommand)]
@@ -68,6 +79,65 @@ enum PolicyCmd {
     },
     /// Print what the policy allows in plain English.
     Explain { file: String },
+}
+
+#[derive(Subcommand)]
+enum SessionCmd {
+    /// Create a session (prints its id). Detached from this process.
+    Start {
+        /// Policy file (TOML). Without one, the `strict` preset applies.
+        #[arg(long)]
+        policy: Option<String>,
+        /// Machine-readable metadata on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run one program inside a session (stdout/stderr are streamed back).
+    Exec {
+        /// Session id.
+        id: String,
+        /// Override the per-exec wall-clock timeout (e.g. "30s").
+        #[arg(long)]
+        timeout: Option<String>,
+        /// Machine-readable JSON report on stdout.
+        #[arg(long)]
+        json: bool,
+        /// The program and its arguments (after --).
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
+    /// Upload a host file into the session work dir.
+    Put {
+        id: String,
+        local: String,
+        remote: String,
+    },
+    /// Download a session file to the host.
+    Get {
+        id: String,
+        remote: String,
+        local: String,
+    },
+    /// List a directory inside the session work dir.
+    Ls {
+        id: String,
+        #[arg(default_value = ".")]
+        path: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// List sessions known to this user.
+    List {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Close a session and remove its work dir and cgroup leaf.
+    Close { id: String },
+    /// Remove dead sessions (never touches a live keeper).
+    Prune {
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn main() -> ExitCode {
@@ -85,6 +155,24 @@ fn main() -> ExitCode {
             PolicyCmd::Explain { file } => policy_explain(&file),
         },
         Cmd::Mcp => mcp_main(),
+        Cmd::Session { cmd } => match cmd {
+            SessionCmd::Start { policy, json } => session_ui::start_main(policy.as_deref(), json),
+            SessionCmd::Exec {
+                id,
+                timeout,
+                json,
+                argv,
+            } => session_ui::exec_main(&id, timeout.as_deref(), json, &argv),
+            SessionCmd::Put { id, local, remote } => session_ui::put_main(&id, &local, &remote),
+            SessionCmd::Get { id, remote, local } => session_ui::get_main(&id, &remote, &local),
+            SessionCmd::Ls { id, path, json } => session_ui::ls_main(&id, &path, json),
+            SessionCmd::List { json } => session_ui::list_main(json),
+            SessionCmd::Close { id } => session_ui::close_main(&id),
+            SessionCmd::Prune { json } => session_ui::prune_main(json),
+        },
+        Cmd::SessionKeeper { spec } => {
+            carapace_native::session::keeper_main(std::path::Path::new(&spec));
+        }
         Cmd::Bench { runs } => match carapace_native::bench::run_benchmark(runs) {
             Ok(report) => {
                 print!("{report}");

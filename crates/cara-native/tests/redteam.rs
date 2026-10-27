@@ -586,6 +586,12 @@ fn rt_double_wait_is_clean_error() {
 }
 
 /// RT20: zero output cap — any write is an immediate overflow kill.
+///
+/// The payload writes and then stays alive for 30s with a 10s wall limit,
+/// so the only ways this run can end are the overflow kill or the timeout:
+/// the assertion on `kill_reason` distinguishes them, and `wall_time` (the
+/// supervisor's own run clock, which excludes spawn) proves the kill did
+/// not wait for the deadline.
 #[test]
 fn rt_zero_output_cap_kills_immediately() {
     let b = backend();
@@ -593,9 +599,16 @@ fn rt_zero_output_cap_kills_immediately() {
         eprintln!("skipping: environment not Tier 1 ready");
         return;
     }
-    let r = run(sh("echo hi").max_output(0).timeout(Duration::from_secs(10)));
+    let r = run(sh("echo hi; sleep 30")
+        .max_output(0)
+        .timeout(Duration::from_secs(10)));
     assert_eq!(r.kill_reason, Some(KillReason::OutputOverflow), "{r:?}");
     assert!(r.stdout.is_empty());
+    assert!(
+        r.wall_time < Duration::from_secs(3),
+        "the overflow kill must not wait for the wall deadline: {:?}",
+        r.wall_time
+    );
 }
 
 /// RT21: stdin is empty — a reader gets EOF, not a hang.
