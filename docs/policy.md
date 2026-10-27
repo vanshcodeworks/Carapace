@@ -62,11 +62,11 @@ etc. are rejected (fail closed).
 
 Selects the base posture; per-field settings below override it.
 
-| Preset | timeout | memory | cpu | max_processes | disk (/work) | max_output | network |
-|---|---|---|---|---|---|---|---|
-| `strict` (default) | 10s | 256 MiB | 100% | 32 | 64 MiB | 1 MiB | `none` |
-| `dev` | 60s | 1 GiB | 200% | 128 | 512 MiB | 8 MiB | `none` |
-| `network-light` | 60s | 1 GiB | 200% | 128 | 512 MiB | 8 MiB | `allowlist` (unimplemented — refuses at run time) |
+| Preset | timeout | memory | cpu | max_processes | disk (/work) | max_output | exec on write | network |
+|---|---|---|---|---|---|---|---|---|
+| `strict` (default) | 10s | 256 MiB | 100% | 32 | 64 MiB | 1 MiB | no | `none` |
+| `dev` | 60s | 1 GiB | 200% | 128 | 512 MiB | 8 MiB | yes | `none` |
+| `network-light` | 60s | 1 GiB | 200% | 128 | 512 MiB | 8 MiB | yes | `allowlist` (unimplemented — refuses at run time) |
 
 Preset numbers are computed as 1024-based (MiB/GiB). Note the distinction
 with string values below: in a file, `256MB` means 256,000,000 bytes
@@ -123,9 +123,29 @@ Required `%` suffix, integer 1–10000 (`50%`, `100%`, `200%`). `0%` and
 
 ```toml
 [filesystem]
-read_only  = ["/opt/data"]            # optional
-read_write = ["/home/dev/project"]    # optional
+read_only     = ["/opt/data"]            # optional
+read_write    = ["/home/dev/project"]    # optional
+exec_on_write = false                    # optional; default false
 ```
+
+`exec_on_write` controls whether the payload may `execve` files it wrote into
+the writable areas (`/work`, `/tmp`, `/dev/shm`, and every `read_write` bind).
+The default is **false**, and it stays false in the `strict` preset: a
+payload can create and run *nothing it wrote*, which blocks the classic
+write-then-exec staging move (escape test `write_then_exec`). `dev` sets it
+to `true` because compile-and-run workflows (`gcc`, `rustc`) need to execute
+their own output; `network-light` inherits `dev`.
+
+Set it explicitly when a policy needs it:
+
+```toml
+[filesystem]
+exec_on_write = true
+```
+
+Landlock's writable grant then includes `EXECUTE`; everything else (seccomp,
+`no_new_privs`, zero capabilities, cgroups) still applies to the new binary.
+See ADR-0007 for the audit trail.
 
 Every listed host path is bind-mounted **at the same absolute path inside
 the sandbox**. Validation rules (violations are parse errors):
@@ -149,11 +169,21 @@ What the sandbox always contains, regardless of policy:
 | `/bin`, `/lib`, `/lib64` | symlinks into `/usr` (merged-usr layout) | no |
 | `/proc` | fresh procfs for the sandbox's own PID namespace | no |
 | `/etc` | **minimal sandbox-owned** `/etc/passwd` + `/etc/group` (`root`, `nobody`) — *not* the host's | no (Landlock) |
+| `/etc/alternatives` | symlinks recreated from the host **only** when they resolve under `/usr` (e.g. `awk`); regular files are never exposed | no |
+| `/etc/java-*-openjdk/security` | read-only bind **only** when an in-tree JVM links to that canonical directory (Debian/Ubuntu OpenJDK layout); the rest of `/etc/java-*` is invisible | no |
 | `/dev` | exactly `null`, `zero`, `urandom`, `random`, bind-mounted from the host | device nodes only |
-| `/work`, `/tmp` | fresh tmpfs, size = `limits.disk` — the payload's cwd is `/work` | yes |
+| `/dev/shm` | fresh tmpfs, size = `limits.disk`, for POSIX shm/named semaphores | yes |
+| `/work` | fresh tmpfs, size = `limits.disk` — the payload's cwd | yes |
+| `/tmp` | directory on the 8 MiB root tmpfs | yes |
 
-Nothing else from the host is visible: no `/home`, `/root`, `/var`, no host
-`/etc`. Writes outside the granted paths are denied by Landlock even where a
+Writes are allowed but **execution of written files is denied by default**
+(Landlock `RW_ALL_NO_EXEC`); see `exec_on_write` above. The scratch budget is
+per mount: `/work` and `/dev/shm` are each capped at `limits.disk`, so the
+aggregate writable space can reach roughly `2 × limits.disk + 8 MiB`.
+
+Nothing else from the host is visible: no `/home`, `/root`, `/var`, and no
+host `/etc` beyond the two narrow, read-only runtime directories above.
+Writes outside the granted paths are denied by Landlock even where a
 mount happens to be writable (test: `hardening.rs::landlock_denies_writes_outside_grants`).
 
 ## `[network]`

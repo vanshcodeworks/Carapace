@@ -44,6 +44,34 @@ mod tests {
     }
 
     #[test]
+    fn readme_table_matches_the_catalog() {
+        // The README claims the table is generated from the catalog. Until a
+        // generator exists, this test is what makes that claim true: every
+        // generated row must be present verbatim in README.md, and no
+        // catalog id may be missing from it.
+        let readme = include_str!("../../../README.md");
+        let md = markdown();
+        let missing: Vec<&str> = md
+            .lines()
+            .filter(|l| l.starts_with("| `"))
+            .filter(|line| !readme.contains(line))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "README is missing {} catalog row(s) (update README from the catalog):\n{}",
+            missing.len(),
+            missing.join("\n")
+        );
+        for t in crate::Catalog::all() {
+            assert!(
+                readme.contains(&format!("| `{}` — ", t.id)),
+                "README does not mention catalog entry {}",
+                t.id
+            );
+        }
+    }
+
+    #[test]
     fn table_rows_are_markdown_safe() {
         // The cells are joined with '|'; field text must not contain the
         // delimiter or the table silently grows columns.

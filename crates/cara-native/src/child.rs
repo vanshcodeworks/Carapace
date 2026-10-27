@@ -54,6 +54,17 @@ pub(crate) struct BindSpec {
     pub rw: bool,
 }
 
+/// One `/etc/alternatives` entry recreated as a symlink inside the
+/// sandbox. The parent planner exposes only symlinks whose resolved target
+/// is under `/usr`; regular files and out-of-/usr targets are dropped.
+#[derive(Debug, Clone)]
+pub(crate) struct AltLink {
+    /// Single path component (the entry name), prepared parent-side.
+    pub name: CString,
+    /// Canonical absolute target under `/usr` (what the symlink points to).
+    pub target: CString,
+}
+
 /// Fixed-size pre-exec failure report written to the exec-status pipe.
 /// `#[repr(C)]` with fixed-width fields so parent and child agree exactly.
 #[repr(C)]
@@ -111,6 +122,18 @@ pub(crate) struct ChildConfig {
     /// Extra bind mounts, applied like the runtime ones: same absolute
     /// path inside and outside, read-only or read-write.
     pub binds: Vec<BindSpec>,
+    /// `/etc/alternatives` symlinks to recreate inside the sandbox
+    /// (symlinks only, targets restricted to `/usr` by the parent).
+    pub alternatives: Vec<AltLink>,
+    /// Whether `execve` is allowed on files in writable locations:
+    /// `/work`, `/tmp`, `/dev/shm` and read-write binds. Mirrors
+    /// [`carapace_core::SandboxSpec::exec_on_write`].
+    pub exec_on_write: bool,
+    /// Test-only: socketpair fd used to force the fork->PDEATHSIG
+    /// interleaving. `-1` in production builds; the field does not exist
+    /// outside `cfg(test)`.
+    #[cfg(test)]
+    pub pdeathsig_hook_fd: RawFd,
     /// Compiled seccomp filter (parent-side compilation; installed by
     /// stage-2 as the LAST setup step before exec).
     pub seccomp_filter: Vec<libc::sock_filter>,
@@ -432,34 +455,29 @@ fn setup_rootfs(cfg: &ChildConfig) {
     let etc_group = join(&root, c"/etc/group".to_bytes_with_nul());
     write_new_file(&etc_group, b"root:x:0:\nnobody:x:65534:\n").or_fail(cfg, stage::MOUNT_RUNTIME);
 
-    // (g2) /etc/alternatives: a read-only view of distro symlinks
-    // (e.g. /usr/bin/awk -> /etc/alternatives/awk -> /usr/bin/gawk).
-    // Only symlink entries are exposed; absolute targets resolve inside
-    // the pivoted root, so nothing beyond the already-mounted /usr becomes
-    // reachable. Absent on non-Debian hosts: skip, don't fail.
-    let alt_src = c"/etc/alternatives".to_bytes_with_nul();
-    let alt_present = unsafe {
-        // SAFETY: access(2) with a NUL-terminated literal path.
-        libc::access(alt_src.as_ptr().cast::<libc::c_char>(), libc::F_OK)
-    } == 0;
-    if alt_present {
-        let alt_dst = join(&root, c"/etc/alternatives".to_bytes_with_nul());
-        if let Err(e) = mount_raw(
-            alt_src,
-            &alt_dst,
-            b"",
-            (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
-            std::ptr::null(),
-        ) {
-            fail(cfg, stage::MOUNT_RUNTIME, e);
+    // (g2) /etc/alternatives: recreate ONLY the symlink entries that the
+    // parent planner resolved to a target under /usr (e.g. /usr/bin/awk ->
+    // /etc/alternatives/awk -> /usr/bin/gawk). Nothing is bind-mounted:
+    // regular files in the host directory (Ubuntu ships README) and
+    // symlinks leaving /usr are not exposed at all. Absent on non-Debian
+    // hosts: the planner returns an empty list, which is not an error.
+    for alt in &cfg.alternatives {
+        let mut path = [0u8; 512];
+        let n_root = root
+            .iter()
+            .position(|&c| c == 0)
+            .expect("root buffer is NUL-terminated");
+        let prefix = b"/etc/alternatives/";
+        let name = alt.name.as_bytes();
+        let end = n_root + prefix.len() + name.len();
+        if end >= path.len() {
+            fail(cfg, stage::MOUNT_RUNTIME, libc::ENAMETOOLONG);
         }
-        if let Err(e) = mount_raw(
-            alt_src,
-            &alt_dst,
-            b"",
-            (libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY | libc::MS_REC) as libc::c_ulong,
-            std::ptr::null(),
-        ) {
+        path[..n_root].copy_from_slice(&root[..n_root]);
+        path[n_root..n_root + prefix.len()].copy_from_slice(prefix);
+        path[n_root + prefix.len()..end].copy_from_slice(name);
+        // path[end] stays 0 from the zero-initialized buffer.
+        if let Err(e) = symlink_raw(alt.target.as_bytes_with_nul(), &path[..=end]) {
             fail(cfg, stage::MOUNT_RUNTIME, e);
         }
     }
@@ -620,12 +638,15 @@ fn verify_rootfs() -> Result<(), i32> {
 
 // ------------------------------------------------------------ mount helpers
 
-/// `access("/proc/<pid>", F_OK)` — async-signal-safe parent-liveness check
-/// for the fork->prctl window. Runs before the fresh procfs is mounted, so
-/// /proc is still the host's procfs and the host pid is meaningful.
-fn proc_pid_exists(pid: libc::pid_t) -> bool {
-    let mut buf = [0u8; 32];
+/// Reads `/proc/<pid>/stat` and reports whether the process is still
+/// present AND not a zombie/dead task. Async-signal-safe (open/read/close
+/// only), used for the fork->PR_SET_PDEATHSIG window. A zombie must count
+/// as dead: PDEATHSIG cannot fire for a parent that already exited, so
+/// proceeding would leave an unkillable pidns init.
+fn proc_pid_is_live(pid: libc::pid_t) -> bool {
+    let mut buf = [0u8; 40];
     let prefix = b"/proc/";
+    let suffix = b"/stat";
     buf[..prefix.len()].copy_from_slice(prefix);
     let mut n = prefix.len();
     let mut v = pid.unsigned_abs();
@@ -645,12 +666,45 @@ fn proc_pid_exists(pid: libc::pid_t) -> bool {
             n += 1;
         }
     }
+    buf[n..n + suffix.len()].copy_from_slice(suffix);
+    n += suffix.len();
     buf[n] = 0;
-    unsafe {
-        // SAFETY: NUL-terminated path in a local buffer; access(2) has no
-        // memory effects beyond reading it.
-        libc::access(buf.as_ptr().cast::<libc::c_char>(), libc::F_OK) == 0
+    let fd = unsafe {
+        // SAFETY: NUL-terminated path in a local buffer; open(2) reads it.
+        libc::open(
+            buf.as_ptr().cast::<libc::c_char>(),
+            libc::O_RDONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return false;
     }
+    let mut data = [0u8; 256];
+    let n = unsafe {
+        // SAFETY: raw read(2) into a valid 256-byte buffer.
+        libc::read(fd, data.as_mut_ptr().cast(), data.len())
+    };
+    unsafe {
+        // SAFETY: closing the fd we opened.
+        libc::close(fd);
+    }
+    if n <= 0 {
+        return false;
+    }
+    let bytes = &data[..n as usize];
+    // The comm field is parenthesized and may itself contain ')'; the
+    // state is the first non-space byte after the LAST ')'.
+    let Some(close) = bytes.iter().rposition(|&b| b == b')') else {
+        return false;
+    };
+    let Some(state) = bytes[close + 1..]
+        .iter()
+        .find(|b| !b.is_ascii_whitespace())
+        .copied()
+    else {
+        return false;
+    };
+    !matches!(state, b'Z' | b'X' | b'x')
 }
 
 /// A 64-byte NUL-terminated path buffer (core sandbox paths fit).
@@ -965,6 +1019,27 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
     }
     if pid2 == 0 {
         // ---- stage-2: the actual sandbox init ----
+        // TEST HOOK (cfg(test) only, never compiled into release builds):
+        // pause exactly between fork(2) and PR_SET_PDEATHSIG so the
+        // forced-interleaving test can SIGKILL the supervisor in this
+        // window. The test releases us with one byte; see
+        // src/pdeathsig_test.rs.
+        #[cfg(test)]
+        if cfg.pdeathsig_hook_fd >= 0 {
+            let fd = cfg.pdeathsig_hook_fd;
+            let _ = write_all(fd, b"P");
+            let mut b = [0u8; 1];
+            loop {
+                let n = unsafe {
+                    // SAFETY: raw read(2) into a valid 1-byte buffer.
+                    libc::read(fd, b.as_mut_ptr().cast(), 1)
+                };
+                if n < 0 && errno() == libc::EINTR {
+                    continue;
+                }
+                break;
+            }
+        }
         // The parent-death signal is NOT inherited by the child of fork(2)
         // (prctl(2)); stage-1's setting only covers stage-1. Re-arm it here
         // so a dead supervisor/stage-1 kills the PID-namespace init, which
@@ -987,30 +1062,24 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         // Close the fork->prctl race: if stage-1 died in between, setting
         // PDEATHSIG has no retroactive effect. /proc is still the host's
         // procfs here (the fresh sandbox /proc is mounted later in
-        // run_payload), so stage-1's host pid is observable.
-        if !proc_pid_exists(stage1_host_pid) {
+        // run_payload), so stage-1's host pid is observable. A zombie is
+        // already dead for this purpose: arming PDEATHSIG on it would
+        // never fire, so treat Z/X as gone (P1 forced-interleaving test).
+        if !proc_pid_is_live(stage1_host_pid) {
             fail(cfg, stage::PDEATHSIG, libc::ESRCH);
         }
         run_payload(cfg);
     }
 
     // ---- stage-1: supervisor proxy ----
-    // CRITICAL: close every child-facing fd except our result pipe. We
-    // never exec (so CLOEXEC never fires for us); holding the status or
-    // stdio pipes open would block the parent's EOF detection forever —
-    // observed as a deadlock once the payload fills its stdout pipe.
-    for fd in [
-        cfg.status_wr,
-        cfg.go_rd,
-        cfg.stdin_fd,
-        cfg.stdout_fd,
-        cfg.stderr_fd,
-    ] {
-        unsafe {
-            // SAFETY: fds from the config; stage-2 owns its own copies.
-            libc::close(fd);
-        }
-    }
+    // Drop every inherited descriptor except our result pipe. Stage-1 is a
+    // fork of the embedding process: without this it retains every fd the
+    // embedder had open, including other concurrent sandboxes' status and
+    // result pipe write ends. Holding those blocks their EOF detection
+    // until this sandbox exits — a deadlock when both payloads are
+    // long-lived (regression test RT22). This also removes the embedder's
+    // stdin/stdout/stderr and any unrelated host fds from the proxy.
+    close_fds_except(cfg.result_wr);
     // Tell the parent which pid to watch (the payload init).
     let notice = ChildError {
         stage: msg::PID2_NOTICE,
@@ -1137,6 +1206,33 @@ fn fail(cfg: &ChildConfig, stage: u8, errno: i32) -> ! {
 
 // ------------------------------------------------------- C4 hardening
 
+/// Closes every descriptor except `keep`. Used by stage-1 immediately after
+/// the stage-2 fork: the proxy must not retain any descriptor inherited from
+/// the embedding process (other sandboxes' pipes, the embedder's stdio,
+/// unrelated host fds). Best-effort by design: `close_range` is a
+/// doctor-gated platform requirement, and stage-2 fails closed if the
+/// syscall is unavailable before the payload can run.
+fn close_fds_except(keep: RawFd) {
+    if keep > 3 {
+        unsafe {
+            // SAFETY: close_range(3, keep-1, 0) closes our own inherited fds.
+            libc::syscall(libc::SYS_close_range, 3u32, (keep - 1) as u32, 0u32);
+        }
+    }
+    unsafe {
+        // SAFETY: close_range(keep+1, UINT_MAX, 0) closes the rest.
+        libc::syscall(libc::SYS_close_range, (keep + 1) as u32, u32::MAX, 0u32);
+    }
+    for fd in 0..3 {
+        if fd != keep {
+            unsafe {
+                // SAFETY: stdio fds we no longer need in the proxy.
+                libc::close(fd);
+            }
+        }
+    }
+}
+
 /// Closes every fd above 2 except the exec-status write end (still needed
 /// to report an exec failure): two close_range calls bracketing it. The
 /// payload inherits exactly {0,1,2}.
@@ -1240,7 +1336,9 @@ fn set_no_new_privs(cfg: &ChildConfig) {
 /// Landlock: deny-by-default across the whole filesystem; explicit grants:
 /// read-only /usr, /proc, /etc; read-write /work, /tmp, /dev/shm (POSIX
 /// shm/semaphores), and file-level write on /dev (only our four safe device
-/// nodes live there). ABI-aware; fails closed if the
+/// nodes live there). Writable grants include `EXECUTE` only when the spec
+/// opted in (`exec_on_write`); the default strict posture lets the payload
+/// write files but not run them. ABI-aware; fails closed if the
 /// kernel lacks Landlock (doctor gates this environment class, so an
 /// error here is a real anomaly, not noise).
 fn apply_landlock(cfg: &ChildConfig) {
@@ -1256,19 +1354,24 @@ fn apply_landlock(cfg: &ChildConfig) {
         Err(e) => fail(cfg, stage::LANDLOCK, e),
     };
     use carapace_sys::landlock::access_fs as fs;
+    let writable = if cfg.exec_on_write {
+        fs::RW_ALL
+    } else {
+        fs::RW_ALL_NO_EXEC
+    };
     let mut grants: Vec<(&[u8], u64)> = vec![
         (c"/usr".to_bytes_with_nul(), fs::RO),
         (c"/proc".to_bytes_with_nul(), fs::RO),
         (c"/etc".to_bytes_with_nul(), fs::RO),
         (c"/dev".to_bytes_with_nul(), fs::RW_FILES),
-        (c"/dev/shm".to_bytes_with_nul(), fs::RW_ALL),
-        (c"/work".to_bytes_with_nul(), fs::RW_ALL),
-        (c"/tmp".to_bytes_with_nul(), fs::RW_ALL),
+        (c"/dev/shm".to_bytes_with_nul(), writable),
+        (c"/work".to_bytes_with_nul(), writable),
+        (c"/tmp".to_bytes_with_nul(), writable),
     ];
     for b in &cfg.binds {
         grants.push((
             b.path.as_bytes_with_nul(),
-            if b.rw { fs::RW_ALL } else { fs::RO },
+            if b.rw { writable } else { fs::RO },
         ));
     }
     for (path, access) in grants {

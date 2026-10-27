@@ -12,6 +12,8 @@ pub mod bench;
 pub mod cgroup;
 pub mod child;
 pub mod doctor;
+#[cfg(test)]
+mod pdeathsig_test;
 pub mod seccomp_profile;
 mod supervisor;
 

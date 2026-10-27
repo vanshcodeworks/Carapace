@@ -158,6 +158,25 @@ fn etc_alternatives_work_when_host_has_them() {
     let (code, out, err) = sh_out("awk 'BEGIN { print \"awk-ok\" }' 2>&1");
     assert_eq!(code, 0, "awk (via /etc/alternatives) must run: {err}");
     assert!(out.contains("awk-ok"), "awk output: {out}");
+
+    // P1 narrowing: only symlinks are recreated; any regular file in the
+    // host directory (Ubuntu ships README) must not be visible.
+    let (code, out, err) = sh_out("find /etc/alternatives -maxdepth 1 -type f | wc -l");
+    assert_eq!(code, 0, "find failed: {err}");
+    assert_eq!(
+        out.trim(),
+        "0",
+        "no regular file from the host /etc/alternatives may be visible"
+    );
+    if std::fs::metadata("/etc/alternatives/README").is_ok() {
+        let (code, out, _) =
+            sh_out("test -e /etc/alternatives/README && echo visible || echo hidden");
+        assert_eq!(code, 0);
+        assert!(
+            out.contains("hidden"),
+            "host README was exposed through /etc/alternatives: {out}"
+        );
+    }
 }
 
 #[test]

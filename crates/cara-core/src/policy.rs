@@ -61,6 +61,7 @@ struct RawLimits {
 struct RawFs {
     read_only: Option<Vec<String>>,
     read_write: Option<Vec<String>>,
+    exec_on_write: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -86,6 +87,10 @@ pub struct Policy {
     pub read_only: Vec<std::path::PathBuf>,
     /// Extra host paths bind-mounted read-write and Landlock-granted.
     pub read_write: Vec<std::path::PathBuf>,
+    /// Allow `execve` on files in writable locations (`/work`, `/tmp`,
+    /// `/dev/shm`, read-write binds). Off by default and off in `strict`;
+    /// `dev` enables it for compile-and-run workflows.
+    pub exec_on_write: bool,
     pub network: NetworkMode,
     /// Runtime language hint (informational in v1).
     pub language: Option<String>,
@@ -119,6 +124,7 @@ impl Policy {
             },
             read_only: Vec::new(),
             read_write: Vec::new(),
+            exec_on_write: false,
             network: NetworkMode::None,
             language: None,
         }
@@ -137,6 +143,7 @@ impl Policy {
             },
             read_only: Vec::new(),
             read_write: Vec::new(),
+            exec_on_write: true,
             network: NetworkMode::None,
             language: None,
         }
@@ -215,6 +222,9 @@ impl Policy {
                 .map(|p| validate_host_path(p, true))
                 .collect::<Result<Vec<_>, _>>()?;
         }
+        if let Some(allow) = raw.filesystem.exec_on_write {
+            policy.exec_on_write = allow;
+        }
         if let Some(mode) = raw.network.mode {
             policy.network = match mode.as_str() {
                 "none" => NetworkMode::None,
@@ -256,6 +266,7 @@ impl Policy {
         spec.limits = self.limits.clone();
         spec.read_only = self.read_only.clone();
         spec.read_write = self.read_write.clone();
+        spec.exec_on_write = self.exec_on_write;
         spec.network = self.network.clone();
         spec.env.insert("PATH".into(), DEFAULT_PATH.into());
         spec.env.insert("HOME".into(), "/work".into());
@@ -307,6 +318,15 @@ impl Policy {
                 out.push_str(&format!(" {}", p.display()));
             }
             out.push_str("  (everything else on the host stays invisible)\n");
+        }
+        if self.exec_on_write {
+            out.push_str(
+                "  - EXECUTE permission on files written to /work, /tmp, /dev/shm and read-write binds\n",
+            );
+        } else {
+            out.push_str(
+                "  - NO execute permission on files written to /work, /tmp, /dev/shm or read-write binds\n",
+            );
         }
         match &self.network {
             NetworkMode::None => out.push_str("  - NO network access at all\n"),
@@ -538,6 +558,7 @@ language = "python3.12"
         assert_eq!(p.limits.scratch_bytes, 64 * 1000 * 1000);
         assert_eq!(p.limits.max_output_bytes, 1000 * 1000);
         assert_eq!(p.network, NetworkMode::None);
+        assert!(!p.exec_on_write, "strict must not execute written files");
         assert_eq!(p.read_only, vec![std::path::PathBuf::from("/usr")]);
         assert_eq!(p.language.as_deref(), Some("python3.12"));
     }
@@ -562,6 +583,12 @@ language = "python3.12"
         let dev = Policy::dev();
         assert!(dev.limits.memory_bytes > strict.limits.memory_bytes);
         assert!(dev.limits.timeout > strict.limits.timeout);
+        assert!(!strict.exec_on_write, "strict must deny exec-on-write");
+        assert!(dev.exec_on_write, "dev enables compile-and-run workflows");
+        assert!(
+            Policy::network_light().exec_on_write,
+            "network-light inherits the dev posture"
+        );
         assert_eq!(
             Policy::network_light().network,
             NetworkMode::Allowlist(vec![])
@@ -648,5 +675,27 @@ language = "python3.12"
         assert_eq!(spec.args.len(), 2);
         assert_eq!(spec.env.get("PATH").unwrap(), DEFAULT_PATH);
         assert_eq!(spec.env.get("HOME").unwrap(), "/work");
+        assert!(!spec.exec_on_write);
+    }
+
+    #[test]
+    fn exec_on_write_is_explicit_and_explained() {
+        // Off by default, off in strict, on in dev.
+        assert!(!Policy::strict().exec_on_write);
+        assert!(Policy::dev().exec_on_write);
+
+        // Explicit opt-in parses; it must be a boolean, not a string.
+        let p = Policy::parse("[filesystem]\nexec_on_write = true\n").unwrap();
+        assert!(p.exec_on_write);
+        assert!(p.explain().contains("EXECUTE permission"));
+        assert!(Policy::parse("[filesystem]\nexec_on_write = \"yes\"\n").is_err());
+
+        // The default explanation states the denial explicitly, so a policy
+        // reader cannot miss it.
+        let e = Policy::strict().explain();
+        assert!(
+            e.contains("NO execute permission on files written"),
+            "strict explain must state exec-on-write denial:\n{e}"
+        );
     }
 }

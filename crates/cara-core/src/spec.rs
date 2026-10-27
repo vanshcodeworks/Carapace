@@ -27,6 +27,13 @@ pub struct SandboxSpec {
     pub read_only: Vec<PathBuf>,
     /// Extra host paths to bind read-write (Landlock-granted).
     pub read_write: Vec<PathBuf>,
+    /// Allow executing files from writable locations: the `/work`, `/tmp`
+    /// and `/dev/shm` mounts and every read-write bind. Default `false`:
+    /// a payload may write and read files there, but `execve` on them is
+    /// denied by Landlock. This is an explicit security decision, not a
+    /// runtime- compatibility detail: `true` lets a payload execute code
+    /// it just wrote (compile-and-run workflows need it).
+    pub exec_on_write: bool,
     /// Network access mode.
     pub network: NetworkMode,
 }
@@ -41,6 +48,7 @@ impl SandboxSpec {
             limits: Limits::default(),
             read_only: Vec::new(),
             read_write: Vec::new(),
+            exec_on_write: false,
             network: NetworkMode::None,
         }
     }
@@ -62,6 +70,13 @@ impl SandboxSpec {
 
     pub fn max_output(mut self, bytes: usize) -> Self {
         self.limits.max_output_bytes = bytes;
+        self
+    }
+
+    /// Opt in (or out) of executing files from writable locations. Off by
+    /// default; see [`SandboxSpec::exec_on_write`].
+    pub fn exec_on_write(mut self, allowed: bool) -> Self {
+        self.exec_on_write = allowed;
         self
     }
 }
@@ -115,6 +130,7 @@ mod tests {
         assert_eq!(s.env.get("CARA_RUN_ID").unwrap(), "t1");
         assert_eq!(s.limits.timeout, Duration::from_millis(250));
         assert_eq!(s.limits.max_output_bytes, 1024);
+        assert!(!s.exec_on_write, "writable execution must default to off");
     }
 
     #[test]

@@ -13,7 +13,7 @@ Run inside the Linux dev environment:
 The script bridges itself through `systemd-run --user --scope` when cgroup
 delegation is not in the current session (WSL), and skips cleanly when
 `cara doctor` says the environment cannot isolate. Optional runtimes
-(node, gcc, rustc) are skipped when absent.
+(node, gcc, rustc, go, jvm) are skipped when absent.
 """
 import json
 import os
@@ -142,13 +142,18 @@ else:
 workdir = tempfile.mkdtemp(prefix="cara-rtm-")
 policy = os.path.join(workdir, "policy.toml")
 with open(policy, "w") as f:
+    # `dev` opts into executing files written to the rw bind
+    # (filesystem.exec_on_write = true). The default/strict posture
+    # deliberately denies write-then-exec (escape catalog:
+    # write_then_exec); compile-and-run needs the explicit opt-in.
+    f.write('preset = "dev"' + NL)
     f.write("[filesystem]" + NL + f'read_write = ["{workdir}"]' + NL)
 
 
-def run_policy(argv):
+def run_policy(argv, timeout=60):
     # --policy goes BEFORE the `--` separator.
     p2 = subprocess.run([CARA, "run", "--policy", policy, "--json", "--"] + argv,
-                        capture_output=True, timeout=60)
+                        capture_output=True, timeout=timeout)
     try:
         return json.loads(p2.stdout)
     except json.JSONDecodeError:
@@ -185,6 +190,64 @@ try:
               r["stderr"][:150])
     else:
         skip("gcc-compile-run", "no /usr/bin/gcc")
+
+    # go: compile and run a goroutine program inside the sandbox. Go's
+    # runtime is a different syscall profile than C/Python (clone with
+    # CLONE_VM, futex, epoll, membarrier, sched_yield), so this is a real
+    # seccomp test rather than a version banner.
+    go = shutil.which("go")
+    if go and go.startswith("/usr/"):
+        src = os.path.join(workdir, "rtm.go")
+        out = os.path.join(workdir, "go-bin")
+        with open(src, "w") as f:
+            f.write('package main' + NL + NL
+                    + 'import (' + NL
+                    + '    "fmt"' + NL
+                    + '    "sync"' + NL
+                    + ')' + NL + NL
+                    + 'func main() {' + NL
+                    + '    var wg sync.WaitGroup' + NL
+                    + '    out := make([]int, 4)' + NL
+                    + '    for i := range out {' + NL
+                    + '        wg.Add(1)' + NL
+                    + '        go func(i int) { defer wg.Done(); out[i] = i * i }(i)' + NL
+                    + '    }' + NL
+                    + '    wg.Wait()' + NL
+                    + '    fmt.Println("go-ok", out)' + NL
+                    + '}' + NL)
+        bash = ("export GO111MODULE=off GOCACHE=%s/gocache GOPATH=%s/gopath "
+                "GOTMPDIR=%s TMPDIR=%s; %s build -o %s %s && %s"
+                % (workdir, workdir, workdir, workdir, go, out, src, out))
+        r = run_policy(["/bin/bash", "-c", bash], timeout=180)
+        check("go-build-run", r["exit_code"] == 0 and "go-ok [0 1 4 9]" in r["stdout"],
+              (r["stderr"][:200] or r["stdout"][:120]))
+    else:
+        skip("go-build-run", "no /usr/bin/go")
+
+    # jvm: javac then java, with a real thread. Exercises the alternatives
+    # chain (/usr/bin/java -> /etc/alternatives -> /usr/lib/jvm), class
+    # loading, and the JVM's futex/mmap/thread syscalls.
+    javac = shutil.which("javac")
+    java = shutil.which("java")
+    if javac and java and javac.startswith("/usr/") and java.startswith("/usr/"):
+        src = os.path.join(workdir, "Rtm.java")
+        with open(src, "w") as f:
+            f.write('public class Rtm {' + NL
+                    + '    public static void main(String[] args) throws Exception {' + NL
+                    + '        Thread t = new Thread(() -> System.out.println("jvm-thread-ok"));' + NL
+                    + '        t.start();' + NL
+                    + '        t.join();' + NL
+                    + '        System.out.println("jvm-ok");' + NL
+                    + '    }' + NL
+                    + '}' + NL)
+        bash = ("%s -d %s %s && %s -XX:-UsePerfData -Djava.io.tmpdir=%s "
+                "-cp %s Rtm" % (javac, workdir, src, java, workdir, workdir))
+        r = run_policy(["/bin/bash", "-c", bash], timeout=180)
+        check("jvm-compile-run",
+              r["exit_code"] == 0 and "jvm-thread-ok" in r["stdout"] and "jvm-ok" in r["stdout"],
+              (r["stderr"][:200] or r["stdout"][:120]))
+    else:
+        skip("jvm-compile-run", "no javac/java under /usr")
 
     # rust binary: built on the host with rustc, run inside via the same bind
     rs = os.path.join(workdir, "rtm.rs")

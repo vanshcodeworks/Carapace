@@ -31,7 +31,14 @@ pub fn render_human(report: &DoctorReport) -> String {
         if let Some(r) = &c.remedy
             && matches!(c.status, Status::Fail | Status::Warn)
         {
-            out.push_str(&format!("      fix: {r}\n"));
+            let mut lines = r.lines();
+            if let Some(first) = lines.next() {
+                out.push_str(&format!("      fix: {first}\n"));
+            }
+            // Continuation lines align with the text after "fix: ".
+            for line in lines {
+                out.push_str(&format!("           {line}\n"));
+            }
         }
     }
     out.push('\n');
@@ -58,6 +65,20 @@ mod tests {
         let s = render_human(&r);
         assert!(s.contains("READY"));
         assert!(!s.contains("NOT READY"));
+    }
+
+    #[test]
+    fn multiline_remedy_is_indented_and_complete() {
+        let r = DoctorReport::new(vec![Check::fail(
+            "userns",
+            "User namespaces",
+            "denied",
+            "line one\nline two\nUpstream: https://example.invalid/doc",
+        )]);
+        let s = render_human(&r);
+        assert!(s.contains("      fix: line one\n"));
+        assert!(s.contains("           line two\n"));
+        assert!(s.contains("           Upstream: https://example.invalid/doc\n"));
     }
 
     #[test]
