@@ -480,6 +480,53 @@ fn rt_concurrent_sandboxes_isolated() {
     }
 }
 
+/// RT22: concurrent long-running sandboxes must not deadlock. Stage-1 is a
+/// fork of the embedding process, so it inherits every open descriptor. If
+/// it keeps them, a long-lived stage-1 holds another sandbox's status/result
+/// pipe write ends; that sandbox's `spawn` then blocks on EOF *before* its
+/// timeout can start. Four infinite payloads with a 1 s timeout must all
+/// return `Timeout` well inside the watchdog window.
+#[test]
+fn rt_concurrent_long_running_sandboxes_do_not_deadlock() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    const N: usize = 4;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(N + 1));
+    let (tx, rx) = std::sync::mpsc::channel();
+    for i in 0..N {
+        let barrier = std::sync::Arc::clone(&barrier);
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            let spec = SandboxSpec::new("/bin/sh")
+                .args(["-c", "while :; do :; done"])
+                .env("PATH", "/usr/bin:/bin")
+                .timeout(Duration::from_secs(1));
+            let r = match NativeBackend::new().spawn(&spec) {
+                Ok(mut h) => h.wait(),
+                Err(e) => Err(e),
+            };
+            let _ = tx.send((i, r));
+        });
+    }
+    drop(tx);
+    barrier.wait();
+    for _ in 0..N {
+        let (i, r) = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("concurrent sandboxes deadlocked: no result within 30s");
+        let r = r.expect("wait");
+        assert_eq!(
+            r.kill_reason,
+            Some(KillReason::Timeout),
+            "sandbox {i} did not time out: {r:?}"
+        );
+    }
+}
+
 /// RT18: resource leaks across many sequential runs — fd count and memory
 /// must return to baseline (close_range + Drop hygiene).
 #[test]

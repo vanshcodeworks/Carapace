@@ -272,6 +272,17 @@ fn verify(e: &EscapeTest, r: &ExitReport) {
                 "host /usr/pwned must not exist"
             );
         }
+        "write_then_exec" => {
+            let out = combined_of(r);
+            assert!(
+                !out.contains("CARA-WRITE-THEN-EXEC-ESCAPED"),
+                "a file written to /work must not be executable under strict: {out}"
+            );
+            assert!(
+                out.contains("Permission denied") || out.contains("rc=126"),
+                "execve must fail with EACCES on the writable area: {out}"
+            );
+        }
         "symlink_escape" => {
             assert_eq!(r.exit_code, Some(0), "the link must resolve: {r:?}");
             let out = stdout_of(r);
@@ -477,6 +488,7 @@ escape_cases!(
     read_shadow,
     read_home,
     write_outside,
+    write_then_exec,
     symlink_escape,
     proc_escape,
     ptrace_attempt,
@@ -489,6 +501,28 @@ escape_cases!(
     fd_leak_scan,
     env_leak,
 );
+
+/// Positive control for `write_then_exec`: the same payload succeeds when
+/// the spec explicitly opts in (`exec_on_write = true`), proving the
+/// denial above is the policy field and not an unrelated failure.
+#[test]
+fn write_then_exec_allowed_when_spec_opts_in() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let entry = Catalog::get("write_then_exec").expect("catalog entry");
+    let spec = spec_for(entry).exec_on_write(true);
+    let mut h = b.spawn(&spec).expect("sandbox spawn must succeed");
+    let r = h.wait().expect("sandbox wait must succeed");
+    assert_eq!(r.exit_code, Some(0), "payload failed: {r:?}");
+    assert!(
+        String::from_utf8_lossy(&r.stdout).contains("CARA-WRITE-THEN-EXEC-ESCAPED"),
+        "exec-on-write opt-in must allow running the written file: {r:?}"
+    );
+    assert_no_payload_processes(entry.payload);
+}
 
 #[test]
 fn catalog_and_suite_stay_in_sync() {

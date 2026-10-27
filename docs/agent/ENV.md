@@ -15,6 +15,8 @@ measured or performed by the agent on 2026-10-24/25 and is the basis for
 | init | systemd 255 (255.4-1ubuntu8.17) as PID 1 |
 | Dev user | `dev` (uid 1000), created manually; passwordless sudo via /etc/sudoers.d/dev |
 | Rust | 1.99.1 stable (rustup, minimal profile + clippy + rustfmt) |
+| Go | 1.22.2 (`golang-go`, Ubuntu package) |
+| OpenJDK | 21.0.12.1 (`openjdk-21-jdk-headless`, Ubuntu package) |
 
 The repository lives on the Windows mount (`/mnt/p/Carapace` in WSL). Builds
 run inside WSL with `CARGO_TARGET_DIR=$HOME/.cache/carapace-target` (ext4) so
@@ -42,7 +44,8 @@ artifacts never touch the slow DrvFs mount — see `scripts/check.sh`.
 2. rustup nightly (profile minimal, for cargo-fuzz); `cargo install
    cargo-fuzz --locked`; `cargo install cargo-audit cargo-deny --locked`
    (P0, cycle 12).
-3. apt: `nodejs npm` (P2 runtime matrix, cycle 13).
+3. apt: `nodejs npm` (P2 runtime matrix, cycle 13); `golang-go
+   openjdk-21-jdk-headless` (P2 Go/JVM columns, cycle 14).
 4. apt: `build-essential curl git pkg-config libseccomp-dev libseccomp2
    ca-certificates uidmap fuse3`.
 5. rustup for user `dev` (stable toolchain).

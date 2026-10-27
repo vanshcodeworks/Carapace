@@ -50,6 +50,20 @@ mod tests {
     }
 
     #[test]
+    fn strict_writable_grant_denies_execute() {
+        assert_eq!(access_fs::RW_ALL_NO_EXEC & access_fs::EXECUTE, 0);
+        assert_ne!(
+            access_fs::RW_ALL_NO_EXEC & access_fs::WRITE_FILE,
+            0,
+            "strict must still allow writing"
+        );
+        assert_eq!(
+            access_fs::RW_ALL & !access_fs::EXECUTE,
+            access_fs::RW_ALL_NO_EXEC
+        );
+    }
+
+    #[test]
     fn strict_env_has_landlock() {
         // Hard environment assertion, but only when the developer opted in
         // via CARA_STRICT_ENV_TESTS (set by scripts/check.sh on the reference
@@ -88,10 +102,10 @@ pub mod access_fs {
     /// ABI 3 (kernel 6.2+): truncate.
     pub const TRUNCATE: u64 = 1 << 14;
     /// Everything an unprivileged program may plausibly need in /work.
-    /// EXECUTE included: compile-and-run workflows exec binaries the
-    /// payload itself wrote — no privilege boundary is crossed (caps
-    /// dropped, no_new_privs set). Found by the P2 runtime matrix
-    /// (rust-binary/gcc EPERM at execve from rw binds).
+    /// EXECUTE included: the `dev` posture and explicit
+    /// `filesystem.exec_on_write = true` opt in to compile-and-run
+    /// workflows that exec binaries the payload itself wrote. This is NOT
+    /// the default: under `strict` use [`RW_ALL_NO_EXEC`].
     pub const RW_ALL: u64 = EXECUTE
         | WRITE_FILE
         | READ_FILE
@@ -105,6 +119,11 @@ pub mod access_fs {
         | MAKE_SYM
         | REFER
         | TRUNCATE;
+    /// Writable-area rights WITHOUT `EXECUTE` (the default/strict posture):
+    /// a payload can create, read, modify and delete files, but cannot
+    /// execute anything it wrote into /work, /tmp, /dev/shm or a
+    /// read-write bind.
+    pub const RW_ALL_NO_EXEC: u64 = RW_ALL & !EXECUTE;
     /// Read-only access.
     pub const RO: u64 = EXECUTE | READ_FILE | READ_DIR;
     /// Read + write files (no creation/removal) — e.g. /dev/null.

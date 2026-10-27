@@ -10,6 +10,7 @@ use carapace_core::spec::SandboxSpec;
 use carapace_sys::fork;
 use std::io::Read;
 use std::os::unix::io::{FromRawFd, RawFd};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -251,6 +252,10 @@ pub(crate) fn spawn(spec: &SandboxSpec) -> Result<NativeSandbox, BackendError> {
             .as_slice()
             .to_vec(),
         binds: binds_for(spec),
+        alternatives: plan_alternatives(std::path::Path::new("/etc/alternatives")),
+        exec_on_write: spec.exec_on_write,
+        #[cfg(test)]
+        pdeathsig_hook_fd: test_pdeathsig_hook_fd(),
     });
     let config_ptr = Box::into_raw(config) as *mut libc::c_void;
 
@@ -515,19 +520,147 @@ fn unshare_flags_for(network: &carapace_core::NetworkMode) -> libc::c_int {
 /// CStrings; existence re-checked where it matters).
 fn binds_for(spec: &SandboxSpec) -> Vec<crate::child::BindSpec> {
     let mut out = Vec::new();
-    let mut push = |p: &std::path::Path, rw: bool| {
+    for (p, rw) in spec
+        .read_only
+        .iter()
+        .map(|p| (p, false))
+        .chain(spec.read_write.iter().map(|p| (p, true)))
+    {
         if let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) {
             out.push(crate::child::BindSpec { path: c, rw });
         }
-    };
-    for p in &spec.read_only {
-        push(p, false);
-    }
-    for p in &spec.read_write {
-        push(p, true);
     }
     out.truncate(16); // child-side buffer budget
+    for p in plan_security_configs(
+        std::path::Path::new("/usr/lib/jvm"),
+        std::path::Path::new("/etc"),
+    ) {
+        if let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) {
+            out.push(crate::child::BindSpec { path: c, rw: false });
+        }
+    }
     out
+}
+
+/// Debian/Ubuntu OpenJDK keeps `conf/security/java.security` in `/usr` as a
+/// symlink into `/etc/java-<v>-openjdk/security`. The sandbox does not expose
+/// host `/etc`, so the JVM refuses to start ("Error loading java.security
+/// file") without this one directory.
+///
+/// Security rule, mirroring `/etc/alternatives`: expose a directory only
+/// when a JVM inside the mounted `/usr` tree actually links to it, and only
+/// the canonical `security` directory itself — never `/etc/java-*` as a
+/// whole. The files are world-readable crypto policy (`java.security`,
+/// `java.policy`, `default.policy`, `blocked.certs`,
+/// `public_suffix_list.dat`, `nss.cfg`), mounted read-only and also denied
+/// for writes by Landlock. Everything else under the host's `/etc` stays
+/// invisible.
+fn plan_security_configs(jvm_root: &std::path::Path, etc_root: &std::path::Path) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let Ok(entries) = std::fs::read_dir(jvm_root) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let link = entry.path().join("conf/security/java.security");
+        let Ok(target) = std::fs::canonicalize(&link) else {
+            continue;
+        };
+        if !target.starts_with(etc_root) {
+            continue;
+        }
+        let Some(dir) = target.parent() else {
+            continue;
+        };
+        if dir.file_name().and_then(|n| n.to_str()) != Some("security") {
+            continue;
+        }
+        if !dir.join("java.security").is_file() {
+            continue;
+        }
+        if !out.iter().any(|p| p == dir) {
+            out.push(dir.to_path_buf());
+        }
+    }
+    out.sort();
+    out
+}
+
+/// `/etc/alternatives` entries to recreate, parent-side. Security rule:
+/// only symlinks whose resolved target is under `/usr` are exposed, and
+/// only the canonical target is recreated (never a bind mount). That drops
+/// regular files in the host directory (Ubuntu ships `README`) and any
+/// symlink that leaves the read-only runtime tree. Non-Debian hosts simply
+/// yield an empty list.
+fn plan_alternatives(base: &std::path::Path) -> Vec<crate::child::AltLink> {
+    use std::os::unix::ffi::OsStrExt;
+    const MAX_LINKS: usize = 256;
+    const MAX_NAME: usize = 180;
+    const MAX_TARGET: usize = 300;
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        if out.len() == MAX_LINKS {
+            break;
+        }
+        if !entry.file_type().is_ok_and(|t| t.is_symlink()) {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name_str) = name.to_str() else {
+            continue;
+        };
+        if name_str.is_empty()
+            || name_str == "."
+            || name_str == ".."
+            || name_str.contains('/')
+            || name_str.len() > MAX_NAME
+        {
+            continue;
+        }
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let resolved = if target.is_absolute() {
+            target
+        } else {
+            base.join(target)
+        };
+        let Ok(canonical) = std::fs::canonicalize(resolved) else {
+            continue; // dangling alternative: nothing usable to expose
+        };
+        if canonical == std::path::Path::new("/usr") || !canonical.starts_with("/usr") {
+            continue;
+        }
+        let bytes = canonical.as_os_str().as_bytes();
+        if bytes.len() > MAX_TARGET {
+            continue;
+        }
+        let (Ok(name_c), Ok(target_c)) = (
+            std::ffi::CString::new(name_str),
+            std::ffi::CString::new(bytes),
+        ) else {
+            continue;
+        };
+        out.push(crate::child::AltLink {
+            name: name_c,
+            target: target_c,
+        });
+    }
+    out.sort_by(|a, b| a.name.as_bytes().cmp(b.name.as_bytes()));
+    out
+}
+
+/// Test-only env plumbing for the forced PDEATHSIG interleaving test. The
+/// release build does not read this variable at all (the field is
+/// `cfg(test)`), so a user cannot enable the pause hook.
+#[cfg(test)]
+fn test_pdeathsig_hook_fd() -> RawFd {
+    std::env::var("CARA_PDEATHSIG_FD")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(-1)
 }
 
 fn release_config(p: *mut libc::c_void) {
@@ -930,6 +1063,102 @@ impl Drop for NativeSandbox {
             libc::close(self.overflow_rd);
         }
         rm_staging_dir(&self.staging_dir);
+    }
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+    use super::*;
+
+    #[test]
+    fn alternatives_planner_exposes_only_usr_symlinks() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "cara-alt-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir(&base).expect("temp base");
+        symlink("/usr/bin/sh", base.join("ok")).expect("symlink ok");
+        symlink("../../usr/bin/sh", base.join("relative-ok")).expect("symlink rel");
+        symlink("/etc/passwd", base.join("outside")).expect("symlink outside");
+        symlink("/usr/bin/cara-definitely-missing", base.join("dangling"))
+            .expect("symlink dangling");
+        std::fs::write(base.join("README"), b"not a symlink").expect("regular file");
+
+        let links = plan_alternatives(&base);
+        let names: Vec<&str> = links.iter().map(|l| l.name.to_str().unwrap()).collect();
+        assert_eq!(
+            names,
+            vec!["ok", "relative-ok"],
+            "only /usr-resolving symlinks may be exposed"
+        );
+        for l in &links {
+            let target = l.target.to_str().unwrap();
+            assert!(
+                target.starts_with("/usr/"),
+                "target must be canonical under /usr: {target}"
+            );
+        }
+        std::fs::remove_dir_all(&base).ok();
+    }
+
+    /// Debian/Ubuntu OpenJDK config: only the canonical `security`
+    /// directory that an in-tree JVM actually links to may be exposed.
+    /// Foreign targets, regular files and dangling links are dropped.
+    #[test]
+    fn security_planner_exposes_only_referenced_etc_security_dirs() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!(
+            "cara-jvm-plan-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let jvm = base.join("usr/lib/jvm");
+        let etc = base.join("etc");
+        let good = etc.join("java-21-openjdk/security");
+        std::fs::create_dir_all(&good).expect("etc security dir");
+        std::fs::write(good.join("java.security"), b"# policy").expect("java.security");
+
+        let linked = jvm.join("openjdk-21/conf/security");
+        std::fs::create_dir_all(&linked).expect("jvm conf dir");
+        symlink(good.join("java.security"), linked.join("java.security")).expect("good link");
+
+        // A JVM whose config resolves under /usr is not an /etc exposure.
+        let share = base.join("usr/share/security");
+        std::fs::create_dir_all(&share).expect("share dir");
+        std::fs::write(share.join("java.security"), b"# usr").expect("share file");
+        let foreign = jvm.join("openjdk-17/conf/security");
+        std::fs::create_dir_all(&foreign).expect("foreign dir");
+        symlink(share.join("java.security"), foreign.join("java.security")).expect("foreign link");
+
+        // A regular file at the expected path is not a distro config link.
+        let regular = jvm.join("openjdk-11/conf/security");
+        std::fs::create_dir_all(&regular).expect("regular dir");
+        std::fs::write(regular.join("java.security"), b"# regular").expect("regular file");
+
+        // Dangling link must not abort the scan.
+        let dangling = jvm.join("openjdk-8/conf/security");
+        std::fs::create_dir_all(&dangling).expect("dangling dir");
+        symlink(
+            etc.join("java-8-openjdk/security/java.security"),
+            dangling.join("java.security"),
+        )
+        .expect("dangling link");
+
+        let got = plan_security_configs(&jvm, &etc);
+        assert_eq!(
+            got,
+            vec![std::fs::canonicalize(&good).expect("canonical good")],
+            "only the referenced /etc security dir may be exposed"
+        );
+        std::fs::remove_dir_all(&base).ok();
     }
 }
 

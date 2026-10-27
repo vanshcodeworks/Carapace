@@ -79,11 +79,14 @@ ever create — stage-1 has no descendants yet.
 2. denies `setgroups`, writes `uid_map`/`gid_map` (`0` → parent uid/gid,
    captured *before* the fork because `getuid()` is meaningless inside the
    new userns until the map exists),
-3. forks **stage 2**, then becomes a proxy: it closes every child-facing fd
-   except the result pipe, sends the payload pid, waits for stage 2, and
+3. forks **stage 2**, then becomes a proxy: it closes **every inherited
+   descriptor except the result pipe** (via `close_range`, not only the
+   child-facing fds), sends the payload pid, waits for stage 2, and
    forwards the raw wait status. It never execs — so it must close fds
-   manually (CLOEXEC would never fire); skipping this deadlocks the
-   supervisor once the payload fills its stdout pipe.
+   manually (CLOEXEC would never fire). Closing only its own config fds is
+   not enough: in an embedder running several sandboxes, stage-1 would hold
+   another run's pipe write ends and block that run's EOF detection until
+   this one exits (RT22).
 
 **Stage 2 — pid-namespace init.** Being init of a fresh PID namespace is
 the primary kill guarantee (ADR-0002): when it dies, the kernel SIGKILLs
@@ -146,7 +149,7 @@ Two pipes with unambiguous ownership:
 | Pipe | Owner | Semantics |
 |---|---|---|
 | status pipe | stage 2 | CLOEXEC write end. **EOF = exec happened** (the payload is running). A `ChildError {stage, errno}` (8 bytes, `#[repr(C)]`, size asserted) = pre-exec failure at a named stage → the supervisor returns a `Setup` error and the payload never ran |
-| result pipe | stage 1 | Message 1: payload pid (20). Message 2: forwarded wait status (21). Stage 1 closes all other fds so the parent's EOF detection only depends on stage 2 |
+| result pipe | stage 1 | Message 1: payload pid (20). Message 2: forwarded wait status (21). Stage 1 closes every inherited fd except the result pipe, so the parent's EOF detection only depends on stage 2 |
 
 After the handshake the supervisor `pidfd_open`s the payload init (ESRCH on
 an instantly-exiting payload is handled as "already finished", not an

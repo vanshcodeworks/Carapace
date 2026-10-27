@@ -13,15 +13,14 @@ test or measurement in this repository currently demonstrates it.
    parsers). Verify by: running a syscall fuzzer (e.g. a targeted syskaller
    subset) inside the sandbox against the ~140-syscall allowlist.
    TODO(verify).
-2. **Seccomp allowlist completeness for Go and JVM runtimes is unproven.**
-   The P2 runtime matrix now covers bash/coreutils, Python (stdlib,
-   threads, multiprocessing), Node (JSON + worker_threads), gcc
-   compile-and-run, and host-built Rust binaries — 15/15 on the reference
-   env. Still untested: Go (thread creation via clone with larger flag
-   sets; `clone3` with fallback) and JVM-style runtimes. Risk: one of them
-   hits an unexpected EPERM and agent users see failures. Verify by:
-   adding Go/JVM cases to `scripts/runtime-matrix.py` (CARA_SECCOMP_LOG
-   profiling for any denial).
+2. ~~**Seccomp allowlist completeness for Go and JVM runtimes is unproven.**~~
+   **DONE (cycle 14).** `scripts/runtime-matrix.py` now has `go-build-run`
+   (build + goroutines) and `jvm-compile-run` (javac + threaded Java):
+   **17 passed, 0 failed, 0 skipped** in strict mode on the reference env.
+   Dev logging (`CARA_SECCOMP_LOG=1`) produced 20 audit records covering 6
+   distinct syscalls not in the allowlist; none was required, and each is
+   reviewed in ADR-0008. Zero syscalls were added. Remaining scope: other
+   distro/kernel/JDK layouts (R2.11, R2.12).
 3. **Landlock ruleset vs. bind-mount interaction under concurrent rule
    paths is unproven.** The rw/ro bind + Landlock grant lists are built
    from the same paths, but no test drives rename(2) BETWEEN two
@@ -49,41 +48,65 @@ test or measurement in this repository currently demonstrates it.
 7. **musl static build** — documented as a recipe (docs/release.md) with
    explicit TODO(verify); wasmtime/masa deps may not compile for musl.
    Never attempted.
-8. **Non-merged-/usr and non-systemd hosts**: doctor requires /usr/bin/sh,
-   /usr/lib, /usr/lib64 and a systemd user slice for delegation. Debian
-   with separate /usr, Alpine (musl + OpenRC), and sysvinit hosts are
-   undetected-and-untested; doctor would fail with the merged-usr message,
-   which is fail-closed but possibly misleading on those layouts. Verify
-   by: P1 compat matrix in VMs/containers.
-9. **cgroup v1 / hybrid hosts**: doctor checks `is_cgroup2_mount` and
-   fails closed, but the *remedy text* for a v1 host ("systemd defaults
-   to it") is untested and may not cover e.g. Debian 10-era hosts.
-   Verify by: P1 (VM with hybrid hierarchy).
-10. **PDEATHSIG across the two-stage fork under every exec path**: stage-1
-    sets PR_SET_PDEATHSIG before parking. `fork(2)` clears the attribute
-    for the child, so stage-2 re-arms SIGKILL immediately after the fork
-    and checks that stage-1 still exists via the host `/proc` (the fresh
-    sandbox procfs is not mounted yet). RT16 covers the main path: a
-    SIGKILLed supervisor leaves no orphan payload. What is NOT tested: a
-    targeted "kill in the microsecond window" loop between the fork and
-    stage-2's prctl — the liveness check closes it in code, but no test
-    forces that interleaving. Verify by: P5 loop test (spawn + instant
-    kill, 1000 iterations).
+8. **Non-merged-/usr and non-systemd hosts**: doctor now detects the
+   merged-usr requirement, non-systemd PID 1 and missing delegation, and
+   prints exact remedies (simulated-environment tests). No real
+   non-merged-/usr, Alpine/OpenRC or sysvinit host has been tested; only
+   the WSL2 Ubuntu 24.04 reference env was available. The failure is
+   fail-closed, but the remedy text may not match every layout. Verify by:
+   booting such a host/VM and running `cara doctor`.
+9. **cgroup v1 / hybrid hosts**: doctor now distinguishes v1-only, hybrid
+   with required controllers, hybrid without them, and missing
+   delegation; the classification and remedies are unit-tested with
+   simulated facts. No real v1/hybrid host has been tested. Verify by: a
+   VM with a hybrid hierarchy.
+10. ~~**PDEATHSIG across the two-stage fork under every exec path**~~ **DONE
+    (cycle 14).** The fork→PDEATHSIG window is now forced deterministically:
+    a `cfg(test)`-only pause hook in stage-2 plus a re-executed helper test
+    (`forced_pdeathsig_race_never_execs_payload`) kill stage-1 inside the
+    window and assert the payload never execs. Release builds cannot enable
+    the hook. RT16 still covers the end-to-end SIGKILL path.
+11. **Other distro/kernel environments are untested.** Every measurement
+    in this repository comes from one environment: WSL2, kernel
+    6.18.54.1-microsoft-standard-WSL2, Ubuntu 24.04.5, x86_64, systemd
+    user slice. No Docker daemon and no VM images are available here, so
+    Debian, Fedora, Arch, Alpine/musl, non-systemd, aarch64 and older
+    kernels (5.10/5.13/5.15 LTS) have never run the suite. Do not treat
+    any distro as supported until its row is measured. Verify by: booting
+    each target (VM or container with userns/cgroup delegation) and
+    running `scripts/check.sh`.
+12. **JVM security-config layout variants are untested.** The JVM column
+    passes on Ubuntu 24.04 OpenJDK 21, whose `conf/security/java.security`
+    links into `/etc/java-21-openjdk/security`; the planner exposes only
+    that canonical directory (ADR-0007 §8). Fedora/Arch-style JDKs that
+    keep the file under `/usr` need no bind and are expected to work, but
+    were not measured. Other JDK vendors/versions may ship additional
+    files in the `security` directory; the bind is read-only and Landlock
+    grants read-only, but the exact file set is not audited. Verify by:
+    adding those images to the matrix.
+13. **Doctor remedies are simulated, never applied.** Every blocker class
+    (AppArmor userns, sysctl userns, cgroup v1/hybrid, missing delegation,
+    non-merged-/usr, missing Landlock/seccomp/pidfd/close_range) is tested
+    against synthetic `Facts` and the printed text is asserted; no real
+    host in that broken state was remediated and re-measured. The
+    commands and upstream URLs were verified to exist, not executed.
+    Verify by: snapshot a VM, break one capability at a time, apply the
+    printed remedy, and re-run `cara doctor`.
 
 ## R3 — Low risk (docs/ergonomics, unproven)
 
-11. **docs/mcp.md client config JSON** was written from the MCP spec shape,
+14. **docs/mcp.md client config JSON** was written from the MCP spec shape,
     not validated against current Claude Desktop / Cursor docs. Verify by:
     reading both products' current documentation (P3).
-12. **Benchmark comparability** (bubblewrap/nsjail/Docker) — never run;
+15. **Benchmark comparability** (bubblewrap/nsjail/Docker) — never run;
     docs make no comparative claims (correct). Verify by: P4 on the same
     machine with installable tools.
-13. **SBOM tooling output** (`cargo cyclonedx`) — command documented, never
+16. **SBOM tooling output** (`cargo cyclonedx`) — command documented, never
     run. Verify by: P8 release dry run.
-14. **`cara policy explain` wording quality** — tested for required
+17. **`cara policy explain` wording quality** — tested for required
     substrings, never reviewed by a human new to the project. Verify by:
     P6 new-user simulation.
-15. **Large-tree builds on DrvFs**: all builds here used the ext4 cache
+18. **Large-tree builds on DrvFs**: all builds here used the ext4 cache
     (CARGO_TARGET_DIR); a naive `cargo build` directly on /mnt/p has never
     been timed (documented in ENV.md as the reason for the cache).
 
@@ -125,3 +148,31 @@ test or measurement in this repository currently demonstrates it.
   `mk_staging_dir` sweeps empty staging dirs older than 60s. Nothing is
   ever killed or moved by either sweeper. Verified by running after a hard
   kill: both lists empty.
+
+## Verified cycle 14 (P1 hardening + doctor + Go/JVM)
+
+- Strict posture: `exec_on_write` is off by default and off in `strict`;
+  escape test `write_then_exec` proves a written file cannot be executed,
+  and its positive control proves the explicit opt-in works. `dev` opts in
+  for compile-and-run (runtime matrix uses `preset = "dev"`).
+- `/etc/alternatives` is no longer bind-mounted: only symlinks whose
+  canonical target is under `/usr` are recreated. Ubuntu's regular
+  `README` is not visible inside.
+- PDEATHSIG window forced deterministically (see R2.10).
+- Concurrency deadlock found by the first full gate: stage-1 inherited the
+  embedder's descriptors, so long-lived parallel sandboxes held each
+  other's pipe write ends and blocked in `spawn` before their timeouts
+  started. Fixed by closing every fd except the result pipe in stage-1;
+  RT22 (4 concurrent infinite payloads, 1 s timeout) failed before the fix
+  and passes in ~1 s after. The escape suite now finishes 23/23 in ~4 s.
+- `cara doctor` refactored into measured `Facts` + pure `classify`; 21
+  unit tests including 17 simulated-environment blocker tests. Every
+  remedy is print-only and cites an upstream URL verified with HTTP 200.
+- README attack table pinned to the escape catalog by a test; it found
+  and fixed 9 already-drifted rows.
+- Go 1.22.2 and OpenJDK 21.0.12.1 installed; runtime matrix now **17
+  passed, 0 failed, 0 skipped** including `go-build-run` and
+  `jvm-compile-run`. Dev logging: 20 audit records, 6 distinct unlisted
+  syscalls, **zero additions** (ADR-0008). The JVM needs one narrow
+  read-only `/etc` bind (ADR-0007 §8).
+- Full `scripts/check.sh`: all green (test total recorded in the cycle log).

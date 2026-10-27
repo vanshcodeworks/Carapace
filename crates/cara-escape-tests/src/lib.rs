@@ -140,6 +140,17 @@ print('SURVIVED')
         attack: "Plant files in host-writable locations (/etc, /usr)",
         expected: "Both writes denied: /usr is read-only (EROFS), /etc is denied by Landlock; no host file appears",
     },
+    // Write an executable into the scratch area and run it. Landlock's
+    // writable grants deny EXECUTE by default (strict), so a payload can
+    // stage code but not run it without an explicit policy opt-in.
+    EscapeTest {
+        id: "write_then_exec",
+        name: "Write then execute",
+        language: Language::Sh,
+        payload: r#"printf '#!/bin/sh\necho CARA-WRITE-THEN-EXEC-ESCAPED\n' > /work/cara-written.sh; chmod +x /work/cara-written.sh; /work/cara-written.sh 2>&1; echo rc=$?"#,
+        attack: "Write an executable into the writable scratch area and execute it",
+        expected: "The file is created but Landlock denies execve on writable locations: the written program never runs (Permission denied, rc=126)",
+    },
     // Symlink from the writable scratch into /etc: the link must resolve
     // inside the Landlock-scoped view, not reach the host.
     EscapeTest {
@@ -311,9 +322,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn catalog_has_20_unique_snake_case_ids() {
+    fn catalog_has_21_unique_snake_case_ids() {
         let all = Catalog::all();
-        assert_eq!(all.len(), 20, "catalog size drifted; update the suite too");
+        assert_eq!(all.len(), 21, "catalog size drifted; update the suite too");
         for (i, t) in all.iter().enumerate() {
             assert!(
                 !t.id.is_empty() && t.id.chars().all(|c| c.is_ascii_lowercase() || c == '_'),
@@ -334,7 +345,7 @@ mod tests {
     fn catalog_serializes_to_json_and_lookups_work() {
         let json = serde_json::to_string(Catalog::all()).expect("serialize catalog");
         let v: serde_json::Value = serde_json::from_str(&json).expect("valid json");
-        assert_eq!(v.as_array().map(|a| a.len()), Some(20));
+        assert_eq!(v.as_array().map(|a| a.len()), Some(21));
         for t in Catalog::all() {
             assert!(json.contains(t.id), "json is missing {}", t.id);
             assert!(Catalog::get(t.id).is_some(), "get({}) failed", t.id);
