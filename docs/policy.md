@@ -128,13 +128,17 @@ read_write    = ["/home/dev/project"]    # optional
 exec_on_write = false                    # optional; default false
 ```
 
-`exec_on_write` controls whether the payload may `execve` files it wrote into
+`exec_on_write` controls whether the payload may execute files it wrote into
 the writable areas (`/work`, `/tmp`, `/dev/shm`, and every `read_write` bind).
-The default is **false**, and it stays false in the `strict` preset: a
-payload can create and run *nothing it wrote*, which blocks the classic
-write-then-exec staging move (escape test `write_then_exec`). `dev` sets it
-to `true` because compile-and-run workflows (`gcc`, `rustc`) need to execute
-their own output; `network-light` inherits `dev`.
+This covers both `execve(2)` and `mmap(PROT_EXEC)`/`dlopen`: Landlock's
+`EXECUTE` right only checks `execve`, so when the field is false Carapace
+also mounts those areas `noexec` (and keeps anonymous executable mappings
+available for JITs). The default is **false**, and it stays false in the
+`strict` preset: a payload can create and run *nothing it wrote*, which
+blocks the classic write-then-exec staging move (escape test
+`write_then_exec`; red-team `rt_mmap_exec_of_written_file_denied`). `dev`
+sets it to `true` because compile-and-run workflows (`gcc`, `rustc`) need to
+execute their own output; `network-light` inherits `dev`.
 
 Set it explicitly when a policy needs it:
 
@@ -143,9 +147,10 @@ Set it explicitly when a policy needs it:
 exec_on_write = true
 ```
 
-Landlock's writable grant then includes `EXECUTE`; everything else (seccomp,
-`no_new_privs`, zero capabilities, cgroups) still applies to the new binary.
-See ADR-0007 for the audit trail.
+Landlock's writable grant then includes `EXECUTE` and the `noexec` mount
+flag is not applied; everything else (seccomp, `no_new_privs`, zero
+capabilities, cgroups) still applies to the new binary. See ADR-0007 for the
+audit trail.
 
 Every listed host path is bind-mounted **at the same absolute path inside
 the sandbox**. Validation rules (violations are parse errors):
@@ -177,7 +182,9 @@ What the sandbox always contains, regardless of policy:
 | `/tmp` | directory on the 8 MiB root tmpfs | yes |
 
 Writes are allowed but **execution of written files is denied by default**
-(Landlock `RW_ALL_NO_EXEC`); see `exec_on_write` above. The scratch budget is
+(Landlock `RW_ALL_NO_EXEC` plus `noexec` on the writable mounts, so
+`execve` and `mmap(PROT_EXEC)`/`dlopen` are both blocked); see
+`exec_on_write` above. The scratch budget is
 per mount: `/work` and `/dev/shm` are each capped at `limits.disk`, so the
 aggregate writable space can reach roughly `2 × limits.disk + 8 MiB`.
 

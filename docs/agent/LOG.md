@@ -291,3 +291,61 @@ Commands: scripts/check.sh, cargo build --target
 x86_64-unknown-linux-musl, debian-pivot-test.sh.
 Next: red-team cycle 16; then P3 (sessions, upload/download, network
 allowlist, SDKs) and P4 (external-review brief, escape challenge).
+
+## Cycle 16 (red-team) - 2026-10-27 - kernel surfaces, inheritance, mmap exec
+
+Task: scheduled red-team cycle. Probe attack classes the regular suites
+do not cover; a probe that only confirms an existing test is not a
+finding.
+
+Outcome: 9 new probes, RT23-RT31, all green after one real fix.
+
+- RT23 `rt_new_mount_api_denied`: `open_tree`, `move_mount`, `fsopen`,
+  `fsconfig`, `fsmount`, `fspick`, `mount_setattr` all return EPERM even
+  with deliberately invalid arguments (denial happens before argument
+  validation).
+- RT24 `rt_cross_hierarchy_hardlink_denied`: `link(2)` out of `/work`
+  into `/etc` and from `/etc/passwd` into `/work` both fail; neither
+  destination appears. Landlock REFER covers hardlinks, not just rename.
+- RT25 `rt_rename_exchange_across_hierarchy_denied`:
+  `renameat2(RENAME_EXCHANGE)` across `/work` -> `/etc` fails and both
+  files keep their original contents (RT5 covered plain rename only).
+- RT26 `rt_tmp_and_shm_are_not_shared`: a marker written to `/tmp` or
+  `/dev/shm` by one sandbox is invisible to the next, and a host file in
+  `/tmp` is invisible inside. Fresh per-run tmpfs mounts.
+- RT27 `rt_threads_inherit_seccomp`: a payload worker thread gets the same
+  EPERM for `socket(2)` as the main thread.
+- RT28 `rt_exec_inherits_landlock_and_seccomp`: a payload-spawned
+  `sh`/`python3` still cannot write `/etc` and cannot create a socket.
+- RT29 `rt_kernel_info_leak_syscalls_denied`: `syslog`,
+  `name_to_handle_at`, `open_by_handle_at`, `process_vm_readv/writev`,
+  `kcmp`, `bpf`, `userfaultfd` all EPERM through the installed filter.
+- RT30 `rt_memfd_execveat_denied`: `memfd_create` is allowed (ordinary
+  payloads need it), but `execveat` is denied with EPERM, closing the
+  anonymous-memfd exec path.
+- RT31 `rt_mmap_exec_of_written_file_denied`: **found a real gap.**
+  Landlock's `LANDLOCK_ACCESS_FS_EXECUTE` right is documented as "Execute
+  a file" and is enforced on `execve(2)` only, not on
+  `mmap(PROT_EXEC)`/`dlopen`. Measured before the fix: a file written to
+  `/work` could be mapped executable (`MAP_SHARED` and `MAP_PRIVATE`),
+  and a copied `libm.so.6` could be `dlopen`ed - i.e. write-then-exec
+  without `execve`, despite `exec_on_write = false`.
+
+Fix: every writable mount is now `MS_NOEXEC` when `exec_on_write` is
+false - the root tmpfs (`/tmp`), `/work`, `/dev/shm`, and read-write
+binds (remounted `MS_NOEXEC`). `/usr` keeps its executable read-only
+bind; anonymous executable mappings remain allowed for JITs. The same
+test is the positive control: with `exec_on_write(true)` the mapping
+succeeds. Measured errno for `mmap(PROT_EXEC)` on a noexec mount is
+**EPERM (1)**, not EACCES - the assertion uses that exact value.
+
+Docs updated: ADR-0007 section 7 (limitation, mount fix, proof row),
+`docs/policy.md` (`exec_on_write` covers execve + mmap + dlopen),
+`docs/threat-model.md`, `CLAIMS.md` (31 red-team tests).
+
+Full workspace: 229 passed / 0 failed (31 red-team tests); clippy
+-D warnings clean; runtime matrix 17/17; escape suite 23/23 in ~4.4 s.
+Cgroup/staging lists empty.
+Commands: scripts/check.sh, .wsl/rt31-probe.sh (characterization).
+Next: P3 (sessions, upload/download, network allowlist, Python/TypeScript
+SDKs) and P4 (external-review brief, escape challenge).

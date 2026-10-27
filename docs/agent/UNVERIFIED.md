@@ -187,3 +187,26 @@ test or measurement in this repository currently demonstrates it.
   syscalls, **zero additions** (ADR-0008). The JVM needs one narrow
   read-only `/etc` bind (ADR-0007 §8).
 - Full `scripts/check.sh`: all green (test total recorded in the cycle log).
+
+## Verified cycle 16 (red-team: kernel surfaces, inheritance, mmap exec)
+
+- **Landlock does not mediate `mmap(PROT_EXEC)`/`dlopen`.** Its
+  `LANDLOCK_ACCESS_FS_EXECUTE` right is documented as "Execute a file" and
+  is enforced on `execve(2)` only. Measured before the fix: a file written
+  to `/work` mapped executable (`MAP_SHARED` and `MAP_PRIVATE`) and a
+  copied `libm.so.6` loaded via `dlopen` under `exec_on_write = false`.
+  Fixed by mounting every writable area (`/tmp` root tmpfs, `/work`,
+  `/dev/shm`, read-write binds) `MS_NOEXEC` when the policy does not opt
+  in. RT31 (`rt_mmap_exec_of_written_file_denied`) asserts EPERM on the
+  file mapping, success for anonymous executable mappings (JITs), and
+  success for the same mapping with `exec_on_write(true)`.
+- New mount API (`open_tree`/`move_mount`/`fsopen`/`fsconfig`/`fsmount`/
+  `fspick`/`mount_setattr`), cross-hierarchy `link(2)` and
+  `renameat2(RENAME_EXCHANGE)`, thread/exec inheritance, per-run
+  `/tmp`+`/dev/shm`, memfd+`execveat`, and the info-leak syscall set are
+  all denied as designed (RT23-RT30).
+- Still unverified: `noexec` semantics on filesystems other than tmpfs and
+  bind mounts (e.g. a policy-granted read-write bind on a host filesystem
+  that ignores `MS_NOEXEC`, such as some FUSE mounts); measured on the
+  reference WSL2 kernel only. An executable *writable* bind is the
+  documented `exec_on_write` trade-off, not a bypass of the default.

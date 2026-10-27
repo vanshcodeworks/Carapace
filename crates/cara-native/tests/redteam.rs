@@ -617,3 +617,362 @@ fn rt_stdin_reads_eof() {
         start.elapsed()
     );
 }
+
+// ---------------- red-team cycle 4: kernel surfaces, inheritance, isolation --
+
+/// RT23: the new mount API (`open_tree`, `move_mount`, `fsopen`, `fsconfig`,
+/// `fsmount`, `fspick`, `mount_setattr`) is not in the allowlist. A mount
+/// escape must be denied before argument validation, so every call returns
+/// EPERM even with deliberately invalid arguments.
+#[test]
+fn rt_new_mount_api_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(r#"
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+calls = [("open_tree", 428), ("move_mount", 429), ("fsopen", 430),
+         ("fsconfig", 431), ("fsmount", 432), ("fspick", 433),
+         ("mount_setattr", 442)]
+for name, nr in calls:
+    ctypes.set_errno(0)
+    ret = libc.syscall(nr, 0, 0, 0, 0, 0)
+    print(name, ret, ctypes.get_errno())
+"#));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 7, "expected one line per syscall: {out:?}");
+    for line in lines {
+        assert!(
+            line.ends_with("-1 1"),
+            "mount API syscall not denied with EPERM: {line:?} (full: {out:?})"
+        );
+    }
+}
+
+/// RT24: Landlock REFER scoping covers hardlinks too, not just rename.
+/// Linking a writable file into read-only `/etc` (and the reverse) must be
+/// denied, and neither destination may appear.
+#[test]
+fn rt_cross_hierarchy_hardlink_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(r#"
+import os
+open('/work/src', 'w').write('x')
+for src, dst, label in [('/work/src', '/etc/rt24-link', 'out'),
+                        ('/etc/passwd', '/work/passwd-link', 'in')]:
+    try:
+        os.link(src, dst)
+        print(label, 'allowed')
+    except OSError as e:
+        print(label, 'denied', e.errno)
+print('out-exists', os.path.exists('/etc/rt24-link'))
+print('in-exists', os.path.exists('/work/passwd-link'))
+"#));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        out.contains("out denied"),
+        "link into /etc allowed: {out:?}"
+    );
+    assert!(
+        out.contains("in denied"),
+        "link from /etc into /work allowed: {out:?}"
+    );
+    assert!(
+        out.contains("out-exists False") && out.contains("in-exists False"),
+        "a cross-hierarchy link landed: {out:?}"
+    );
+}
+
+/// RT25: `renameat2(RENAME_EXCHANGE)` across a Landlock hierarchy boundary
+/// must fail and leave both files untouched (RT5 covers plain rename).
+#[test]
+fn rt_rename_exchange_across_hierarchy_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(r#"
+import ctypes, os
+open('/work/a', 'w').write('A')
+libc = ctypes.CDLL(None, use_errno=True)
+ctypes.set_errno(0)
+ret = libc.syscall(316, -100, b'/work/a', -100, b'/etc/passwd', 2)
+print('exchange', ret, ctypes.get_errno())
+print('a', open('/work/a').read())
+print('passwd', open('/etc/passwd').read().split(':')[0])
+"#));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        out.contains("exchange -1") && !out.contains("exchange -1 0"),
+        "RENAME_EXCHANGE across /work -> /etc must fail: {out:?}"
+    );
+    assert!(out.contains("a A"), "/work/a was swapped: {out:?}");
+    assert!(
+        out.contains("passwd root"),
+        "/etc/passwd was swapped: {out:?}"
+    );
+}
+
+/// RT26: `/tmp` and `/dev/shm` are fresh per-run tmpfs mounts. A marker
+/// written by one sandbox must be invisible to the next, and a host file in
+/// `/tmp` must be invisible inside.
+#[test]
+fn rt_tmp_and_shm_are_not_shared() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    let host_marker = format!("/tmp/cara-rt26-host-{}", std::process::id());
+    std::fs::write(&host_marker, b"host").expect("write host marker");
+
+    let a = run(sh(
+        "echo sandbox > /tmp/cara-rt26 && echo sandbox > /dev/shm/cara-rt26 && echo wrote",
+    ));
+    assert!(
+        String::from_utf8_lossy(&a.stdout).contains("wrote"),
+        "first sandbox could not write markers: {a:?}"
+    );
+
+    let b_run = run(sh(&format!(
+        "test -e /tmp/cara-rt26 && echo tmp-leak; \
+         test -e /dev/shm/cara-rt26 && echo shm-leak; \
+         test -e {host_marker} && echo host-leak; echo checked"
+    )));
+    let out = String::from_utf8_lossy(&b_run.stdout).into_owned();
+    assert!(out.contains("checked"), "second sandbox failed: {out:?}");
+    assert!(
+        !out.contains("tmp-leak") && !out.contains("shm-leak") && !out.contains("host-leak"),
+        "/tmp or /dev/shm leaked across sandboxes or from the host: {out:?}"
+    );
+    let _ = std::fs::remove_file(&host_marker);
+}
+
+/// RT27: a seccomp filter installed before exec applies to every thread the
+/// payload creates. A worker thread must get EPERM for `socket(2)` exactly
+/// like the main thread.
+#[test]
+fn rt_threads_inherit_seccomp() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(r#"
+import socket, threading
+result = []
+def attempt():
+    try:
+        socket.socket()
+        result.append('allowed')
+    except OSError as e:
+        result.append('denied:%d' % e.errno)
+t = threading.Thread(target=attempt)
+t.start()
+t.join()
+print(result[0])
+"#));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        out.contains("denied:1"),
+        "seccomp did not apply to a payload thread: {out:?}"
+    );
+}
+
+/// RT28: Landlock and seccomp survive fork+exec. A payload-spawned child
+/// cannot write into read-only /etc and cannot create a socket either.
+#[test]
+fn rt_exec_inherits_landlock_and_seccomp() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(r#"
+import os, subprocess
+w = subprocess.run(['/bin/sh', '-c', 'echo x > /etc/rt28-escape'],
+                   capture_output=True, text=True)
+s = subprocess.run(['/usr/bin/python3', '-c', 'import socket; socket.socket()'],
+                   capture_output=True, text=True)
+print('write-rc', w.returncode)
+print('sock-rc', s.returncode)
+print('escaped', os.path.exists('/etc/rt28-escape'))
+"#));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        !out.contains("write-rc 0"),
+        "exec'd child wrote into /etc: {out:?}"
+    );
+    assert!(
+        !out.contains("sock-rc 0"),
+        "exec'd child created a socket: {out:?}"
+    );
+    assert!(
+        out.contains("escaped False"),
+        "write-then-exec child left a file in /etc: {out:?}"
+    );
+}
+
+/// RT29: kernel information-leak syscalls are absent from the allowlist and
+/// must fail with EPERM end to end (unit tests cover the list; this proves
+/// the installed filter).
+#[test]
+fn rt_kernel_info_leak_syscalls_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(r#"
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+calls = [("syslog", 103), ("name_to_handle_at", 303),
+         ("open_by_handle_at", 304), ("process_vm_readv", 310),
+         ("process_vm_writev", 311), ("kcmp", 312), ("bpf", 321),
+         ("userfaultfd", 323)]
+for name, nr in calls:
+    ctypes.set_errno(0)
+    ret = libc.syscall(nr, 0, 0, 0, 0, 0)
+    print(name, ret, ctypes.get_errno())
+"#));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 8, "expected one line per syscall: {out:?}");
+    for line in lines {
+        assert!(
+            line.ends_with("-1 1"),
+            "kernel info-leak syscall not denied with EPERM: {line:?} (full: {out:?})"
+        );
+    }
+}
+
+/// RT30: Landlock cannot mediate execution of an anonymous memfd, but
+/// `execveat(2)` is not in the allowlist, so the memfd-exec bypass must be
+/// closed by seccomp with EPERM (not ENOEXEC/EFAULT, which would mean the
+/// syscall ran).
+#[test]
+fn rt_memfd_execveat_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let r = run(py(r#"
+import ctypes, os
+libc = ctypes.CDLL(None, use_errno=True)
+fd = libc.syscall(319, b'cara-rt30', 0)
+print('memfd', fd)
+os.write(fd, b'\x7fELF' + b'\x00' * 64)
+ctypes.set_errno(0)
+ret = libc.syscall(322, fd, b'', 0, 0, 0x1000)
+print('execveat', ret, ctypes.get_errno())
+"#));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        out.contains("memfd 3"),
+        "memfd_create should be allowed for ordinary payloads: {out:?}"
+    );
+    assert!(
+        out.contains("execveat -1 1"),
+        "execveat must be denied with EPERM before it can run the memfd: {out:?}"
+    );
+}
+
+/// RT31: `execve` is not the only way to run written code — a payload can
+/// `mmap(PROT_EXEC)` its own file. Landlock's EXECUTE right is checked on
+/// that mapping too, so the mapping must fail while an anonymous executable
+/// mapping (JITs, Node/V8) still works. This is the positive/negative pair
+/// the `exec_on_write` claim needs; a regression here would allow
+/// write-then-exec without `execve(2)`.
+#[test]
+fn rt_mmap_exec_of_written_file_denied() {
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let code = r#"
+import mmap, os
+path = '/work/rt31'
+with open(path, 'wb') as f:
+    f.write(b'\x90' * 16)
+fd = os.open(path, os.O_RDONLY)
+try:
+    m = mmap.mmap(fd, 16, prot=mmap.PROT_READ | mmap.PROT_EXEC)
+    print('file-mapped')
+    m.close()
+except OSError as e:
+    print('file-denied', e.errno)
+try:
+    anon = mmap.mmap(-1, 4096, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+    print('anon-mapped')
+    anon.close()
+except OSError as e:
+    print('anon-denied', e.errno)
+"#;
+    let r = run(py(code));
+    let out = String::from_utf8_lossy(&r.stdout).into_owned();
+    assert!(
+        !out.contains("file-mapped"),
+        "mmap(PROT_EXEC) of a written file succeeded: {out:?}"
+    );
+    assert!(
+        out.contains("file-denied 1"),
+        "expected EPERM from the noexec mount on the file mapping: {out:?}"
+    );
+    assert!(
+        out.contains("anon-mapped"),
+        "anonymous executable mappings must stay allowed (JITs): {out:?}"
+    );
+
+    // Positive control: the same mapping must work when the policy opts in,
+    // proving the denial comes from exec_on_write and not an unrelated
+    // mmap restriction.
+    let allowed = run(py(code).exec_on_write(true));
+    let out = String::from_utf8_lossy(&allowed.stdout).into_owned();
+    assert!(
+        out.contains("file-mapped"),
+        "exec_on_write = true must permit the file mapping: {out:?}"
+    );
+}
