@@ -117,7 +117,7 @@ flowchart TD
     P --> Q[Stage-1: uid/gid map]
     Q --> R[Fork stage-2]
     R --> S[Stage-2: rlimits]
-    S --> T[MS_REC\|MS_PRIVATE]
+    S --> T[MS_REC / MS_PRIVATE]
     T --> U[Mount root tmpfs]
     U --> V[Bind policy paths]
     V --> W[Bind /usr read-only]
