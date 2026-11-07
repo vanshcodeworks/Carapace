@@ -18,9 +18,9 @@ pub fn markdown() -> String {
          the payload runs through the real sandbox and the suite asserts the \
          documented result.\n\n",
     );
-    out.push_str("| Attack | Result |\n|---|---|\n");
+    out.push_str("| Test | Attack | Result |\n|---|---|---|\n");
     for t in Catalog::all() {
-        out.push_str(&format!("| `{}` — {} | {} |\n", t.id, t.name, t.expected));
+        out.push_str(&format!("| `{}` | {} | {} |\n", t.id, t.name, t.expected));
     }
     out
 }
@@ -33,10 +33,13 @@ mod tests {
     fn table_lists_every_catalog_entry() {
         let md = markdown();
         assert!(md.starts_with("# What Carapace stops"), "bad header:\n{md}");
-        assert!(md.contains("| Attack | Result |"), "bad header:\n{md}");
+        assert!(
+            md.contains("| Test | Attack | Result |"),
+            "bad header:\n{md}"
+        );
         for t in crate::Catalog::all() {
             assert!(
-                md.contains(&format!("| `{}` — ", t.id)),
+                md.contains(&format!("| `{}` | ", t.id)),
                 "table is missing entry {}:\n{md}",
                 t.id
             );
@@ -64,7 +67,7 @@ mod tests {
         );
         for t in crate::Catalog::all() {
             assert!(
-                readme.contains(&format!("| `{}` — ", t.id)),
+                readme.contains(&format!("| `{}` | ", t.id)),
                 "README does not mention catalog entry {}",
                 t.id
             );

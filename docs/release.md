@@ -1,17 +1,16 @@
 # Release Runbook (docs/release.md)
 
-> **Audience: a human.** Per [CONTRIBUTING.md](../CONTRIBUTING.md) rule 3
-> ("**Never publish.** No crates.io releases, no package uploads, no
-> prebuilt binaries distributed outside the repository while the project
-> is pre-release"), every step that *distributes* something — tagging,
-> publishing, uploading assets — is performed by a human, deliberately,
-> and only once the project formally exits pre-release. Nothing in this
-> runbook is fully automated; the only CI support is
+> **Audience: a human.** The GitHub repository is public, but there is no
+> tagged release and no prebuilt binary yet. Per
+> [CONTRIBUTING.md](../CONTRIBUTING.md) rule 3, every step that
+> *distributes* something — tagging, publishing, uploading assets — is
+> performed by a human, deliberately, and only after this checklist passes.
+> Nothing in this runbook is fully automated; the only CI support is
 > [`.github/workflows/release-dry-run.yml`](../.github/workflows/release-dry-run.yml),
 > which builds, tests, packages, and uploads **artifacts for inspection
 > only** — it publishes nothing.
 
-Every command below is verbatim for this repository as of milestone C12.
+Every command below is verbatim for this repository as of cycle 18.
 Unverified steps are marked `TODO(verify)` — do not skip them on release
 day; resolve them first.
 
@@ -48,32 +47,33 @@ Work through in order; do not batch.
   ./target/debug/cara doctor
   ```
 
-- [ ] **Security audit** — dependency advisories. Note: **not run by CI**
-      (no job in `.github/workflows/ci.yml` or the release-dry-run
-      workflow invokes it), so this step only happens when a human does
-      it. Install once, then audit:
+- [ ] **Security audit** — dependency advisories. `cargo deny check`
+      runs in CI (the `deny` job in `.github/workflows/ci.yml`).
+      `cargo audit` is not in CI, so run it manually. Install once, then
+      audit:
 
   ```sh
   cargo install cargo-audit cargo-deny
   cargo audit
+  cargo deny check
   ```
 
   Every RUSTSEC finding must be either fixed (bump the dependency in
   `Cargo.lock`) or explicitly waived with a written reason in this
   runbook's release notes. Silent waivers are bugs.
 
-- [ ] **License / ban policy check** — also not in CI. `deny.toml` is
-      committed at the repo root (generated once, then reviewed), so runs
-      are reproducible:
+- [ ] **License / ban policy check** — `cargo deny check` runs in CI.
+      `deny.toml` is committed at the repo root (generated once, then
+      reviewed), so runs are reproducible:
 
   ```sh
   cargo deny check
   ```
 
-  Verified cycle 12: all four sections pass with a permissive-only
+  Verified cycle 18: all four sections pass with a permissive-only
   license allow list (each entry justified; copyleft fails by default).
-  `cargo audit` reported no advisories across 205 dependencies. Remaining
-  TODO(verify): add both commands to CI; re-run per release.
+  The wasmtime dependency was updated to 50.0.1 for RUSTSEC-2026-0420.
+  Re-run both commands per release.
 
 - [ ] **Product demo green against a release build** (built in step 2):
 
@@ -221,9 +221,9 @@ the green run before continuing.
 
 ## 6. crates.io publishing (human; decision-gated)
 
-> This section only applies after the project formally exits
-> pre-release (CONTRIBUTING rule 3). Until then: do not run
-> `cargo publish` without `--dry-run`.
+> This section only applies after the release checklist passes and a human
+> decides to publish. Until then: do not run `cargo publish` without
+> `--dry-run`.
 
 For every crate, dry-run first, then publish for real:
 

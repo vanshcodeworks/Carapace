@@ -5,7 +5,8 @@
 > `crates/cara-mcp`: line-delimited JSON-RPC 2.0 over stdio, `initialize` /
 > `tools/list` / `tools/call`, with the hostile-input rules below enforced
 > (29 protocol unit tests + two real-sandbox e2e tests). Client
-> configuration below is live.
+> configuration below is live. The real-client smoke test is
+> `python3 scripts/mcp-smoke.py`.
 
 ## Purpose
 
@@ -69,7 +70,7 @@ from MCP. A crashed or restarted server therefore leaves no live sandbox.
   `Backend` trait, ADR-0001): an async runtime at the edge, if any, bridges
   to the sync core via `spawn_blocking`. One run at a time per sandbox;
   concurrent runs are independent sandboxes with independent cgroup leaves.
-- The binary will be `cara-mcp` (crate `carapace-mcp`).
+- The binary is `cara-mcp` (crate `carapace-mcp`).
 
 ## Hostile-input rules (the non-negotiable part)
 
@@ -113,6 +114,11 @@ cargo build -p carapace-mcp
 # binary at ./target/debug/cara-mcp (or $CARGO_TARGET_DIR/... )
 ```
 
+Or install both binaries with `bash scripts/install.sh`; the server lands at
+`~/.local/bin/cara-mcp`. For a step-by-step agent setup, see
+[AGENT_SETUP.md](../AGENT_SETUP.md). For the human guide, see
+[docs/agents.md](agents.md).
+
 ### Claude Desktop
 
 `Claude Desktop → Settings → Developer → Edit Config`:
@@ -153,6 +159,15 @@ Notes:
   the linger fix).
 - Run `cara doctor` once from the same account to confirm the environment
   is Tier 1 ready before connecting a client.
+
+Verify the server without a full client:
+
+```sh
+python3 scripts/mcp-smoke.py "$(command -v cara-mcp)"
+```
+
+It performs the real MCP handshake, lists all 8 tools, and runs one
+harmless shell command through the sandbox.
 
 ## Milestones
 

@@ -35,6 +35,21 @@ own `/usr` inside namespaces and tears it down with the run. The only
 system service involved is systemd's user manager, which owns the cgroup
 subtree your limits are written into (standard on any Linux login).
 
+## Can an agent keep files between calls?
+
+Yes. Use `cara session start` and `cara session exec`, or the six session
+tools in the MCP server. A session keeps a size-capped `/work` directory
+across execs. It does not keep processes: every exec gets a new PID
+namespace and a new root filesystem. The session dies with the MCP server,
+or when you run `cara session close`.
+
+## How do I hand this to my agent?
+
+Give the agent [AGENT_SETUP.md](../AGENT_SETUP.md). It is a step-by-step
+file that covers the host check, clone, build, install, doctor gate, MCP
+configuration, and a smoke test. The human guide is
+[docs/agents.md](agents.md).
+
 ## Does it work on WSL2?
 
 Yes — that is the primary development environment (Ubuntu 24.04 on WSL2,
@@ -71,13 +86,13 @@ out of scope for v1.
 
 Anything whose interpreter lives under `/usr`: the sandbox bind-mounts the
 host `/usr` read-only, so `/bin/sh`, `/usr/bin/python3`, `/usr/bin/perl`,
-`node`, `gcc`-built binaries — whatever your distro ships — work without
-any per-language setup (docs/runtime-guide.md). Requirements: the program
+`node`, `gcc`-built binaries, Go, and the JVM work without any
+per-language setup (docs/runtime-guide.md). Requirements: the program
 path must be absolute (Carapace does no PATH search), the environment is
 allowlist-only (policy runs default `PATH` + `HOME=/work`), and network
 access requires an explicit policy. The P2 runtime matrix exercises bash,
-Python, Node, gcc and Rust end to end; Go and the JVM are still unverified
-(`scripts/runtime-matrix.py`, docs/agent/UNVERIFIED.md).
+Python, Node, gcc, Rust, Go, and the JVM end to end: 17 passed, 0 failed,
+0 skipped on the reference environment (`scripts/runtime-matrix.py`).
 
 ## What does the payload see?
 

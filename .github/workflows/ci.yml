@@ -20,9 +20,23 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Note: hosted runners restrict unprivileged user namespaces, so
       # environment-dependent tests self-skip (CARA_STRICT_ENV_TESTS unset).
+      - name: Docs check
+        run: python3 scripts/check-docs.py
+      - name: Shell syntax
+        run: |
+          bash -n scripts/check.sh
+          bash -n scripts/install.sh
+          bash -n demo/demo.sh
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
       - name: Test
         run: cargo test --workspace
+
+  deny:
+    name: cargo deny
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2

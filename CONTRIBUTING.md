@@ -2,7 +2,7 @@
 
 Carapace is a sandbox for hostile code. That shapes the contribution rules:
 security claims must be proven, test payloads must never touch the host,
-and nothing is published.
+and the public docs must match what is measured.
 
 ## Development setup
 
@@ -40,17 +40,22 @@ crates/
   cara-sys           raw syscalls — ALL unsafe code is confined here
   cara-native        Tier 1 backend: doctor, supervisor, child, rootfs,
                      cgroups, seccomp profiles
-  cara-cli           the `cara` binary (doctor / run / policy)
+  cara-cli           the `cara` binary (doctor / run / policy / session / mcp)
   cara-escape-tests  hostile payload catalog + generated README table
-  cara-mcp           MCP server (milestone C7)
-  cara-wasm          Tier 2 (C9)          cara-vm: Tier 3 (C10)
+  cara-mcp           MCP server with 8 tools
+  cara-wasm          Tier 2 library backend
+  cara-vm            Tier 3 design and fail-closed plan
 docs/
   threat-model.md    what is defended, what is not — read this first
   policy.md          policy file reference        architecture.md: how a run works
   runtime-guide.md   running languages            troubleshooting.md: doctor remedies
-  mcp.md             MCP contract                 decisions/: ADRs
+  mcp.md             MCP contract                 agents.md: agent workflows
+  decisions/         ADRs
   agent/             working state: STATE, LOG, CLAIMS, ENV, QUEUE, NEEDS_HUMAN
+AGENT_SETUP.md       setup file to hand to a user's agent
 scripts/check.sh     the verification loop
+scripts/install.sh   build and install cara + cara-mcp
+scripts/mcp-smoke.py real MCP handshake + run_code smoke test
 examples/            library API examples
 benches/ · fuzz/     C8 benchmark and fuzz targets
 runtimes/            minimal rootfs recipes (future; v1 uses the host /usr)
@@ -78,9 +83,10 @@ runtimes/            minimal rootfs recipes (future; v1 uses the host /usr)
    real sandbox under test — never via a plain `Command`, never on the
    host, never "just this once" to debug. Debug by adding assertions
    inside the sandboxed script.
-3. **Never publish.** No crates.io releases, no package uploads, no
-   prebuilt binaries distributed outside the repository while the project
-   is pre-release (milestones C0–C10 are tracked in docs/agent/STATE.md).
+3. **Release with the runbook.** The GitHub repository is public, but there
+   is no tagged release and no prebuilt binary yet. Do not publish crates,
+   upload packages, or distribute binaries without following
+   [docs/release.md](docs/release.md) and its human decision points.
 4. **Fail closed, always.** New configuration surface (policy fields,
    flags, MCP request fields) must reject unknown values, must have a
    deny-by-default posture, and must never add a "degraded mode" that runs
