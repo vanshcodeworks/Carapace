@@ -11,7 +11,7 @@
 use carapace_core::report::{ExitReport, KillReason};
 use carapace_core::spec::SandboxSpec;
 use carapace_core::{Backend, BackendError, SandboxHandle};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use wasmtime::{Config, Engine, Module, Store};
 
@@ -25,21 +25,46 @@ const FUEL_PER_CPU_PERCENT_SECOND: u64 = 2_000_000_000 / 100;
 /// run is reported as OutputOverflow.
 const WASM_STREAM_CAP: usize = 8 * 1024 * 1024;
 
-/// Store state: WASI(p1) + memory limits. `add_to_linker_sync` for the
-/// preview1 shim requires `&mut WasiP1Ctx` from the state, hence the
-/// explicit accessor in the linker closure.
+/// Store state: WASI(p1) + memory limits.
 struct WasmState {
     wasi: wasmtime_wasi::p1::WasiP1Ctx,
     limits: wasmtime::StoreLimits,
 }
 
+/// Shared engine for kill() support across runs.
+#[derive(Clone, Debug)]
+struct SharedEngine {
+    engine: Engine,
+}
+
+impl Default for SharedEngine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SharedEngine {
+    fn new() -> Self {
+        let mut cfg = Config::new();
+        cfg.consume_fuel(true);
+        cfg.epoch_interruption(true);
+        Self {
+            engine: Engine::new(&cfg).expect("engine creation"),
+        }
+    }
+}
+
 /// The Wasm tier backend.
 #[derive(Debug, Clone, Default)]
-pub struct WasmBackend;
+pub struct WasmBackend {
+    shared_engine: Arc<SharedEngine>,
+}
 
 impl WasmBackend {
     pub fn new() -> Self {
-        Self
+        Self {
+            shared_engine: Arc::new(SharedEngine::new()),
+        }
     }
 }
 
@@ -63,11 +88,7 @@ impl Backend for WasmBackend {
             wat::parse_str(text).map_err(|e| BackendError::Setup(format!("not wasm/wat: {e}")))?
         };
 
-        // Engine: fuel for CPU, epochs for wall time.
-        let mut cfg = Config::new();
-        cfg.consume_fuel(true);
-        cfg.epoch_interruption(true);
-        let engine = Engine::new(&cfg).map_err(|e| BackendError::Setup(format!("engine: {e}")))?;
+        let engine = self.shared_engine.engine.clone();
         let module = Module::from_binary(&engine, &module_bytes)
             .map_err(|e| BackendError::Setup(format!("compile module: {e}")))?;
 
@@ -106,11 +127,15 @@ impl Backend for WasmBackend {
 
         // The run happens on a worker thread; wait() joins it.
         let engine_t = engine.clone();
+        let engine_for_handle = engine.clone(); // Clone for the handle
         let timeout = spec.limits.timeout;
         let max_output = spec.limits.max_output_bytes;
         let guard = ScratchGuard {
             path: scratch.into_path(),
         };
+
+        // Track initial fuel and memory for reporting
+        let initial_fuel = fuel;
 
         let worker = std::thread::Builder::new()
             .stack_size(512 * 1024)
@@ -183,11 +208,25 @@ impl Backend for WasmBackend {
                 // harmless with no store alive.
                 drop(ticker);
                 let wall = start.elapsed();
+
+                // cpu_time from fuel consumed
+                let fuel_left = store.get_fuel().ok();
+                let cpu_time = fuel_left.map(|left| {
+                    let consumed = initial_fuel.saturating_sub(left);
+                    // Convert fuel to microseconds: fuel units / (fuel_per_second / 1e6)
+                    let fuel_per_us = FUEL_PER_CPU_PERCENT_SECOND / 1_000_000;
+                    Duration::from_micros(consumed.checked_div(fuel_per_us).unwrap_or(0))
+                });
+
+                // peak_memory_bytes from store - use the configured limit since
+                // wasmtime's Store doesn't expose runtime memory usage directly.
+                // The configured limit is the peak possible.
+                let peak_memory_bytes = mem_bytes as u64;
+
                 // Trap classification by STATE, not message strings:
                 // fuel exhausted -> CpuLimit; fuel remaining but the wall
                 // deadline passed -> Timeout. (wasmtime 50 has no public
                 // Trap enum; messages alone are ambiguous.)
-                let fuel_left = store.get_fuel().ok();
                 let wall_deadline_hit = wall + Duration::from_millis(50) >= timeout;
 
                 // Capture + overflow: MemoryOutputPipe drops writes past its
@@ -253,8 +292,8 @@ impl Backend for WasmBackend {
                     wall_time: wall,
                     stdout: out,
                     stderr: err,
-                    cpu_time: None,          // TODO(wasm-tier): fuel→time estimate
-                    peak_memory_bytes: None, // TODO(wasm-tier): store usage
+                    cpu_time,
+                    peak_memory_bytes: Some(peak_memory_bytes),
                     peak_processes: None,
                 }
             })
@@ -263,6 +302,7 @@ impl Backend for WasmBackend {
         Ok(Box::new(WasmHandle {
             worker: Mutex::new(Some(worker)),
             _guard: guard,
+            engine: engine_for_handle,
         }))
     }
 }
@@ -334,6 +374,7 @@ struct WasmHandle {
     worker: Mutex<Option<std::thread::JoinHandle<ExitReport>>>,
     /// Keeps the scratch dir alive for the run's duration; removes it after.
     _guard: ScratchGuard,
+    engine: Engine,
 }
 
 impl SandboxHandle for WasmHandle {
@@ -350,9 +391,8 @@ impl SandboxHandle for WasmHandle {
     }
 
     fn kill(&mut self, _reason: KillReason) {
-        // The run is bounded by fuel (CPU) and the epoch deadline (wall);
-        // both already guarantee termination. An explicit external kill
-        // hook (engine-shared epoch bump) lands with engine sharing.
-        // TODO(wasm-tier): share one Engine per backend to enable kill().
+        // External kill via epoch bump on the shared engine.
+        // This will cause the running wasm to trap at the next epoch check.
+        self.engine.increment_epoch();
     }
 }
