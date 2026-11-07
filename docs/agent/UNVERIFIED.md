@@ -34,17 +34,19 @@ test or measurement in this repository currently demonstrates it.
 
 ## R2 — Medium risk (correctness/completeness, unproven)
 
-5. **CI has never been observed running.** The workflow exists and the
-   trigger now includes `agent/work`, but no GitHub Actions run of this
-   repository has been seen (nothing was pushed from this environment).
-   Whether hosted runners pass (userns available? cgroup v2 delegation
-   absent → tests self-skip? wasm parity runs?) is unproven. Verify by:
-   pushing the branch (human action).
-6. **~~`cargo audit` / `cargo deny` results~~ DONE (cycle 12)**: cargo
-   audit rc=0 (no advisories, 205 deps); cargo deny all four sections ok
-   after writing an explicit license policy in deny.toml (permissive-only
-   allow list, each entry justified; copyleft fails the check by default).
-   Remaining: add `cargo deny check` to CI (currently local-only).
+5. ~~**CI has never been observed running.**~~ **DONE (cycle 18).** CI runs
+   on `main` and `agent/work` (run 42357119917 on `main`, 42357112000 on
+   `agent/work`): fmt, clippy, test, docs check, shell syntax, and
+   `cargo deny check` all pass. Hosted runners skip environment-dependent
+   tests (userns/cgroup delegation) because `CARA_STRICT_ENV_TESTS` is
+   unset; this is documented in the workflow.
+6. ~~**`cargo audit` / `cargo deny` results~~ DONE (cycle 12, CI in
+   cycle 18):** cargo audit rc=0 (no advisories, 205 deps); cargo deny all
+   four sections ok after writing an explicit license policy in deny.toml
+   (permissive-only allow list, each entry justified; copyleft fails the
+   check by default). **`cargo deny check` now runs in CI** (the `deny` job
+   in `.github/workflows/ci.yml`). Remaining: add `cargo audit` to CI; re-run
+   both commands per release.
 7. ~~**musl static build**~~ **DONE (cycle 15).** `cargo build -p
    carapace-cli --target x86_64-unknown-linux-musl` succeeds after fixing
    a signedness difference in `statfs.f_type` (signed on glibc, unsigned
@@ -301,4 +303,24 @@ test or measurement in this repository currently demonstrates it.
   stress (R2.18), automatic stale-dir reaping (R2.19), transfer-cap
   boundaries (R3.25), the socket fallback path (R3.26), new-user
   ergonomics (R3.27), and alternate environments (R3.28).
+
+## Verified cycle 18 (ship)
+
+- CI runs on `main` and `agent/work` (GitHub Actions run 42357119917 on
+  `main`, 42357112000 on `agent/work`): fmt, clippy, test, docs check
+  (no em dashes), shell syntax, and `cargo deny check` all pass.
+- `cargo deny check` passes locally and in CI (advisories, bans, licenses,
+  sources all ok); wasmtime 50.0.1 for RUSTSEC-2026-0420.
+- Local `scripts/check.sh` passes: 250 tests, 17/17 runtime matrix.
+- Repository is public at `https://github.com/vanshcodeworks/Carapace`;
+  `main` and `agent/work` both at commit `eb8d4be`.
+- Animated README with SVG hero (`docs/assets/hero.svg`); simple English,
+  no em dashes (enforced by `scripts/check-docs.py`).
+- Agent setup files: `AGENT_SETUP.md` (for the agent) and `docs/agents.md`
+  (for the human); MCP smoke test `scripts/mcp-smoke.py` works with
+  `systemd-run --user --scope` bridge on WSL2.
+- Licensing: `LICENSE-MIT` added (paired with `LICENSE-APACHE`).
+- URLs fixed: `Cargo.toml`, `SECURITY.md` point to `vanshcodeworks/Carapace`.
+- Public docs refreshed: `faq.md`, `runtime-guide.md`, `CONTRIBUTING.md`,
+  `release.md`, `mcp.md` reflect current state.
 

@@ -1,6 +1,6 @@
 # STATE - agent working state (overwritten every cycle)
 
-Last updated: cycle 17 (P3: persistent sessions) - 2026-10-27.
+Last updated: cycle 18 (ship) - 2026-11-07.
 
 ## Done (all green via scripts/check.sh)
 - C0-C12 COMPLETE at 02044f0 (see FINAL_REPORT.md).
@@ -94,6 +94,26 @@ Last updated: cycle 17 (P3: persistent sessions) - 2026-10-27.
 - Full workspace: **250 passed / 0 failed** (27 result lines; 31 red-team
   tests); clippy -D warnings clean; runtime matrix 17/17; escape suite
   23/23.
+
+- **Cycle 18 shipping polish (COMPLETE):**
+  - Animated README with SVG hero (`docs/assets/hero.svg`), simple English,
+    no em dashes. Current capabilities only: run, session, mcp, doctor,
+    policy, Tier 1. "What it does not do yet" section is honest.
+  - Agent setup files: `AGENT_SETUP.md` (for the agent) and
+    `docs/agents.md` (for the human). MCP smoke test `scripts/mcp-smoke.py`.
+  - Licensing: `LICENSE-MIT` added (paired with `LICENSE-APACHE`).
+  - URLs fixed: `Cargo.toml`, `SECURITY.md` now point to
+    `vanshcodeworks/Carapace`. `CHANGELOG.md` records unreleased changes.
+  - Public docs refreshed: `faq.md`, `runtime-guide.md`, `CONTRIBUTING.md`,
+    `release.md`, `mcp.md` reflect current state (17/17 runtime, sessions,
+    no allowlist, no "never publish").
+  - CI hardened: `.github/workflows/ci.yml` adds docs check (no em dashes),
+    shell syntax check, and `cargo deny check` job.
+  - Verification: local `scripts/check.sh` passes (250 tests, 17/17
+    runtime matrix). CI on `main` and `agent/work` passes (fmt, clippy,
+    test, cargo deny). `cargo deny check` passes locally.
+  - Repository: pushed to `agent/work`, fast-forwarded `main` to commit
+    `eb8d4be`, made public via `gh repo edit`. Both branches at same commit.
 
 ## In progress
 - P3 rest: network allowlist (seccomp user-notification `connect` broker,

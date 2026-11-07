@@ -450,3 +450,55 @@ Housekeeping: the GitHub repository `vanshcodeworks/Carapace` was set to
 Next: push `agent/work`; then network allowlist (seccomp user-notification
 `connect` broker, IP/CIDR + port), Python/TypeScript SDKs, and P4
 (external-review brief, draft escape challenge).
+
+## Cycle 18 (ship) - 2026-11-07 - public repo, animated README, agent setup, CI hardening
+
+Task: ship Carapace on GitHub as a public, tested, easy-to-use project.
+Animated README in very simple English, agent-facing setup file, all commits
+on `main` and `agent/work`, repo verification, CI hardening.
+
+Outcome: DONE.
+
+- **Animated README**: new SVG hero (`docs/assets/hero.svg`) showing agent
+  code being blocked by Carapace while the host stays safe. README
+  rewritten in very simple English, no em dashes (enforced by
+  `scripts/check-docs.py`). Documents what exists today: `cara run`,
+  `cara session`, `cara mcp`, `cara doctor`, `cara policy`, Tier 1 native.
+  "What Carapace stops" table updated from escape catalog (3-column format:
+  Test, Attack, Result). "What it does not do yet" section is honest:
+  network allowlist, aarch64, SDKs, prebuilt binaries, kernel exploits.
+
+- **Agent setup**: `AGENT_SETUP.md` (file to hand to an agent) and
+  `docs/agents.md` (human guide to agent workflows). Covers host check,
+  clone, build, install, doctor gate, MCP configuration, smoke test, and
+  safety rules. The agent can run `python3 scripts/mcp-smoke.py` to verify
+  the connection.
+
+- **Licensing & metadata**: `LICENSE-MIT` added (paired with
+  `LICENSE-APACHE`). `Cargo.toml` and `SECURITY.md` URLs fixed to
+  `vanshcodeworks/Carapace`. `CHANGELOG.md` records unreleased changes.
+
+- **Public docs refreshed**: `docs/faq.md`, `docs/runtime-guide.md`,
+  `CONTRIBUTING.md`, `docs/release.md`, `docs/mcp.md` updated to reflect
+  current state (17/17 runtime matrix including Go/JVM, sessions exist,
+  network allowlist refused, no "never publish" wording, MCP smoke test
+  documented).
+
+- **CI hardening**: `.github/workflows/ci.yml` adds docs check (no em
+  dashes), shell syntax check, and `cargo deny check` job. `scripts/check.sh`
+  runs docs check, shell syntax, fmt, clippy, tests, and runtime matrix.
+
+- **Verification**: `scripts/check.sh` passes locally (250 tests, 17/17
+  runtime matrix). CI on `main` and `agent/work` passes (fmt, clippy,
+  test, cargo deny). `cargo deny check` passes locally.
+
+- **Repository**: pushed to `agent/work` and fast-forwarded `main` to
+  commit `eb8d4be`. Made repository public via `gh repo edit`. Both
+  branches at the same commit. CI green on both.
+
+Commands: `scripts/check.sh`, `cargo deny check`, `python3 scripts/mcp-smoke.py`,
+`git push origin agent/work`, `git checkout main && git merge agent/work --ff-only`,
+`git push origin main`, `gh repo edit --visibility public --accept-visibility-change-consequences`.
+
+Next: maintain public repo; track issues; network allowlist (P3 rest), SDKs,
+P4 (external review brief, escape challenge). Update agent journals per cycle.

@@ -149,3 +149,20 @@ test lands at listed milestone.
 | Unknown/malformed session ids exit 3; `session start` requires an absolute program path | `session.rs::unknown_and_malformed_ids_are_rejected`, `session_start_requires_an_absolute_program` | ✅ verified P3 |
 | Session policy is validated on the host and again in the keeper; `network = "allowlist"` is refused; memory < 64 MiB is refused; the policy round-trips through JSON | `carapace-native::session::tests::session_policy_rejects_allowlist_and_tiny_memory`, `session_policy_round_trips_through_json` | ✅ verified P3 |
 | MCP exposes exactly 8 tools including 6 session tools; session ids are server-owned, and foreign ids are refused before any filesystem/socket access | `cara-mcp` unit tests `tools_list_has_exactly_eight_tools`, `session_tools_validate_before_touching_a_sandbox`; e2e foreign-id refusal | ✅ verified P3 |
+
+## Cycle 18 claims (shipping, 2026-11-07)
+| Claim | Basis | Status |
+|---|---|---|
+| Animated README hero (`docs/assets/hero.svg`) renders in-browser and shows agent code being blocked by Carapace | SVG is valid XML; GitHub README renders it | ✅ cycle 18 |
+| README is written in very simple English with no em dash characters | `scripts/check-docs.py` enforces the rule; CI runs it | ✅ cycle 18 |
+| "What Carapace stops" table uses 3-column format (Test, Attack, Result) generated from escape catalog | `table::markdown()` updated; test `readme_table_matches_the_catalog` passes | ✅ cycle 18 |
+| README only documents what exists today: run, session, mcp, doctor, policy, Tier 1; "What it does not do yet" section lists network allowlist, aarch64, SDKs, prebuilt binaries, kernel exploits | Manual review + cycle 18 diff | ✅ cycle 18 |
+| `AGENT_SETUP.md` is a complete step-by-step file an agent can follow to set up Carapace | Manual verification: host check, clone, build, install, doctor, MCP config, smoke test | ✅ cycle 18 |
+| `docs/agents.md` is a complete human guide to agent workflows: MCP config, sessions, policy recipes, safety rules, verify commands | Manual verification | ✅ cycle 18 |
+| MCP smoke test `scripts/mcp-smoke.py` performs real handshake, lists 8 tools, runs one `run_code` through sandbox | Tested on WSL2 with `systemd-run --user --scope` bridge; output "mcp smoke: ok" | ✅ cycle 18 |
+| `LICENSE-MIT` added and paired with `LICENSE-APACHE`; both Apache-2.0 OR MIT | Files exist; `Cargo.toml` license field unchanged | ✅ cycle 18 |
+| Repository URLs fixed to `https://github.com/vanshcodeworks/Carapace` in `Cargo.toml` and `SECURITY.md` | `git diff` shows changes; GitHub repo is public at that URL | ✅ cycle 18 |
+| CI adds docs check (no em dashes), shell syntax check, and `cargo deny check` job | `.github/workflows/ci.yml` diff; both jobs pass on `main` and `agent/work` | ✅ cycle 18 |
+| `scripts/check.sh` runs docs check, shell syntax, fmt, clippy, workspace tests, runtime matrix | Local run: 250 passed / 0 failed; runtime matrix 17/17 | ✅ cycle 18 |
+| `cargo deny check` passes (advisories, bans, licenses, sources all ok) | Local and CI run; wasmtime 50.0.1 for RUSTSEC-2026-0420 | ✅ cycle 18 |
+| Repository is public; `main` and `agent/work` both at commit `eb8d4be`; CI green on both | `gh repo view`, `gh run list`, branch pointers | ✅ cycle 18 |
