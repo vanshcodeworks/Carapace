@@ -125,7 +125,7 @@ run (a current implementation limit of the child's fixed buffers).
 ## What has actually been run (P2 runtime matrix)
 
 `scripts/runtime-matrix.py` spawns real workloads through the real Tier 1
-sandbox and asserts their output (not just exit status). 15/15 pass on the
+sandbox and asserts their output (not just exit status). 17/17 pass on the
 reference WSL environment, and `scripts/check.sh` runs the matrix after the
 workspace tests:
 
@@ -136,9 +136,29 @@ workspace tests:
 | Node.js | inline JSON, `worker_threads` worker loaded from a read-write bind |
 | gcc | compile a C program into a read-write bind, then exec the result inside the sandbox |
 | Rust | run a host-built binary, exec from a read-write bind |
+| Go | build and run a Go program, including goroutines |
+| OpenJDK | `javac` compile and run a threaded Java program |
 
-Go and JVM runtimes remain unverified (see `docs/agent/UNVERIFIED.md` R1.2);
-the matrix skips optional runtimes (Node, gcc, rustc) that are not installed.
+The matrix skips optional runtimes (Node, gcc, rustc, Go, JVM) that are not
+installed. Other distro, kernel, and JDK layouts remain unverified (see
+`docs/agent/UNVERIFIED.md` R2.11 and R2.12).
+
+## Persistent work across runs
+
+A normal `cara run` gets a fresh `/work`. If a workflow needs files to
+survive between calls, use a session:
+
+```sh
+id=$(cara session start --policy policy.toml)
+cara session exec "$id" -- /usr/bin/python3 /work/train.py
+cara session exec "$id" -- /usr/bin/python3 /work/report.py
+cara session close "$id"
+```
+
+The session `/work` is a size-capped tmpfs. Each exec still gets a new PID
+namespace and a new root, so processes do not survive. See
+[docs/mcp.md](mcp.md) for the MCP session tools and
+[ADR-0009](decisions/ADR-0009-sessions.md) for the design.
 
 ## Adding a *new* runtime (the general recipe)
 

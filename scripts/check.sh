@@ -27,6 +27,14 @@ if ! grep -q "user.slice/user-$(id -u).slice" /proc/self/cgroup 2>/dev/null \
   exec systemd-run --user --scope --quiet "$0" "$@"
 fi
 
+echo "==> docs check"
+python3 scripts/check-docs.py
+
+echo "==> shell syntax"
+bash -n scripts/check.sh
+bash -n scripts/install.sh
+bash -n demo/demo.sh
+
 echo "==> cargo fmt --check"
 cargo fmt --all -- --check
 

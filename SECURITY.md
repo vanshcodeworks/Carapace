@@ -13,7 +13,7 @@ Report privately via:
 - Email: **TODO(verify)** — security contact address not yet provisioned
   (pre-release). Until it is announced here, use a GitHub private
   vulnerability report on the repository
-  (https://github.com/vanshgoyal000/Carapace/security/advisories/new).
+  (https://github.com/vanshcodeworks/Carapace/security/advisories/new).
 
 Include: affected commit or release, kernel and distro (`uname -a`),
 environment (bare metal / WSL2 / container — `cara doctor --json` output
@@ -55,7 +55,10 @@ kernels that pass `cara doctor`.
   into the payload, environment leakage, processes surviving teardown,
   supervisor death or exhaustion, privilege transitions inside the
   sandbox.
-- The (upcoming) MCP server: input validation bypasses, size-cap bypasses.
+- The MCP server and session manager: input validation bypasses, size-cap
+  bypasses, session id confusion, path traversal in upload/download, keeper
+  lifecycle bugs, and control-socket access that crosses a documented trust
+  boundary.
 - The doctor gate: an environment that `doctor` declares ready but that
   cannot actually isolate (or vice versa: a false refusal is a bug too,
   just not a security one).
