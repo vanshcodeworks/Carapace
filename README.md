@@ -1,12 +1,12 @@
 <p align="center">
-  <img src="docs/assets/hero.svg" alt="An animated terminal shows agent code being blocked by Carapace while the host machine stays safe." width="100%">
+  <img src="docs/assets/hero.svg" alt="Animated diagram showing an agent request entering an isolated sandbox with resource boundaries and the host remaining protected." width="100%">
 </p>
 
 <h1 align="center">Carapace</h1>
 
 <p align="center">
   <strong>Run code written by AI agents. Keep your machine.</strong><br>
-  A small, local sandbox. No daemon. No Docker. No root.
+  A local execution sandbox for untrusted code. One binary. No daemon. No Docker. No root.
 </p>
 
 <p align="center">
@@ -14,9 +14,12 @@
   <img alt="Status" src="https://img.shields.io/badge/status-alpha-orange">
   <img alt="Platform" src="https://img.shields.io/badge/platform-Linux%20x86__64-blue">
   <img alt="License" src="https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-green">
+  <a href="https://github.com/vanshcodeworks/Carapace/blob/main/docs/agent/CLAIMS.md"><img alt="Claims" src="https://img.shields.io/badge/claims-verified-brightgreen"></a>
 </p>
 
-## What is Carapace?
+---
+
+## What is Carapace
 
 Carapace is a local sandbox for untrusted code. It is built for code that an AI agent writes and wants to run.
 
@@ -37,27 +40,33 @@ A normal agent needs a shell to test its work. A shell on your laptop can read y
 
 That is the whole product.
 
-## What works today
+---
 
-| Feature | Status |
-|---|---|
-| `cara run` | One-shot sandbox. Runs a program with limits and returns a report. |
-| `cara session` | Persistent `/work` across execs. Every exec is a fresh sandbox. |
-| `cara mcp` | MCP server with 8 tools for agent clients. |
-| `cara doctor` | Measures the host. Refuses to run when the host cannot isolate. |
-| `cara policy` | Strict TOML policy. `check` and `explain`. |
-| Tier 1 native | Linux namespaces, cgroups v2, Landlock, seccomp, capability drop. This is the supported path. |
-| Tier 2 Wasm | Library backend with parity tests. Not exposed by the CLI yet. |
-| Tier 3 microVM | Design and fail-closed plan. Not usable yet. |
+## Feature Status
 
-### One run
+| Feature | Status | Notes |
+|---------|--------|-------|
+| `cara run` | ✅ Implemented | One-shot sandbox with limits and JSON report |
+| `cara session` | ✅ Implemented | Persistent `/work` across execs, fresh sandbox each exec |
+| `cara mcp` | ✅ Implemented | MCP server with 8 tools for agent clients |
+| `cara doctor` | ✅ Implemented | Measures host capabilities, fails closed when not ready |
+| `cara policy` | ✅ Implemented | Strict TOML, `check` and `explain` |
+| Tier 1 native | ✅ Supported | Namespaces, cgroups v2, Landlock, seccomp, capability drop |
+| Tier 2 Wasm | 🧪 Library backend | Parity tests pass, not exposed by CLI |
+| Tier 3 microVM | 📐 Design | Fail-closed plan, not usable |
+
+---
+
+## Product Demonstration
+
+### One-shot execution
 
 ```sh
 cara run -- /bin/sh -c 'echo hello from the sandbox'
 cara run --json -- /usr/bin/python3 -c 'print(6 * 7)'
 ```
 
-### One session
+### Persistent session
 
 ```sh
 id=$(cara session start --policy dev.toml)
@@ -66,9 +75,9 @@ cara session exec "$id" -- /bin/sh -c 'cat /work/input.txt'
 cara session close "$id"
 ```
 
-The file survives. The process does not. Each `session exec` gets a new PID namespace and a new root.
+The file survives. The process does not. Each `session exec` gets a new PID namespace and a new root filesystem.
 
-### One agent connection
+### Agent connection (MCP)
 
 ```json
 {
@@ -81,13 +90,189 @@ The file survives. The process does not. Each `session exec` gets a new PID name
 }
 ```
 
-The agent gets these tools:
+The agent gets these tools: `run_code`, `explain_result`, `session_create`, `session_exec`, `session_upload`, `session_download`, `session_list`, `session_close`.
 
-`run_code`, `explain_result`, `session_create`, `session_exec`, `session_upload`, `session_download`, `session_list`, `session_close`.
+---
 
-## Try it
+## Security Architecture
+
+```mermaid
+flowchart TD
+    A[Agent / Caller] --> B{Entry Point}
+    B -->|CLI| C[cara run]
+    B -->|MCP| D[cara-mcp server]
+    C --> E[Policy::parse]
+    D --> E
+    E --> F[SandboxSpec]
+    F --> G[cara-doctor gate]
+    G -->|not ready| H[Exit 4 - fail closed]
+    G -->|ready| I[NativeBackend::spawn]
+    I --> J[Validate host layout]
+    J --> K[Prepare parent-side]
+    K --> L[Fork stage-1]
+    L --> M[Create cgroup leaf]
+    M --> N[Attach stage-1]
+    N --> O[Go byte]
+    O --> P[Stage-1: unshare namespaces]
+    P --> Q[Stage-1: uid/gid map]
+    Q --> R[Fork stage-2]
+    R --> S[Stage-2: rlimits]
+    S --> T[MS_REC\|MS_PRIVATE]
+    T --> U[Mount root tmpfs]
+    U --> V[Bind policy paths]
+    V --> W[Bind /usr read-only]
+    W --> X[Create /dev nodes]
+    X --> Y[Mount /dev/shm tmpfs]
+    Y --> Z[Create /etc sandbox]
+    Z --> AA[Mount /work tmpfs]
+    AA --> AB[Mount /proc]
+    AB --> AC[pivot_root]
+    AC --> AD[Verify sandbox]
+    AD --> AE[close_range]
+    AE --> AF[capset drop all]
+    AF --> AG[no_new_privs]
+    AG --> AH[Landlock ruleset]
+    AH --> AI[seccomp filter]
+    AI --> AJ[execve payload]
+    AJ --> AK[Supervision]
+    AK --> AL[ExitReport]
+```
+
+### Trust Boundary
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        HOST MACHINE                             │
+│  ┌─────────────────────────────────────────────────────────┐   │
+│  │                    CARAPACE SUPERVISOR                    │   │
+│  │  • Policy validation (fail closed)                        │   │
+│  │  • Doctor capability checks                               │   │
+│  │  • cgroup v2 leaf creation                                │   │
+│  │  • Stage-1 fork and attach                                │   │
+│  └──────────────────────┬────────────────────────────────────┘   │
+│                         │                                        │
+│         ┌───────────────┴───────────────┐                       │
+│         ▼                               ▼                       │
+│  ┌─────────────────┐           ┌─────────────────┐             │
+│  │   STAGE-1       │           │   STAGE-2       │             │
+│  │  (no namespaces)│           │  (PID ns init)  │             │
+│  │  • parked       │           │  • namespaces   │             │
+│  │  • cgroup leaf  │           │  • pivot_root   │             │
+│  └────────┬────────┘           │  • Landlock     │             │
+│           │                    │  • seccomp      │             │
+│           │                    │  • caps dropped │             │
+│           │                    │  • execve       │             │
+│           └────────┬───────────┘────────┬────────┘             │
+│                    │                    │                      │
+│                    ▼                    ▼                      │
+│         ┌─────────────────────────────────────────┐           │
+│         │           SANDBOX PAYLOAD               │           │
+│         │  • Fresh PID / mount / net / IPC / UTS  │           │
+│         │  • Read-only /usr                       │           │
+│         │  • No /home, /root, /sys                │           │
+│         │  • /work tmpfs (size capped)            │           │
+│         │  • CPU, memory, PIDs, disk, output caps │           │
+│         │  • seccomp allowlist (~140 syscalls)    │           │
+│         └─────────────────────────────────────────┘           │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Attack Containment
+
+Every row is a test in the escape suite (crate `carapace-escape-tests`). The payload runs through the real sandbox and the suite asserts the documented result. The table is generated from the test catalog, so it cannot drift from what is actually tested.
+
+### Process Exhaustion
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `fork_bomb` | Fork bomb | Capped by pids.max and killed at the timeout; peak process count stays near the cap and no stragglers survive on the host |
+
+### Resource Exhaustion
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `memory_hog` | Memory hog | OOM-killed at the memory limit (KillReason::MemoryLimit) with peak memory near the cap; the host is unaffected |
+| `cpu_spin` | CPU spin | Killed at the wall timeout with cpu_time close to the cpu.max quota (100 percent of one core) |
+| `disk_filler` | Disk filler | Writes fail with ENOSPC (8 MiB root tmpfs) or the RLIMIT_FSIZE / scratch-size cap; the host filesystem is untouched |
+| `output_flood` | Output flood | Killed with KillReason::OutputOverflow at the output cap; captured output stays capped |
+
+### Filesystem Isolation
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `read_etc_passwd` | Read /etc/passwd | Succeeds but shows the sandbox's own passwd (carapace-sandbox-marker), never host users |
+| `read_shadow` | Read /etc/shadow | The file does not exist inside the sandbox; cat fails |
+| `read_home` | Read /home and /root | Neither exists inside the sandbox (No such file or directory) |
+| `write_outside` | Write outside the sandbox | Both writes denied: /usr is read-only (EROFS), /etc is denied by Landlock; no host file appears |
+| `write_then_exec` | Write then execute | The file is created but Landlock denies execve on writable locations: the written program never runs (Permission denied, rc=126) |
+| `symlink_escape` | Symlink escape | The link resolves to the sandbox's own /etc/passwd within the Landlock scope; the host file is untouched |
+
+### Namespace Isolation
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `proc_escape` | /proc inspection | /proc/1 is the sandbox's own shell and the pid space is fresh (max pid <= 10); host processes are invisible |
+
+### Privilege Escalation
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `setuid_escalation` | setuid escalation | Every uid change fails with EPERM (no CAP_SETUID); setuid bits in the read-only /usr bind are inert: CapEff=0000000000000000 and NoNewPrivs=1 |
+
+### System Call Restrictions
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `ptrace_attempt` | ptrace injection | Denied with EPERM: ptrace is not in the seccomp allowlist |
+| `mount_attempt` | mount(2) attempt | Denied with EPERM: mount(2) is not in the seccomp allowlist |
+| `unshare_attempt` | unshare(2) escape | Denied with EPERM: unshare(2) is not in the seccomp allowlist |
+
+### Network Restrictions
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `socket_egress` | Network egress | Denied with EPERM on socket(2): no sockets exist (empty netns plus seccomp); the connection is never made |
+| `abstract_unix_escape` | Abstract Unix socket | Denied with EPERM: socket(2) itself is denied, so the abstract namespace is unreachable |
+
+### Kernel Interface Abuse
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `keyring_abuse` | Keyring abuse | Denied with EPERM: keyring syscalls are not in the seccomp allowlist |
+
+### Information Leakage
+
+| Test | Attack | Result |
+|------|--------|--------|
+| `fd_leak_scan` | FD leak scan | Exactly 0, 1, 2 plus the scanner's own transient directory fd; nothing else leaks in |
+| `env_leak` | Environment leak | The child sees exactly the allowlisted variables the spec set; nothing is inherited from the host |
+
+### Additional Red-Team Coverage
+
+The red-team suite (`tests/redteam.rs`, 31 tests) covers chroot, mknod, sethostname, /proc/sys writes, cross-hierarchy rename, zombie hoards, dual-stream floods, slow-drip output, hostile argv, the new mount API, memfd, mmap exec, and more. All are denied or contained.
+
+---
+
+## Threat Model Boundaries
+
+**Tier 1 does not promise:**
+- Protection against a Linux kernel exploit. All namespaces share the host kernel. A payload that exploits the kernel from inside can escape. This is why Tiers 2 and 3 exist.
+- Side channels (Spectre-class, Rowhammer).
+- Hardware/DMA attacks.
+- The host already being compromised by other means.
+- Misconfiguration by the trusted user who writes the policy.
+
+See [docs/threat-model.md](docs/threat-model.md) for the complete model.
+
+---
+
+## Installation
 
 You need Linux x86_64. WSL2 works. You need Rust 1.85 or newer and git.
+
+### With the installer (recommended)
 
 ```sh
 git clone https://github.com/vanshcodeworks/Carapace.git
@@ -97,7 +282,7 @@ bash scripts/install.sh
 
 The installer builds `cara` and `cara-mcp`, installs them in `~/.local/bin`, and runs `cara doctor`. If doctor fails, Carapace will not run code. Fix the host first. The installer prints the exact remedy.
 
-If you do not want the installer:
+### Manual build
 
 ```sh
 cargo build --release -p carapace-cli -p carapace-mcp
@@ -105,55 +290,271 @@ cargo build --release -p carapace-cli -p carapace-mcp
 ./target/release/cara run -- /bin/sh -c 'echo hello from the sandbox'
 ```
 
-## Give this repo to your agent
+---
 
-Hand your agent [AGENT_SETUP.md](AGENT_SETUP.md). It is a step-by-step file for an AI agent. It covers:
+## Quick Start
 
-- checking the host
-- cloning and building
-- installing the two binaries
-- running the doctor gate
-- connecting an MCP client
-- running a safe smoke test
-- what to do when the host is not ready
+```sh
+# 1. Check your host
+cara doctor
 
-The short version:
+# 2. Run a command
+cara run -- /bin/sh -c 'echo hello from the sandbox'
 
-> Read AGENT_SETUP.md in https://github.com/vanshcodeworks/Carapace and set up Carapace on this machine. Stop if `cara doctor` fails. Do not disable the sandbox.
+# 3. Run with JSON output
+cara run --json -- /usr/bin/python3 -c 'print(6 * 7)'
 
-For the full agent guide, see [docs/agents.md](docs/agents.md).
+# 4. Use a session for persistent files
+id=$(cara session start --policy dev.toml)
+cara session exec "$id" -- /bin/sh -c 'echo data > /work/input.txt'
+cara session exec "$id" -- /bin/sh -c 'cat /work/input.txt'
+cara session close "$id"
+```
 
-## What it stops
+---
 
-Every row is a test in the escape suite (crate `carapace-escape-tests`): the payload runs through the real sandbox and the suite asserts the documented result. The table is generated from the test catalog, so it cannot drift from what is actually tested.
+## CLI Reference
 
-| Test | Attack | Result |
-|---|---|---|
-| `fork_bomb` | Fork bomb | Capped by pids.max and killed at the timeout; peak process count stays near the cap and no stragglers survive on the host |
-| `memory_hog` | Memory hog | OOM-killed at the memory limit (KillReason::MemoryLimit) with peak memory near the cap; the host is unaffected |
-| `cpu_spin` | CPU spin | Killed at the wall timeout with cpu_time close to the cpu.max quota (100 percent of one core) |
-| `disk_filler` | Disk filler | Writes fail with ENOSPC (8 MiB root tmpfs) or the RLIMIT_FSIZE / scratch-size cap; the host filesystem is untouched |
-| `output_flood` | Output flood | Killed with KillReason::OutputOverflow at the output cap; captured output stays capped |
-| `read_etc_passwd` | Read /etc/passwd | Succeeds but shows the sandbox's own passwd (carapace-sandbox-marker), never host users |
-| `read_shadow` | Read /etc/shadow | The file does not exist inside the sandbox; cat fails |
-| `read_home` | Read /home and /root | Neither exists inside the sandbox (No such file or directory) |
-| `write_outside` | Write outside the sandbox | Both writes denied: /usr is read-only (EROFS), /etc is denied by Landlock; no host file appears |
-| `write_then_exec` | Write then execute | The file is created but Landlock denies execve on writable locations: the written program never runs (Permission denied, rc=126) |
-| `symlink_escape` | Symlink escape | The link resolves to the sandbox's own /etc/passwd within the Landlock scope; the host file is untouched |
-| `proc_escape` | /proc inspection | /proc/1 is the sandbox's own shell and the pid space is fresh (max pid <= 10); host processes are invisible |
-| `ptrace_attempt` | ptrace injection | Denied with EPERM: ptrace is not in the seccomp allowlist |
-| `mount_attempt` | mount(2) attempt | Denied with EPERM: mount(2) is not in the seccomp allowlist |
-| `unshare_attempt` | unshare(2) escape | Denied with EPERM: unshare(2) is not in the seccomp allowlist |
-| `socket_egress` | Network egress | Denied with EPERM on socket(2): no sockets exist (empty netns plus seccomp); the connection is never made |
-| `abstract_unix_escape` | Abstract Unix socket | Denied with EPERM: socket(2) itself is denied, so the abstract namespace is unreachable |
-| `setuid_escalation` | setuid escalation | Every uid change fails with EPERM (no CAP_SETUID); setuid bits in the read-only /usr bind are inert: CapEff=0000000000000000 and NoNewPrivs=1 |
-| `keyring_abuse` | Keyring abuse | Denied with EPERM: keyring syscalls are not in the seccomp allowlist |
-| `fd_leak_scan` | FD leak scan | Exactly 0, 1, 2 plus the scanner's own transient directory fd; nothing else leaks in |
-| `env_leak` | Environment leak | The child sees exactly the allowlisted variables the spec set; nothing is inherited from the host |
+### Run a command
 
-Additional red-team probes (tests/redteam.rs) cover chroot, mknod, sethostname, /proc/sys writes, cross-hierarchy rename, zombie hoards, dual-stream floods, slow-drip output, hostile argv, the new mount API, memfd, mmap exec, and more. All are denied or contained.
+```sh
+cara run [OPTIONS] -- <PROGRAM> [ARGS...]
 
-## What it does not do yet
+Options:
+  --policy FILE    Policy file (TOML). Without one, the strict preset applies.
+  --json           Machine-readable JSON report on stdout.
+  --timeout DUR    Override the wall-clock timeout (e.g. "30s").
+```
+
+### Manage sessions
+
+```sh
+cara session start [--policy FILE] [--json]     # Create session, prints ID
+cara session exec ID [--timeout DUR] [--json] -- <PROGRAM> [ARGS...]
+cara session put ID <local> <remote>            # Upload file to session /work
+cara session get ID <remote> <local>            # Download file from session /work
+cara session ls ID [PATH] [--json]              # List directory in session
+cara session list [--json]                      # List all sessions
+cara session close ID                           # Close session, remove /work
+cara session prune [--json]                     # Remove dead sessions
+```
+
+### Policy commands
+
+```sh
+cara policy check FILE [--json]    # Validate policy (exit 0 = valid, 3 = invalid)
+cara policy explain FILE           # Print what the policy allows in plain English
+```
+
+### Doctor and MCP
+
+```sh
+cara doctor [--json]               # Check host capabilities
+cara mcp                           # Run MCP server on stdio
+```
+
+---
+
+## MCP Integration
+
+Build once:
+
+```sh
+cargo build --release -p carapace-mcp
+```
+
+The server binary is `target/release/cara-mcp`, or `~/.local/bin/cara-mcp` after the installer.
+
+### Claude Desktop
+
+Settings → Developer → Edit Config:
+
+```json
+{
+  "mcpServers": {
+    "carapace": {
+      "command": "/home/YOU/.local/bin/cara-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+### Cursor
+
+`~/.cursor/mcp.json` or project `.cursor/mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "carapace": {
+      "command": "/home/YOU/.local/bin/cara-mcp",
+      "args": []
+    }
+  }
+}
+```
+
+The path must be absolute. The server runs on the same machine as the sandbox. There is no remote mode.
+
+### Verify the connection
+
+```sh
+python3 scripts/mcp-smoke.py "$(command -v cara-mcp)"
+```
+
+This performs a real MCP handshake, lists all 8 tools, and runs one harmless shell command through the sandbox.
+
+### Available tools
+
+| Tool | Description |
+|------|-------------|
+| `run_code` | Execute a short shell or Python program in a one-shot sandbox |
+| `explain_result` | Explain a sandbox report in plain English |
+| `session_create` | Create a persistent session with size-capped `/work` |
+| `session_exec` | Run code in a fresh sandbox using the session's `/work` |
+| `session_upload` | Write base64 content to a file in the session work dir |
+| `session_download` | Read a session file as base64 |
+| `session_list` | List sessions created by this server with liveness |
+| `session_close` | Stop a session and remove its work dir |
+
+The server treats MCP input as hostile: size caps, field whitelists, absolute program paths, no shell interpolation. A request can narrow a policy but never widen it beyond local configuration.
+
+---
+
+## Policy Configuration
+
+Policies are strict TOML. Unknown fields are rejected. Unknown units are rejected. A policy can never silently widen permissions (fail closed).
+
+### Presets
+
+```toml
+# Strict: tight everything, no network (default)
+preset = "strict"
+
+# Dev: room to work, still no network, exec_on_write = true
+preset = "dev"
+
+# Network-light: dev limits with allowlist network (not implemented, fails closed)
+preset = "network-light"
+```
+
+### Strict preset defaults
+
+```toml
+[limits]
+timeout = "10s"
+memory = "256MB"
+max_processes = 32
+disk = "64MB"
+max_output = "1MB"
+
+[filesystem]
+read_only = []
+read_write = []
+exec_on_write = false
+
+[network]
+mode = "none"
+```
+
+### Custom policy example
+
+```toml
+preset = "strict"
+
+[limits]
+timeout = "30s"
+memory = "512MB"
+max_processes = 64
+disk = "256MB"
+max_output = "4MB"
+
+[filesystem]
+read_only = ["/opt/models", "/srv/datasets"]
+read_write = ["/home/user/project"]
+exec_on_write = false
+
+[network]
+mode = "none"
+```
+
+### Network modes
+
+| Mode | Behavior |
+|------|----------|
+| `none` | Empty network namespace, seccomp denies socket(2) |
+| `full` | Share host network namespace (loud opt-in) |
+| `allowlist` | Not implemented, fails closed at run time |
+
+---
+
+## Supported Runtimes
+
+The sandbox bind-mounts the host `/usr` read-only, so every interpreter your distro ships works without per-language setup. The P2 runtime matrix exercises these end-to-end (17 passed, 0 failed, 0 skipped on the reference WSL environment):
+
+| Runtime | Exercised |
+|---------|-----------|
+| bash + coreutils | pipelines, sort/head, sed/awk, find/grep, date/expr |
+| Python 3 | stdlib JSON/re/hashlib, subprocess, sqlite3, ssl (no network), threads, concurrent.futures, multiprocessing.Pool |
+| Node.js | inline JSON, worker_threads from read-write bind |
+| gcc | compile C program into read-write bind, exec result in sandbox |
+| Rust | run host-built binary, exec from read-write bind |
+| Go | build and run, including goroutines |
+| OpenJDK | javac compile and run threaded Java |
+
+The matrix skips optional runtimes (Node, gcc, rustc, Go, JVM) that are not installed. Other distro, kernel, and JDK layouts remain unverified.
+
+---
+
+## Workspace Structure
+
+```
+crates/
+  cara-core          types: SandboxSpec, Policy (TOML), ExitReport, DoctorReport
+  cara-sys           raw syscalls - ALL unsafe code confined here
+  cara-native        Tier 1 backend: doctor, supervisor, child, rootfs, cgroups, seccomp
+  cara-cli           the `cara` binary (doctor / run / policy / session / mcp)
+  cara-mcp           MCP server with 8 tools
+  cara-wasm          Tier 2 library backend
+  cara-vm            Tier 3 design and fail-closed plan
+  cara-escape-tests  hostile payload catalog + generated README table
+docs/
+  threat-model.md    what is defended, what is not - read this first
+  policy.md          policy file reference
+  architecture.md    how a run works
+  runtime-guide.md   running languages
+  troubleshooting.md doctor remedies
+  mcp.md             MCP contract
+  agents.md          agent workflows
+  decisions/         ADRs
+  agent/             working state: STATE, LOG, CLAIMS, UNVERIFIED
+scripts/
+  check.sh           full verification loop
+  install.sh         build and install cara + cara-mcp
+  mcp-smoke.py       real MCP handshake + run_code smoke test
+  runtime-matrix.py  P2 runtime matrix
+demo/                product demo (escape suite via CLI)
+```
+
+---
+
+## Host Requirements
+
+- Linux kernel ≥ 5.10 (developed on 6.18)
+- cgroup v2 unified hierarchy with cpu, memory, pids delegation
+- Unprivileged user namespaces (CLONE_NEWUSER)
+- Landlock LSM (kernel ≥ 5.13, ABI probed at runtime)
+- seccomp-bpf
+- pidfd (kernel ≥ 5.3) and close_range (kernel ≥ 5.9) - optional but recommended
+- Merged-usr layout (`/bin` → `/usr/bin`, `/lib` → `/usr/lib`)
+- systemd for cgroup delegation (WSL2 needs `systemd-run --user --scope`)
+
+Run `cara doctor` to measure your exact environment. It prints exact remedies for every missing capability.
+
+---
+
+## Limitations and Non-Goals
 
 - **Network allowlist.** `network = "allowlist"` is refused. Use `none` or `full`.
 - **Windows and macOS native.** Linux only. WSL2 works.
@@ -163,20 +564,7 @@ Additional red-team probes (tests/redteam.rs) cover chroot, mknod, sethostname, 
 - **Kernel exploits.** Tier 1 shares the host kernel. A kernel exploit can escape. Tier 2 and Tier 3 exist to change that, but Tier 2 is not in the CLI yet and Tier 3 is not usable.
 - **Other distros.** The measured environment is WSL2 Ubuntu 24.04, kernel 6.18, x86_64. Other distros are not supported until they are measured. `cara doctor` is the gate.
 
-## How it works
-
-1. `cara doctor` measures user namespaces, cgroup v2, Landlock, seccomp, and the host layout. If a required piece is missing, it stops.
-2. `cara run` creates new user, PID, mount, network, IPC, UTS, and cgroup namespaces. It builds a small root filesystem, drops capabilities, sets `no_new_privs`, installs a seccomp allowlist, and applies Landlock rules.
-3. The payload runs with CPU, memory, process, disk, output, and wall-clock limits.
-4. The supervisor kills the whole tree and returns a report. A normal run removes its cgroup leaf and staging directory.
-
-Read [docs/architecture.md](docs/architecture.md) for the full path.
-
-## Where it fits
-
-Carapace is an execution primitive for agent platforms. If your product lets a user ask an agent to write and run code, Carapace is the part that runs the code without giving the agent the machine.
-
-It is deliberately small. It is not an IDE, a browser, a container platform, or a cloud service. It is the narrow step between model output and a real result.
+---
 
 ## Documentation
 
@@ -192,6 +580,8 @@ It is deliberately small. It is not an IDE, a browser, a container platform, or 
 - [Claims ledger](docs/agent/CLAIMS.md) - every claim and its test
 - [Unverified list](docs/agent/UNVERIFIED.md) - what is not proven yet
 
+---
+
 ## Contributing
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md). The short rules:
@@ -201,9 +591,13 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md). The short rules:
 - new configuration fails closed
 - docs must match measured behavior
 
+---
+
 ## Security
 
 Report vulnerabilities privately. See [SECURITY.md](SECURITY.md). Do not open a public issue for a security report.
+
+---
 
 ## License
 
