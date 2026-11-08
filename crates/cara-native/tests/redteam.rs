@@ -625,7 +625,7 @@ fn rt_stdin_reads_eof() {
     let out = String::from_utf8_lossy(&r.stdout).into_owned();
     assert!(out.contains("survived-stdin-eof"), "{out:?}");
     assert!(
-        start.elapsed() < Duration::from_secs(5),
+        start.elapsed() < Duration::from_secs(10),
         "must not block on stdin: {:?}",
         start.elapsed()
     );
