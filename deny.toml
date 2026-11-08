@@ -26,6 +26,8 @@ allow = [
     "Unicode-3.0",
     # Small utility licenses.
     "Zlib",
+    # libloading (libkrun dependency) uses ISC license.
+    "ISC",
     # r-efi (wasmtime UEFI support) is a tri-license; the crate may also be
     # used under MIT OR Apache-2.0. Today no crate in the tree is ONLY
     # LGPL-licensed; if one appears, a human decides here.
