@@ -8,3 +8,8 @@ repository.workspace = true
 
 [dependencies]
 carapace-core = { workspace = true }
+libkrun = { version = "1.19", features = ["init-blob", "net", "blk"] }
+libc = "0.2"
+
+[build-dependencies]
+libkrun-sys = "0.12"
