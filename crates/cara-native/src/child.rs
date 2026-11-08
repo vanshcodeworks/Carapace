@@ -11,6 +11,8 @@
 //! Landlock (C4). It exists to build and prove the namespace + supervisor
 //! machinery. Only self-written benign payloads run through it in tests.
 
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use std::ffi::CString;
 use std::os::unix::io::RawFd;
 
@@ -149,9 +151,55 @@ pub(crate) struct ChildConfig {
     /// Compiled seccomp filter (parent-side compilation; installed by
     /// stage-2 as the LAST setup step before exec).
     pub seccomp_filter: Vec<libc::sock_filter>,
+    /// Network mode for this run (needed for allowlist connect check).
+    pub network: carapace_core::NetworkMode,
+    /// Socket fd for seccomp user-notification fd passing from stage-2 to stage-1.
+    /// Created as a socketpair in the parent; one end given to stage-2 to send
+    /// the seccomp notification fd via SCM_RIGHTS. `None` if not in allowlist mode.
+    pub seccomp_notif_sock: Option<RawFd>,
+    /// Parent end of the seccomp notification socketpair. The supervisor uses
+    /// this to receive seccomp notifications from the child.
+    #[allow(dead_code)]
+    pub seccomp_notif_sock_parent: Option<RawFd>,
 }
 
 // ---------------------------------------------------------------- raw I/O
+
+/// Sends a file descriptor over a Unix socket using SCM_RIGHTS.
+/// Returns Ok(()) on success, Err(errno) on failure.
+fn send_fd(sock: RawFd, fd: RawFd) -> Result<(), i32> {
+    let cmsg_space =
+        unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as libc::c_uint) } as usize;
+    let mut cmsg_buf = vec![0u8; cmsg_space];
+    let mut iov = libc::iovec {
+        iov_base: &1u8 as *const u8 as *mut libc::c_void,
+        iov_len: 1,
+    };
+    let mut msg = libc::msghdr {
+        msg_name: std::ptr::null_mut(),
+        msg_namelen: 0,
+        msg_iov: &mut iov,
+        msg_iovlen: 1,
+        msg_control: cmsg_buf.as_mut_ptr() as *mut libc::c_void,
+        msg_controllen: cmsg_buf.len(),
+        msg_flags: 0,
+    };
+    let cmsg = unsafe { libc::CMSG_FIRSTHDR(&msg) };
+    unsafe {
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        let cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as libc::c_uint) as usize;
+        (*cmsg).cmsg_len = cmsg_len;
+        std::ptr::copy_nonoverlapping(&fd as *const RawFd, libc::CMSG_DATA(cmsg) as *mut RawFd, 1);
+    }
+    msg.msg_controllen = unsafe { (*cmsg).cmsg_len };
+    let n = unsafe { libc::sendmsg(sock, &msg, libc::MSG_NOSIGNAL) };
+    if n < 0 {
+        Err(unsafe { *libc::__errno_location() })
+    } else {
+        Ok(())
+    }
+}
 
 /// write(2) until all of `buf` is written or an error occurs. Returns errno
 /// style: Ok(()) or Err(errno). Only used pre-exec on tiny buffers, so a
@@ -1226,7 +1274,25 @@ fn run_payload(cfg: &ChildConfig) -> ! {
     drop_capabilities(cfg);
     set_no_new_privs(cfg);
     apply_landlock(cfg);
-    install_seccomp(cfg);
+    let notif_fd = match install_seccomp(cfg) {
+        Ok(fd) => fd,
+        Err(e) => fail(cfg, stage::SECCOMP, e),
+    };
+
+    // If in allowlist mode, send the seccomp notification fd to the supervisor
+    // via the socket pair.
+    if let Some(fd) = notif_fd {
+        if let Some(sock) = cfg.seccomp_notif_sock {
+            if let Err(e) = send_fd(sock, fd) {
+                let _ = unsafe { libc::close(fd) };
+                fail(cfg, stage::SECCOMP, e);
+            }
+            // The fd is now owned by the supervisor; don't close it here.
+        } else {
+            // No socket provided; close the fd to avoid leak.
+            let _ = unsafe { libc::close(fd) };
+        }
+    }
 
     // execve. C arrays built from the leaked config; on success we never
     // return. The status pipe (CLOEXEC) closes at exec: that EOF is the
@@ -1493,10 +1559,10 @@ fn apply_landlock(cfg: &ChildConfig) {
 
 /// seccomp LAST: with Landlock applied and fds sanitized, the allowlist
 /// filter seals the syscall surface until exec.
-fn install_seccomp(cfg: &ChildConfig) {
-    if let Err(e) = carapace_sys::seccomp::install(&cfg.seccomp_filter) {
-        fail(cfg, stage::SECCOMP, e);
-    }
+fn install_seccomp(cfg: &ChildConfig) -> Result<Option<RawFd>, i32> {
+    // Enable listener for seccomp user-notification if in allowlist mode.
+    let allowlist = matches!(cfg.network, carapace_core::NetworkMode::Allowlist(_));
+    carapace_sys::seccomp::install(&cfg.seccomp_filter, allowlist)
 }
 
 #[cfg(test)]

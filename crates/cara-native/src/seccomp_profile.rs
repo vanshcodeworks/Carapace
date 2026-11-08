@@ -215,12 +215,13 @@ const NETWORK_ALLOWED: &[libc::c_long] = &[
 pub fn filter_for(network: &carapace_core::NetworkMode) -> seccomp::Filter {
     let log = std::env::var("CARA_SECCOMP_LOG").is_ok_and(|v| v == "1");
     let mut allowed: Vec<libc::c_long> = base_allowed().to_vec();
+    let allowlist_connect = matches!(network, carapace_core::NetworkMode::Allowlist(_));
     if matches!(network, carapace_core::NetworkMode::Full) {
         allowed.extend_from_slice(NETWORK_ALLOWED);
         allowed.sort_unstable();
         allowed.dedup();
     }
-    seccomp::compile_allowlist(&allowed, log)
+    seccomp::compile_allowlist(&allowed, log, allowlist_connect)
 }
 
 /// The no-network base profile.

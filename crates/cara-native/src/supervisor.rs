@@ -3,6 +3,8 @@
 //! stdio wiring, the go/exec handshake, cgroup attach, wall-time timeout,
 //! output caps, pidfd kill of the payload init, reaping, resource report.
 
+#![allow(clippy::undocumented_unsafe_blocks)]
+
 use crate::child::{ChildConfig, ChildError, msg, stage};
 use carapace_core::BackendError;
 use carapace_core::report::{ExitReport, KillReason};
@@ -13,7 +15,131 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
+
+mod seccomp_notif {
+    #![allow(clippy::undocumented_unsafe_blocks)]
+    use std::os::unix::io::RawFd;
+
+    // SECCOMP_IOCTL_NOTIF_RECV = 0x40809403
+    const SECCOMP_IOCTL_NOTIF_RECV: u64 = 0x40809403;
+    // SECCOMP_IOCTL_NOTIF_SEND = 0x40809404
+    const SECCOMP_IOCTL_NOTIF_SEND: u64 = 0x40809404;
+    // SECCOMP_USER_NOTIF_FLAG_CONTINUE = 1
+    const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+    // SECCOMP_USER_NOTIF_FLAG_KILL = 2
+    const SECCOMP_USER_NOTIF_FLAG_KILL: u32 = 2;
+
+    #[repr(C)]
+    struct SeccompNotif {
+        id: u64,
+        pid: u32,
+        flags: u32,
+        data: libc::seccomp_data,
+    }
+
+    #[repr(C)]
+    struct SeccompNotifResp {
+        id: u64,
+        val: i64,
+        error: i32,
+        flags: u32,
+    }
+
+    /// Seccomp user-notification handler for network allowlist mode.
+    /// Reads notifications from the seccomp fd, checks if the connect destination
+    /// is in the allowlist, and replies with allow/deny.
+    pub fn seccomp_notif_handler(fd: RawFd, allowlist: &[String]) {
+        loop {
+            let mut notif = SeccompNotif {
+                id: 0,
+                pid: 0,
+                flags: 0,
+                data: unsafe { std::mem::zeroed() },
+            };
+
+            // SECCOMP_IOCTL_NOTIF_RECV
+            let ret = unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_RECV, &mut notif) };
+
+            if ret < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                // fd closed or error - exit
+                eprintln!("seccomp notif handler: ioctl RECV failed: {}", e);
+                break;
+            }
+
+            // Check if this is a connect(2) syscall
+            if notif.data.nr != libc::SYS_connect as i32 {
+                // Not a connect - deny by default (shouldn't happen since only connect gets USER_NOTIF)
+                let resp = SeccompNotifResp {
+                    id: notif.id,
+                    val: 0,
+                    error: -libc::EPERM,
+                    flags: SECCOMP_USER_NOTIF_FLAG_KILL,
+                };
+                unsafe { libc::ioctl(fd, SECCOMP_IOCTL_NOTIF_SEND, &resp) };
+                continue;
+            }
+
+            // Extract connect arguments
+            // args[0] = sockfd, args[1] = sockaddr*, args[2] = addrlen
+            let sockaddr_ptr = notif.data.args[1] as *const libc::sockaddr;
+            let addrlen = notif.data.args[2] as libc::socklen_t;
+
+            // Read the sockaddr
+            let allowed = if addrlen >= std::mem::size_of::<libc::sockaddr_in>() as u32 {
+                let sockaddr_in = unsafe { &*(sockaddr_ptr as *const libc::sockaddr_in) };
+                let ip = libc::ntohl(sockaddr_in.sin_addr.s_addr);
+                let port = libc::ntohs(sockaddr_in.sin_port);
+                let ip_str = format!(
+                    "{}.{}.{}.{}",
+                    (ip >> 24) & 0xFF,
+                    (ip >> 16) & 0xFF,
+                    (ip >> 8) & 0xFF,
+                    ip & 0xFF
+                );
+                // Check against allowlist (CIDR not implemented yet - exact match only)
+                allowlist.iter().any(|domain| {
+                    // For now, only support IP:port exact match
+                    // TODO: CIDR and hostname resolution
+                    if domain.contains(':') {
+                        let parts: Vec<&str> = domain.split(':').collect();
+                        if parts.len() == 2 {
+                            parts[0] == ip_str && parts[1] == port.to_string()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                false
+            };
+
+            let (error, flags) = if allowed {
+                (0, SECCOMP_USER_NOTIF_FLAG_CONTINUE)
+            } else {
+                (-libc::ECONNREFUSED, SECCOMP_USER_NOTIF_FLAG_KILL)
+            };
+
+            let resp = SeccompNotifResp {
+                id: notif.id,
+                val: 0,
+                error,
+                flags,
+            };
+
+            unsafe {
+                libc::ioctl(fd, 0x40809404, &resp); // SECCOMP_IOCTL_NOTIF_SEND
+            };
+        }
+    }
+}
 
 fn pipe2_cloexec() -> std::io::Result<(RawFd, RawFd)> {
     let mut fds = [0 as libc::c_int; 2];
@@ -131,6 +257,11 @@ pub(crate) struct NativeSandbox {
     overflow_wr: RawFd,
     /// Self-pipe read end polled alongside the pidfd; closed on drop.
     overflow_rd: RawFd,
+    /// Seccomp user-notification fd for network allowlist (mode = "allowlist").
+    /// The supervisor handles connect(2) notifications and replies allow/deny.
+    seccomp_notif_fd: Option<RawFd>,
+    /// Join handle for the seccomp notification handler thread.
+    seccomp_notif_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 // SAFETY: NativeSandbox owns its raw pointer (the leaked ChildConfig)
@@ -174,16 +305,6 @@ pub(crate) fn spawn_with(
     let setup = |what: &str, e: std::io::Error| -> BackendError {
         BackendError::Setup(format!("{what}: {e}"))
     };
-
-    // Network allowlist mode: designed (ADR-0004) but not implemented —
-    // fail closed with a clear message rather than pretending.
-    if let carapace_core::NetworkMode::Allowlist(_) = spec.network {
-        return Err(BackendError::Setup(
-            "network mode \"allowlist\" is not implemented yet (ADR-0004); \
-             use mode = \"none\" or \"full\""
-                .to_string(),
-        ));
-    }
 
     // Host-layout validation for the C2 runtime recipe (fail closed BEFORE
     // forking: merged-usr with a real /usr tree).
@@ -288,13 +409,46 @@ pub(crate) fn spawn_with(
         seccomp_filter: crate::seccomp_profile::filter_for(&spec.network)
             .as_slice()
             .to_vec(),
+        // Seccomp user-notification socket for network allowlist mode.
+        // Created as a socketpair: one end for the child (sent via SCM_RIGHTS),
+        // one end for the supervisor to receive notifications.
+        seccomp_notif_sock: None,
+        seccomp_notif_sock_parent: None,
         binds: binds_for(spec),
         alternatives: plan_alternatives(std::path::Path::new("/etc/alternatives")),
         exec_on_write: spec.exec_on_write,
+        network: spec.network.clone(),
         #[cfg(test)]
         pdeathsig_hook_fd: test_pdeathsig_hook_fd(),
     });
     let config_ptr = Box::into_raw(config) as *mut libc::c_void;
+
+    // Create seccomp notification socketpair for network allowlist mode.
+    // One end goes to the child (sent via SCM_RIGHTS), one end stays with the supervisor.
+    let (_seccomp_notif_sock, seccomp_notif_sock_parent) =
+        if matches!(spec.network, carapace_core::NetworkMode::Allowlist(_)) {
+            let mut socks = [-1, -1];
+            if unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    socks.as_mut_ptr(),
+                )
+            } < 0
+            {
+                release_config(config_ptr);
+                return Err(setup("socketpair", std::io::Error::last_os_error()));
+            }
+            // Store the child's end in the config so the child can send the notification fd
+            unsafe {
+                (*config_ptr.cast::<crate::child::ChildConfig>()).seccomp_notif_sock =
+                    Some(socks[0]);
+            }
+            (Some(socks[0]), Some(socks[1]))
+        } else {
+            (None, None)
+        };
 
     // Stage-1: a PLAIN fork (no namespaces yet) — required so the parent
     // can move it into the cgroup leaf (see child.rs design note).
@@ -525,7 +679,7 @@ pub(crate) fn spawn_with(
         .map_err(|e| setup("stderr reader", e))?;
 
     drop(status_file); // status pipe fully consumed; result pipe kept
-    Ok(NativeSandbox {
+    let mut sandbox = NativeSandbox {
         pid1,
         pidfd2,
         config: config_ptr,
@@ -543,7 +697,23 @@ pub(crate) fn spawn_with(
         staging_dir,
         overflow_wr,
         overflow_rd,
-    })
+        seccomp_notif_fd: seccomp_notif_sock_parent,
+        seccomp_notif_handle: None,
+    };
+
+    // Start seccomp notification handler if in allowlist mode.
+    if let Some(fd) = sandbox.seccomp_notif_fd {
+        let allowlist = match &spec.network {
+            carapace_core::NetworkMode::Allowlist(domains) => domains.clone(),
+            _ => Vec::new(),
+        };
+        let handle = thread::spawn(move || {
+            seccomp_notif::seccomp_notif_handler(fd, &allowlist);
+        });
+        sandbox.seccomp_notif_handle = Some(handle);
+    }
+
+    Ok(sandbox)
 }
 
 /// Namespace flags by network mode: "full" shares the host network

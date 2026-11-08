@@ -19,6 +19,9 @@ const RET_LOG: u32 = 0x7ffc_0000;
 /// `SECCOMP_RET_KILL_PROCESS` = 0x80000000.
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
 
+/// `SECCOMP_RET_USER_NOTIF` = 0x7ffc0001 (allow with notification).
+const RET_USER_NOTIF: u32 = 0x7ffc_0001;
+
 /// `SECCOMP_GET_ACTION_AVAIL` operation for the `seccomp(2)` syscall.
 /// Per `linux/seccomp.h`: `2`.
 const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
@@ -122,7 +125,11 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 /// `clone3` must NOT be in `allowed` (its flags live behind a pointer the
 /// filter cannot inspect); debugged empirically — glibc falls back to
 /// `clone` when `clone3` fails.
-pub fn compile_allowlist(allowed: &[libc::c_long], log_denied: bool) -> Filter {
+pub fn compile_allowlist(
+    allowed: &[libc::c_long],
+    log_denied: bool,
+    allowlist_connect: bool,
+) -> Filter {
     let default_action = if log_denied {
         RET_LOG
     } else {
@@ -174,6 +181,7 @@ pub fn compile_allowlist(allowed: &[libc::c_long], log_denied: bool) -> Filter {
     }
 
     // Allowlist chain: each allowed nr falls into RET_ALLOW.
+    // If allowlist_connect is true, connect(2) gets RET_USER_NOTIF instead.
     let mut sorted: Vec<u32> = allowed.iter().map(|&n| n as u32).collect();
     sorted.sort_unstable();
     sorted.dedup();
@@ -181,8 +189,13 @@ pub fn compile_allowlist(allowed: &[libc::c_long], log_denied: bool) -> Filter {
         if nr == libc::SYS_clone as u32 || nr == libc::SYS_clone3 as u32 {
             continue; // handled by the dedicated blocks above
         }
+        let action = if allowlist_connect && nr == libc::SYS_connect as u32 {
+            RET_USER_NOTIF
+        } else {
+            RET_ALLOW
+        };
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
-        prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW));
+        prog.push(stmt(BPF_RET | BPF_K, action));
     }
 
     // The default (chain end) comes FIRST; the wrong-architecture kill is
@@ -208,10 +221,17 @@ pub fn compile_allowlist(allowed: &[libc::c_long], log_denied: bool) -> Filter {
     Filter { prog }
 }
 
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER` = 1 << 3.
+const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 1 << 3;
+
 /// Installs a filter in the CALLING process. Requires
 /// `PR_SET_NO_NEW_PRIVS` (set it first — see child setup). Fails closed:
 /// an error here must abort the sandbox before exec.
-pub fn install(prog: &[libc::sock_filter]) -> Result<(), i32> {
+///
+/// If `new_listener` is true, the filter is installed with
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER` and the returned `Ok(fd)` contains
+/// the notification fd for `SECCOMP_RET_USER_NOTIF` notifications.
+pub fn install(prog: &[libc::sock_filter], new_listener: bool) -> Result<Option<libc::c_int>, i32> {
     if prog.is_empty() || prog.len() > 4096 {
         return Err(libc::EINVAL);
     }
@@ -219,13 +239,18 @@ pub fn install(prog: &[libc::sock_filter]) -> Result<(), i32> {
         len: prog.len() as u16,
         filter: prog.as_ptr() as *mut libc::sock_filter,
     };
+    let flags = if new_listener {
+        SECCOMP_FILTER_FLAG_NEW_LISTENER
+    } else {
+        0
+    };
     let ret = unsafe {
         // SAFETY: seccomp(2) SET_MODE_FILTER with a valid sock_fprog whose
         // filter array outlives the call (child: leaked config owns it).
         libc::syscall(
             libc::SYS_seccomp,
             SECCOMP_SET_MODE_FILTER,
-            0u32,
+            flags,
             &fprog as *const libc::sock_fprog,
         )
     };
@@ -234,8 +259,10 @@ pub fn install(prog: &[libc::sock_filter]) -> Result<(), i32> {
             // SAFETY: per-thread errno pointer is valid to read here.
             *libc::__errno_location()
         })
+    } else if new_listener {
+        Ok(Some(ret as i32))
     } else {
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -245,7 +272,7 @@ mod tests {
 
     #[test]
     fn filter_has_sane_shape() {
-        let f = compile_allowlist(&[libc::SYS_read, libc::SYS_write], false);
+        let f = compile_allowlist(&[libc::SYS_read, libc::SYS_write], false, false);
         let p = f.as_slice();
         assert!(p.len() >= 10);
         // First insn loads arch; second is the arch jump.
@@ -259,7 +286,7 @@ mod tests {
 
     #[test]
     fn log_mode_default_is_ret_log() {
-        let f = compile_allowlist(&[libc::SYS_read], true);
+        let f = compile_allowlist(&[libc::SYS_read], true, false);
         let def = f.as_slice()[f.len() - 2];
         assert_eq!(def.k, RET_LOG);
     }
@@ -331,7 +358,7 @@ mod tests {
 
     #[test]
     fn filter_semantics_interpreted() {
-        let f = compile_allowlist(&[libc::SYS_read, libc::SYS_write], false);
+        let f = compile_allowlist(&[libc::SYS_read, libc::SYS_write], false, false);
         let p = f.as_slice();
 
         // Allowed syscall -> ALLOW.
