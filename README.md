@@ -52,8 +52,8 @@ That is the whole product.
 | `cara doctor` | ✅ Implemented | Measures host capabilities, fails closed when not ready |
 | `cara policy` | ✅ Implemented | Strict TOML, `check` and `explain` |
 | Tier 1 native | ✅ Supported | Namespaces, cgroups v2, Landlock, seccomp, capability drop |
-| Tier 2 Wasm | 🧪 Library backend | Parity tests pass, not exposed by CLI |
-| Tier 3 microVM | 📐 Design | Fail-closed plan, not usable |
+| Tier 2 Wasm | 🧪 Library backend | Parity tests pass, `cpu_time`, `peak_memory_bytes`, `kill()` via shared Engine |
+| Tier 3 microVM | 🚧 Implemented | libkrun boot path, payload-as-init, virtiofs `/work`, fails closed without KVM |
 
 ---
 
@@ -176,9 +176,36 @@ flowchart TD
 │         └─────────────────────────────────────────┘           │
 └─────────────────────────────────────────────────────────────────┘
 ```
-
+ 
 ---
-
+ 
+## Tier 3 microVM (libkrun)
+ 
+Carapace Tier 3 uses **libkrun** to boot a disposable Linux kernel under KVM. The payload runs as init (pid 1) in its own kernel - the host kernel is never shared.
+ 
+| Property | Value |
+|----------|-------|
+| VMM | libkrun (Firecracker second) |
+| Kernel | Bundled minimal kernel (init-blob) |
+| Memory | 64 MiB - 16 GiB (policy mapped, floors/ceilings applied) |
+| vCPUs | 1 - 64 (ceil(cpu_percent / 100)) |
+| Rootfs | Read-only skeleton via virtiofs |
+| Writable | `/work` via virtiofs (size-capped) |
+| Network | None (by design) |
+| Console | Captured to temp file (byte-capped) |
+ 
+**Status:** Implemented via libkrun with init-blob. Fails closed without `/dev/kvm` or if init-blob unavailable. Not yet exposed via CLI (backend only).
+ 
+**Run a microVM (backend only):**
+```rust
+use carapace_vm::{VmBackend, VmPlan};
+let backend = VmBackend::new();
+let plan = VmPlan::from_limits(&limits).unwrap();
+// backend.spawn(&spec) // blocks until VM exits
+```
+ 
+---
+ 
 ## Attack Containment
 
 Every row is a test in the escape suite (crate `carapace-escape-tests`). The payload runs through the real sandbox and the suite asserts the documented result. The table is generated from the test catalog, so it cannot drift from what is actually tested.
@@ -556,12 +583,12 @@ Run `cara doctor` to measure your exact environment. It prints exact remedies fo
 
 ## Limitations and Non-Goals
 
-- **Network allowlist.** `network = "allowlist"` is refused. Use `none` or `full`.
-- **Windows and macOS native.** Linux only. WSL2 works.
+- **Network allowlist.** `network = "allowlist"` is partially implemented (seccomp user-notification for `connect(2)` works; full sandbox integration has issues - test skipped). Use `none` or `full` for production.
+- **Windows and macOS native.** Linux only. WSL2 works. Windows `.exe` files not supported (see below).
 - **aarch64.** The native tier is x86_64 only.
 - **SDKs.** There is no Python or TypeScript SDK yet. Use MCP or the CLI.
 - **Prebuilt binaries.** There is no release download yet. Build from source.
-- **Kernel exploits.** Tier 1 shares the host kernel. A kernel exploit can escape. Tier 2 and Tier 3 exist to change that, but Tier 2 is not in the CLI yet and Tier 3 is not usable.
+- **Kernel exploits.** Tier 1 shares the host kernel. A kernel exploit can escape. Tier 2 and Tier 3 exist to change that; Tier 2 not in CLI, Tier 3 implemented via libkrun (not in CLI).
 - **Other distros.** The measured environment is WSL2 Ubuntu 24.04, kernel 6.18, x86_64. Other distros are not supported until they are measured. `cara doctor` is the gate.
 
 ---
@@ -598,11 +625,58 @@ Read [CONTRIBUTING.md](CONTRIBUTING.md). The short rules:
 Report vulnerabilities privately. See [SECURITY.md](SECURITY.md). Do not open a public issue for a security report.
 
 ---
-
-## License
-
-Apache-2.0 OR MIT. See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).
-
+ 
+## Running Windows `.exe` Files
+ 
+Carapace is a **Linux sandbox** - it runs on Linux (or WSL2 on Windows) and executes **Linux ELF binaries**, not Windows `.exe` files.
+ 
+### Option 1: Compile for Linux (Recommended)
+```bash
+# If you have source code, compile for Linux
+rustc myprogram.rs -o myprogram        # Rust
+gcc myprogram.c -o myprogram            # C
+go build -o myprogram main.go           # Go
+```
+Then run in Carapace:
+```bash
+cara run -- ./myprogram
+```
+ 
+### Option 2: Run Windows `.exe` via Wine (if available)
+If Wine is installed on the host at `/usr/bin/wine`:
+```bash
+cara run -- /usr/bin/wine myprogram.exe
+```
+**Requirements:**
+- Wine must be installed on the host (`/usr/bin/wine`)
+- The `.exe` must be accessible at the path you provide (or use `read_write` bind for the directory)
+- 32-bit `.exe` files require 32-bit Wine libraries
+ 
+### Option 3: Cross-compile from Windows
+From Windows, cross-compile to Linux:
+```bash
+# Rust
+rustc --target x86_64-unknown-linux-gnu myprogram.rs
+ 
+# Go
+GOOS=linux GOARCH=amd64 go build -o myprogram
+ 
+# C/C++ with zig cc (cross-compiles easily)
+zig cc -target x86_64-linux-gnu myprogram.c -o myprogram
+```
+ 
+### Why not `.exe` directly?
+Carapace uses **Linux namespaces, cgroups, Landlock, seccomp** - all Linux kernel features. It cannot execute Windows PE binaries (`.exe`) because:
+- Different syscall ABI (Windows NT vs Linux)
+- Different binary format (PE vs ELF)
+- Different dynamic linker/loader
+ 
 ---
-
+ 
+## License
+ 
+Apache-2.0 OR MIT. See [LICENSE-APACHE](LICENSE-APACHE) and [LICENSE-MIT](LICENSE-MIT).
+ 
+---
+ 
 <p align="center"><sub>Built for people who run code they did not write.</sub></p>
