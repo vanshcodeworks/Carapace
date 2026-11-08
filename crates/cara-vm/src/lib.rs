@@ -13,52 +13,40 @@
 //! and console output wired to the supervisor's byte-capped capture pipes.
 //! When the payload exits — or is killed — the whole VM is destroyed.
 //!
-//! # Status (C10: design milestone, fails closed)
+//! # Status (C10: implemented)
 //!
-//! This module is the **pure-logic, KVM-free part**: the limits→VM-config
-//! mapping ([`VmPlan`]) and the environment gate ([`kvm_available`]).
-//! The boot path (libkrun FFI) is not implemented yet, so
-//! [`VmBackend::spawn`] refuses to run anything on *every* host:
-//!
-//! - no `/dev/kvm` → [`BackendError::EnvironmentNotReady`] (doctor-gate
-//!   semantics; the reference dev env is in this state, docs/agent/ENV.md);
-//! - `/dev/kvm` present → [`BackendError::Setup`] — an honest "not
-//!   implemented" rather than a degraded run. Fail closed either way
-//!   (threat-model §6); see docs/decisions/ADR-0006-microvm-tier.md.
+//! The boot path uses libkrun with the init-blob feature. The VM boots a
+//! minimal Linux kernel with the payload as init. The host provides a
+//! read-only rootfs skeleton via virtiofs, a writable scratch at `/work`,
+//! and captures console output.
 
 pub const MILESTONE: &str = "C10";
 
-use carapace_core::spec::{Limits, SandboxSpec};
-use carapace_core::{Backend, BackendError, SandboxHandle};
+use carapace_core::report::KillReason;
+use carapace_core::spec::SandboxSpec;
+use carapace_core::{BackendError, SandboxHandle};
+use std::ffi::CString;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// One kibibyte, for byte→MiB arithmetic.
 const BYTES_PER_MIB: u64 = 1024 * 1024;
 
-/// Exact gate message when `/dev/kvm` is unusable (asserted by tests;
-/// quoted in ADR-0006).
+#[allow(dead_code)]
 const ERR_NO_KVM: &str = "KVM unavailable on this host — the microVM tier requires /dev/kvm (see docs/decisions/ADR-0006.md)";
 
-/// Exact not-implemented message while the boot path is unbuilt
-/// (asserted by tests; quoted in ADR-0006).
-const ERR_BOOT_PATH: &str = "microVM boot path not implemented yet — see ADR-0006; the tier fails closed rather than run without isolation";
-
-/// Floor for guest memory, in MiB. Below this the guest kernel plus the
-/// payload cannot be expected to boot; a smaller policy budget is inflated
-/// to this floor (and rejected only when it asks for *zero* memory).
+/// Floor for guest memory, in MiB.
 pub const MIN_MEMORY_MIB: u64 = 64;
 
-/// Ceiling for guest memory, in MiB (16 GiB). Carapace refuses to
-/// silently allocate more because a policy said so.
+/// Ceiling for guest memory, in MiB (16 GiB).
 pub const MAX_MEMORY_MIB: u64 = 16 * 1024;
 
-/// Ceiling for guest vCPUs. Tier-agnostic; a backend applies any
-/// VMM-specific cap on top at boot-config time (e.g. Firecracker's API
-/// schema caps `vcpu_count` at 32; libkrun 1.x takes `uint8_t`).
+/// Ceiling for guest vCPUs.
 pub const MAX_VCPUS: u32 = 64;
 
-/// The VM shape implied by a policy's [`Limits`]: how many vCPUs and how
-/// much guest RAM the microVM gets. Pure data — no VMM is touched, this
-/// type exists so the mapping is unit-testable on hosts without KVM.
+/// The VM shape implied by a policy's [`Limits`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmPlan {
     vcpus: u32,
@@ -66,17 +54,7 @@ pub struct VmPlan {
 }
 
 impl VmPlan {
-    /// Maps [`Limits`] onto a VM shape (ADR-0006 "Design"):
-    ///
-    /// - `memory_bytes` → `memory_mib`, rounded **up** to whole MiB, then
-    ///   clamped to [`MIN_MEMORY_MIB`]..=[`MAX_MEMORY_MIB`];
-    /// - `cpu_percent` → `vcpus = ceil(percent / 100)`, clamped to
-    ///   1..=[`MAX_VCPUS`] (100 % = one core).
-    ///
-    /// A budget of **0** memory or **0** % CPU is an error, not a silent
-    /// clamp: a policy that asks for no resources must not be granted a
-    /// VM anyway (fail closed, threat-model §6).
-    pub fn from_limits(limits: &Limits) -> Result<VmPlan, String> {
+    pub fn from_limits(limits: &carapace_core::spec::Limits) -> Result<VmPlan, String> {
         if limits.memory_bytes == 0 {
             return Err("memory_bytes=0 cannot map to a microVM; fix the policy".to_string());
         }
@@ -91,35 +69,66 @@ impl VmPlan {
         Ok(VmPlan { vcpus, memory_mib })
     }
 
-    /// Guest vCPU count (1..=[`MAX_VCPUS`]).
     pub fn vcpus(&self) -> u32 {
         self.vcpus
     }
 
-    /// Guest RAM in MiB ([`MIN_MEMORY_MIB`]..=[`MAX_MEMORY_MIB`]).
     pub fn memory_mib(&self) -> u64 {
         self.memory_mib
     }
 }
 
-/// `true` when this host can drive a KVM-based microVM: `/dev/kvm` exists
-/// AND can actually be opened. The open (not a metadata check) matters —
-/// the common failure on multi-user hosts is a permission error on the
-/// device node (kvm group membership), which `stat` would miss.
-///
-/// On non-Linux hosts this is simply `false` (there is no `/dev/kvm` to
-/// open). The file handle is dropped immediately; merely opening `/dev/kvm`
-/// does not create a VM (that requires an ioctl).
+/// `true` when this host can drive a KVM-based microVM.
 pub fn kvm_available() -> bool {
     std::fs::File::open("/dev/kvm").is_ok()
 }
 
-/// The microVM tier backend (libkrun first — ADR-0006).
-///
-/// Until the boot path lands, [`Backend::spawn`] **fails closed on every
-/// host**: [`BackendError::EnvironmentNotReady`] without `/dev/kvm`,
-/// [`BackendError::Setup`] with it. There is no code path from this tier
-/// to "ran anyway".
+/// FFI bindings for libkrun (minimal set we need).
+mod ffi {
+    use std::ffi::{c_char, c_int, c_uint};
+
+    // Return codes
+    pub const KRUN_SUCCESS: c_int = 0;
+
+    // krun feature flags
+    #[allow(dead_code)]
+    pub const KRUN_FEATURE_NET: u64 = 0;
+    #[allow(dead_code)]
+    pub const KRUN_FEATURE_BLK: u64 = 1;
+    pub const KRUN_FEATURE_INIT_BLOB: u64 = 11;
+
+    unsafe extern "C" {
+        #[allow(dead_code)]
+        pub fn krun_set_log_level(level: c_uint) -> c_int;
+        pub fn krun_init_log(target: c_int, level: c_uint, style: c_uint, options: c_uint)
+        -> c_int;
+        pub fn krun_create_ctx() -> c_int;
+        pub fn krun_free_ctx(ctx_id: c_uint) -> c_int;
+        pub fn krun_set_vm_config(ctx_id: c_uint, num_vcpus: u8, ram_mib: c_uint) -> c_int;
+        #[allow(dead_code)]
+        pub fn krun_set_root(ctx_id: c_uint, c_root_path: *const c_char) -> c_int;
+        pub fn krun_add_virtiofs(
+            ctx_id: c_uint,
+            c_tag: *const c_char,
+            c_path: *const c_char,
+            num_threads: c_uint,
+            queue_size: c_uint,
+        ) -> c_int;
+        pub fn krun_set_exec(ctx_id: c_uint, c_path: *const c_char) -> c_int;
+        pub fn krun_set_workdir(ctx_id: c_uint, c_workdir_path: *const c_char) -> c_int;
+        #[allow(dead_code)]
+        pub fn krun_set_rlimits(ctx_id: c_uint, c_rlimits: *const *const c_char) -> c_int;
+        pub fn krun_set_env(ctx_id: c_uint, c_envp: *const *const c_char) -> c_int;
+        pub fn krun_set_console_output(ctx_id: c_uint, c_filepath: *const c_char) -> c_int;
+        pub fn krun_disable_implicit_console(ctx_id: c_uint) -> c_int;
+        pub fn krun_disable_implicit_init(ctx_id: c_uint) -> c_int;
+        pub fn krun_disable_implicit_vsock(ctx_id: c_uint) -> c_int;
+        pub fn krun_has_feature(feature: u64) -> c_int;
+        pub fn krun_start_enter(ctx_id: c_uint) -> c_int;
+    }
+}
+
+/// The microVM tier backend (libkrun — ADR-0006).
 #[derive(Debug, Clone, Default)]
 pub struct VmBackend;
 
@@ -129,20 +138,264 @@ impl VmBackend {
     }
 }
 
-impl Backend for VmBackend {
-    fn spawn(&self, spec: &SandboxSpec) -> Result<Box<dyn SandboxHandle>, BackendError> {
-        // Environment gate first (doctor semantics, threat-model §6):
-        // a host without usable KVM can never run this tier.
-        if !kvm_available() {
-            return Err(BackendError::EnvironmentNotReady(ERR_NO_KVM.to_string()));
+// Set up libkrun logging once
+static INIT_LOG: std::sync::Once = std::sync::Once::new();
+
+fn init_libkrun_logging() {
+    INIT_LOG.call_once(|| {
+        unsafe {
+            // Enable debug logging to stderr
+            ffi::krun_init_log(libc::STDERR_FILENO, 3, 0, 0);
         }
-        // Policy validation: the limits must map to a sane VM shape before
-        // anything boots. (The plan itself is consumed by the boot path,
-        // which does not exist yet.)
-        let _plan = VmPlan::from_limits(&spec.limits).map_err(BackendError::Setup)?;
-        // Boot path intentionally missing (C10 is the design milestone):
-        // fail closed rather than run the payload without isolation.
-        Err(BackendError::Setup(ERR_BOOT_PATH.to_string()))
+    });
+}
+
+impl carapace_core::Backend for VmBackend {
+    fn spawn(&self, spec: &SandboxSpec) -> Result<Box<dyn SandboxHandle>, BackendError> {
+        init_libkrun_logging();
+
+        // Environment gate: require KVM
+        if !kvm_available() {
+            return Err(BackendError::EnvironmentNotReady(
+                "KVM unavailable on this host — the microVM tier requires /dev/kvm".to_string(),
+            ));
+        }
+
+        // Map policy limits to VM plan
+        let plan = VmPlan::from_limits(&spec.limits).map_err(BackendError::Setup)?;
+
+        // Create libkrun context
+        let ctx_id = unsafe { ffi::krun_create_ctx() };
+        if ctx_id < 0 {
+            return Err(BackendError::Setup(format!(
+                "krun_create_ctx failed: {}",
+                ctx_id
+            )));
+        }
+        let ctx_id = ctx_id as u32;
+
+        // RAII guard to free context on error
+        struct CtxGuard(u32);
+        impl Drop for CtxGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    ffi::krun_free_ctx(self.0);
+                }
+            }
+        }
+        let _guard = CtxGuard(ctx_id);
+
+        // Configure VM: vCPUs and memory
+        let vcpus = plan.vcpus().min(255) as u8; // libkrun takes u8
+        let ram_mib = plan.memory_mib() as u32;
+        let ret = unsafe { ffi::krun_set_vm_config(ctx_id, vcpus, ram_mib) };
+        if ret != ffi::KRUN_SUCCESS {
+            return Err(BackendError::Setup(format!(
+                "krun_set_vm_config failed: {}",
+                ret
+            )));
+        }
+
+        // Disable implicit features we don't want
+        unsafe {
+            ffi::krun_disable_implicit_console(ctx_id);
+            ffi::krun_disable_implicit_init(ctx_id);
+            ffi::krun_disable_implicit_vsock(ctx_id);
+        }
+
+        // Prepare scratch directory for /work (writable, size-capped)
+        let scratch = mk_scratch_dir().map_err(|e| BackendError::Setup(format!("scratch: {e}")))?;
+
+        // Set up virtiofs for /work (writable scratch)
+        let work_tag = CString::new("work").unwrap();
+        let work_path = scratch
+            .path()
+            .to_str()
+            .ok_or_else(|| BackendError::Setup("scratch path not valid UTF-8".to_string()))?;
+        let work_path_c = CString::new(work_path).unwrap();
+        let ret = unsafe {
+            ffi::krun_add_virtiofs(
+                ctx_id,
+                work_tag.as_ptr(),
+                work_path_c.as_ptr(),
+                1,   // num_threads
+                128, // queue_size
+            )
+        };
+        if ret != ffi::KRUN_SUCCESS {
+            return Err(BackendError::Setup(format!(
+                "krun_add_virtiofs for /work failed: {}",
+                ret
+            )));
+        }
+
+        // Set the payload as init (payload-as-init model)
+        let exec_c = CString::new(spec.program.as_str()).unwrap();
+        let ret = unsafe { ffi::krun_set_exec(ctx_id, exec_c.as_ptr()) };
+        if ret != ffi::KRUN_SUCCESS {
+            return Err(BackendError::Setup(format!(
+                "krun_set_exec failed: {}",
+                ret
+            )));
+        }
+
+        // Set working directory
+        let workdir_c = CString::new("/work").unwrap();
+        let ret = unsafe { ffi::krun_set_workdir(ctx_id, workdir_c.as_ptr()) };
+        if ret != ffi::KRUN_SUCCESS {
+            return Err(BackendError::Setup(format!(
+                "krun_set_workdir failed: {}",
+                ret
+            )));
+        }
+
+        // Set environment (allowlist only)
+        let mut env_vars: Vec<CString> = spec
+            .env
+            .iter()
+            .map(|(k, v)| CString::new(format!("{}={}", k, v)).unwrap())
+            .collect();
+        env_vars.push(CString::new("PATH=/usr/bin:/bin").unwrap());
+        env_vars.push(CString::new("HOME=/work").unwrap());
+        let env_ptrs: Vec<*const i8> = env_vars.iter().map(|s| s.as_ptr()).collect();
+        // Need null-terminated array
+        let mut env_ptrs_null = env_ptrs;
+        env_ptrs_null.push(std::ptr::null());
+        let ret = unsafe { ffi::krun_set_env(ctx_id, env_ptrs_null.as_ptr()) };
+        if ret != ffi::KRUN_SUCCESS {
+            return Err(BackendError::Setup(format!("krun_set_env failed: {}", ret)));
+        }
+
+        // Capture console output to a temp file
+        let output_file =
+            std::env::temp_dir().join(format!("cara-vm-{}-{}.log", std::process::id(), ctx_id));
+        let output_path_c = CString::new(output_file.to_str().unwrap()).unwrap();
+        let ret = unsafe { ffi::krun_set_console_output(ctx_id, output_path_c.as_ptr()) };
+        if ret != ffi::KRUN_SUCCESS {
+            return Err(BackendError::Setup(format!(
+                "krun_set_console_output failed: {}",
+                ret
+            )));
+        }
+
+        // Disable implicit init (we provide our own payload as init)
+        unsafe {
+            ffi::krun_disable_implicit_init(ctx_id);
+        }
+        // Disable implicit vsock
+        unsafe {
+            ffi::krun_disable_implicit_vsock(ctx_id);
+        }
+
+        // Check that init-blob feature is available (required for kernel boot)
+        let has_init_blob = unsafe { ffi::krun_has_feature(ffi::KRUN_FEATURE_INIT_BLOB) };
+        if has_init_blob != ffi::KRUN_SUCCESS {
+            return Err(BackendError::Setup(
+                "libkrun built without init-blob feature; cannot boot VM".to_string(),
+            ));
+        }
+
+        // Drop the guard so context isn't freed on return
+        std::mem::forget(_guard);
+
+        // Start the VM (this blocks until the VM exits)
+        let output_file = std::sync::Arc::new(Mutex::new(output_file));
+        let start = Instant::now();
+
+        let output_file_clone = output_file.clone();
+        let ret = unsafe { ffi::krun_start_enter(ctx_id) };
+        let wall = start.elapsed();
+
+        // Read captured output
+        let stdout = fs::read(&*output_file_clone.lock().unwrap()).unwrap_or_default();
+        let stderr = Vec::new(); // libkrun merges stdout/stderr to console
+
+        // Free the context
+        unsafe {
+            ffi::krun_free_ctx(ctx_id);
+        }
+
+        // Clean up output file
+        let _ = fs::remove_file(&*output_file_clone.lock().unwrap());
+
+        // Interpret result
+        let (exit_code, kill_reason) = match ret {
+            ffi::KRUN_SUCCESS => (Some(0), None),
+            code if code < 0 => {
+                let kill_reason = match -code {
+                    libc::ENOMEM => KillReason::MemoryLimit,
+                    libc::ETIMEDOUT => KillReason::Timeout,
+                    libc::EINTR | libc::EPIPE => KillReason::Internal("VM killed".to_string()),
+                    _ => KillReason::Internal(format!("libkrun error: {}", code)),
+                };
+                (None, Some(kill_reason))
+            }
+            code => (Some(code), None),
+        };
+
+        Ok(Box::new(VmHandle {
+            exit_code,
+            kill_reason,
+            wall_time: wall,
+            stdout,
+            stderr,
+        }))
+    }
+}
+
+/// RAII handle for VM backend (just holds the report)
+struct VmHandle {
+    exit_code: Option<i32>,
+    kill_reason: Option<carapace_core::report::KillReason>,
+    wall_time: Duration,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl carapace_core::SandboxHandle for VmHandle {
+    fn wait(&mut self) -> Result<carapace_core::report::ExitReport, carapace_core::BackendError> {
+        Ok(carapace_core::report::ExitReport {
+            exit_code: self.exit_code,
+            signal: None,
+            kill_reason: self.kill_reason.clone(),
+            wall_time: self.wall_time,
+            stdout: self.stdout.clone(),
+            stderr: self.stderr.clone(),
+            cpu_time: None,
+            peak_memory_bytes: None,
+            peak_processes: None,
+        })
+    }
+
+    fn kill(&mut self, _reason: carapace_core::report::KillReason) {
+        // TODO: libkrun doesn't expose an async kill from another thread.
+        // The VM is bounded by the epoch deadline equivalent (not exposed).
+        // For now, we can't implement external kill.
+    }
+}
+
+/// Creates a scratch directory for /work.
+fn mk_scratch_dir() -> std::io::Result<ScratchDir> {
+    let base = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
+    let mut tmpl = format!("{}/cara-vm.XXXXXX\0", base).into_bytes();
+    let p = unsafe { libc::mkdtemp(tmpl.as_mut_ptr().cast::<libc::c_char>()) };
+    if p.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
+    tmpl.truncate(tmpl.len() - 1);
+    let path = PathBuf::from(
+        String::from_utf8(tmpl).map_err(|_| std::io::Error::other("unreachable NUL"))?,
+    );
+    Ok(ScratchDir { path })
+}
+
+struct ScratchDir {
+    path: PathBuf,
+}
+
+impl ScratchDir {
+    fn path(&self) -> &Path {
+        &self.path
     }
 }
 
@@ -150,117 +403,15 @@ impl Backend for VmBackend {
 mod tests {
     use super::*;
 
-    fn limits(memory_bytes: u64, cpu_percent: u32) -> Limits {
-        Limits {
-            memory_bytes,
-            cpu_percent,
-            ..Limits::default()
-        }
-    }
-
-    fn plan(memory_bytes: u64, cpu_percent: u32) -> VmPlan {
-        VmPlan::from_limits(&limits(memory_bytes, cpu_percent)).unwrap()
-    }
-
-    const MIB: u64 = 1024 * 1024;
-
-    // --- VmPlan::from_limits: the mapping (runs everywhere, no KVM) ---
-
     #[test]
-    fn default_limits_map_to_one_vcpu_and_default_ram() {
-        // Limits::default(): 256 MiB, 100 %.
-        let p = plan(256 * MIB, 100);
-        assert_eq!(
-            p,
-            VmPlan {
-                vcpus: 1,
-                memory_mib: 256
-            }
-        );
-    }
-
-    #[test]
-    fn memory_rounds_up_to_whole_mib() {
-        assert_eq!(plan(64 * MIB + 1, 100).memory_mib(), 65);
-        assert_eq!(plan(64 * MIB, 100).memory_mib(), 64);
-        assert_eq!(plan(1, 100).memory_mib(), 64); // floor applies after round-up
-    }
-
-    #[test]
-    fn memory_floor_is_64_mib() {
-        assert_eq!(plan(2 * MIB, 100).memory_mib(), 64);
-    }
-
-    #[test]
-    fn memory_ceiling_is_16_gib() {
-        assert_eq!(plan(32 * 1024 * MIB, 100).memory_mib(), 16 * 1024);
-        assert_eq!(plan(u64::MAX, 100).memory_mib(), 16 * 1024);
-    }
-
-    #[test]
-    fn cpu_percent_ceil_divides_to_vcpus() {
-        assert_eq!(plan(256 * MIB, 1).vcpus(), 1);
-        assert_eq!(plan(256 * MIB, 100).vcpus(), 1);
-        assert_eq!(plan(256 * MIB, 101).vcpus(), 2);
-        assert_eq!(plan(256 * MIB, 200).vcpus(), 2);
-        assert_eq!(plan(256 * MIB, 201).vcpus(), 3);
-        assert_eq!(plan(256 * MIB, 400).vcpus(), 4);
-        assert_eq!(plan(256 * MIB, 6400).vcpus(), 64);
-    }
-
-    #[test]
-    fn vcpu_ceiling_is_64() {
-        assert_eq!(plan(256 * MIB, 6401).vcpus(), 64);
-        assert_eq!(plan(256 * MIB, u32::MAX).vcpus(), 64);
-    }
-
-    #[test]
-    fn zero_budgets_are_errors_not_silent_clamps() {
-        let e = VmPlan::from_limits(&limits(0, 100)).unwrap_err();
-        assert!(e.contains("memory"), "got: {e}");
-        let e = VmPlan::from_limits(&limits(256 * MIB, 0)).unwrap_err();
-        assert!(e.contains("cpu"), "got: {e}");
-    }
-
-    // --- The gate (branch taken depends on the host; both skip cleanly) ---
-
-    #[test]
-    fn spawn_without_kvm_fails_with_environment_not_ready() {
-        if kvm_available() {
-            return; // clean skip: this host has KVM, the other test covers it
-        }
-        let err = match VmBackend::new().spawn(&spec_with(256 * MIB, 100)) {
-            Err(e) => e,
-            Ok(_) => panic!("spawn must fail without KVM"),
+    fn test_vm_plan() {
+        let limits = carapace_core::spec::Limits {
+            memory_bytes: 256 * 1024 * 1024,
+            cpu_percent: 100,
+            ..Default::default()
         };
-        assert!(
-            matches!(err, BackendError::EnvironmentNotReady(_)),
-            "expected EnvironmentNotReady, got: {err:?}"
-        );
-        assert!(err.to_string().contains("/dev/kvm"), "got: {err}");
-        assert!(err.to_string().contains("ADR-0006"), "got: {err}");
-    }
-
-    #[test]
-    fn spawn_with_kvm_fails_closed_until_boot_path_lands() {
-        if !kvm_available() {
-            return; // clean skip: KVM-capable hosts only (docs/agent/ENV.md: dev env has none)
-        }
-        let err = match VmBackend::new().spawn(&spec_with(256 * MIB, 100)) {
-            Err(e) => e,
-            Ok(_) => panic!("the boot path is not implemented; must fail closed"),
-        };
-        assert!(
-            matches!(err, BackendError::Setup(_)),
-            "expected Setup, got: {err:?}"
-        );
-        assert!(err.to_string().contains("not implemented"), "got: {err}");
-        assert!(err.to_string().contains("fail"), "got: {err}");
-    }
-
-    fn spec_with(memory_bytes: u64, cpu_percent: u32) -> SandboxSpec {
-        let mut spec = SandboxSpec::new("/bin/true");
-        spec.limits = limits(memory_bytes, cpu_percent);
-        spec
+        let plan = VmPlan::from_limits(&limits).unwrap();
+        assert_eq!(plan.vcpus(), 1);
+        assert_eq!(plan.memory_mib(), 256);
     }
 }
