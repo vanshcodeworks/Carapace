@@ -1,0 +1,9 @@
+# This policy is intentionally NOT runnable yet.
+# The allowlist mode is designed in docs/decisions/ADR-0004-network-modes.md
+# but not implemented. Carapace refuses it before any code runs (fail closed).
+# Use mode = "none" or mode = "full" instead.
+preset = "strict"
+
+[network]
+mode = "allowlist"
+allow = ["pypi.org"]

@@ -46,7 +46,7 @@ test lands at listed milestone.
 |---|---|---|
 | Policy files reject unknown fields/units/presets (fail closed) | cara-core policy tests + cli_run policy_check_valid_and_invalid | verified C5 |
 | read_write binds expose exactly the listed host dirs inside the sandbox | cli_run run_with_read_write_bind_sees_host_dir | verified C5 |
-| network mode allowlist fails closed at run time (not implemented) | cli_run run_fails_closed_on_unknown_network_mode_in_policy | verified C5 |
+| network mode allowlist fails closed before any payload runs (not implemented) | cli_run.rs::run_fails_closed_on_unknown_network_mode_in_policy (real assertion, restored cycle 19) | verified C5, re-verified cycle 19 |
 | network mode full permits sockets end to end (loopback round-trip); none denies them | hardening.rs::network_full_mode_permits_loopback_sockets + seccomp_blocks_socket_creation | ✅ verified cycle 15 |
 | cara run --json has a stable report schema | run_ui json tests (kill_reason strings) | verified C5 |
 | cara run exit codes documented (0/2/3/4) | exit_codes.rs + cli tests | verified C5 |
@@ -166,3 +166,12 @@ test lands at listed milestone.
 | `scripts/check.sh` runs docs check, shell syntax, fmt, clippy, workspace tests, runtime matrix | Local run: 250 passed / 0 failed; runtime matrix 17/17 | ✅ cycle 18 |
 | `cargo deny check` passes (advisories, bans, licenses, sources all ok) | Local and CI run; wasmtime 50.0.1 for RUSTSEC-2026-0420 | ✅ cycle 18 |
 | Repository is public; `main` and `agent/work` both at commit `eb8d4be`; CI green on both | `gh repo view`, `gh run list`, branch pointers | ✅ cycle 18 |
+
+## Cycle 19 claims (audit)
+| Claim | Basis | Status |
+|---|---|---|
+| README Tier 3 section does not claim usable sandbox behavior | README.md Tier 3 experimental section lists missing rootfs, console cap, timeout/kill, CLI wiring and 1 unit test | verified cycle 19 |
+| The network allowlist refuses before code runs with a clear error | `cara run --policy examples/network-allowlist.toml -- /bin/true` + restored cli_run assertion | verified cycle 19 |
+| `cara-mcp --version` and `--help` work without breaking stdio | crates/cara-mcp/src/main.rs + `python3 scripts/mcp-smoke.py` (8 tools, run_code marker) | verified cycle 19 |
+| The product demo works from a plain wsl.exe shell | `CARA=... demo/demo.sh` self-bridges via systemd-run; 9 passed, 0 failed | verified cycle 19 |
+| All documented policy files exist | examples/README.md, examples/dev.toml, examples/network-allowlist.toml | verified cycle 19 |

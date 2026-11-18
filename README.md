@@ -53,7 +53,7 @@ That is the whole product.
 | `cara policy` | ✅ Implemented | Strict TOML, `check` and `explain` |
 | Tier 1 native | ✅ Supported | Namespaces, cgroups v2, Landlock, seccomp, capability drop |
 | Tier 2 Wasm | 🧪 Library backend | Parity tests pass, `cpu_time`, `peak_memory_bytes`, `kill()` via shared Engine |
-| Tier 3 microVM | 🚧 Implemented | libkrun boot path, payload-as-init, virtiofs `/work`, fails closed without KVM |
+| Tier 3 microVM | 🚧 Experimental backend only | libkrun boot path, no rootfs/kill/timeout yet, no CLI wiring, needs KVM |
 
 ---
 
@@ -69,7 +69,7 @@ cara run --json -- /usr/bin/python3 -c 'print(6 * 7)'
 ### Persistent session
 
 ```sh
-id=$(cara session start --policy dev.toml)
+id=$(cara session start --policy examples/dev.toml)
 cara session exec "$id" -- /bin/sh -c 'echo data > /work/input.txt'
 cara session exec "$id" -- /bin/sh -c 'cat /work/input.txt'
 cara session close "$id"
@@ -179,33 +179,40 @@ flowchart TD
  
 ---
  
-## Tier 3 microVM (libkrun)
- 
-Carapace Tier 3 uses **libkrun** to boot a disposable Linux kernel under KVM. The payload runs as init (pid 1) in its own kernel - the host kernel is never shared.
- 
-| Property | Value |
-|----------|-------|
+## Tier 3 microVM (libkrun) - experimental
+
+Carapace Tier 3 uses **libkrun** to boot a disposable Linux kernel under KVM.
+The goal is that the host kernel is never shared with the payload. The
+`carapace-vm` crate contains a real libkrun FFI boot path, but it is **not a
+usable sandbox yet** and is not wired into the CLI or MCP server.
+
+| Property | Current state |
+|----------|---------------|
 | VMM | libkrun (Firecracker second) |
 | Kernel | Bundled minimal kernel (init-blob) |
-| Memory | 64 MiB - 16 GiB (policy mapped, floors/ceilings applied) |
-| vCPUs | 1 - 64 (ceil(cpu_percent / 100)) |
-| Rootfs | Read-only skeleton via virtiofs |
-| Writable | `/work` via virtiofs (size-capped) |
-| Network | None (by design) |
-| Console | Captured to temp file (byte-capped) |
- 
-**Status:** Implemented via libkrun with init-blob. Fails closed without `/dev/kvm` or if init-blob unavailable. Not yet exposed via CLI (backend only).
- 
-**Run a microVM (backend only):**
+| Memory mapping | 64 MiB - 16 GiB, floors/ceilings applied (unit tested) |
+| vCPU mapping | 1 - 64, `ceil(cpu_percent / 100)` (unit tested) |
+| `/work` | virtiofs export (size-capped) |
+| Rootfs | **Not provided** - `krun_set_root` is declared but never called |
+| Network | libkrun `net` feature is enabled; no policy enforcement yet |
+| Console | Written to a temp file, **no byte cap yet** |
+| Timeout / kill | **Not implemented** - `kill()` is a no-op TODO |
+| Tests | 1 mapping unit test; never booted (no `/dev/kvm` in dev env) |
+
+**What this means:** do not use Tier 3 to run untrusted code today. It fails
+closed on hosts without `/dev/kvm`. It needs a guest rootfs, a bounded
+console, a timeout/kill path, and real boot tests before it can be called
+supported. See [ADR-0006](docs/decisions/ADR-0006-microvm-tier.md).
+
 ```rust
 use carapace_vm::{VmBackend, VmPlan};
 let backend = VmBackend::new();
 let plan = VmPlan::from_limits(&limits).unwrap();
-// backend.spawn(&spec) // blocks until VM exits
+// backend.spawn(&spec) // blocks until VM exits (no timeout/kill)
 ```
- 
+
 ---
- 
+
 ## Attack Containment
 
 Every row is a test in the escape suite (crate `carapace-escape-tests`). The payload runs through the real sandbox and the suite asserts the documented result. The table is generated from the test catalog, so it cannot drift from what is actually tested.
@@ -309,6 +316,12 @@ bash scripts/install.sh
 
 The installer builds `cara` and `cara-mcp`, installs them in `~/.local/bin`, and runs `cara doctor`. If doctor fails, Carapace will not run code. Fix the host first. The installer prints the exact remedy.
 
+`~/.local/bin` is not on `PATH` by default on most systems. The installer prints this, but you can add it before continuing:
+
+```sh
+export PATH="$HOME/.local/bin:$PATH"   # add to ~/.bashrc or ~/.zshrc to keep it
+```
+
 ### Manual build
 
 ```sh
@@ -316,6 +329,9 @@ cargo build --release -p carapace-cli -p carapace-mcp
 ./target/release/cara doctor
 ./target/release/cara run -- /bin/sh -c 'echo hello from the sandbox'
 ```
+
+You need Rust 1.85+, git, and a C linker. Carapace does not link libseccomp
+directly, so `libseccomp-dev` is not required.
 
 ---
 
@@ -332,11 +348,31 @@ cara run -- /bin/sh -c 'echo hello from the sandbox'
 cara run --json -- /usr/bin/python3 -c 'print(6 * 7)'
 
 # 4. Use a session for persistent files
-id=$(cara session start --policy dev.toml)
+id=$(cara session start --policy examples/dev.toml)
 cara session exec "$id" -- /bin/sh -c 'echo data > /work/input.txt'
 cara session exec "$id" -- /bin/sh -c 'cat /work/input.txt'
 cara session close "$id"
 ```
+
+### WSL2 note
+
+Commands started by `wsl.exe` land outside the systemd user slice, where
+cgroup delegation is denied. `cara doctor` will report that and exit 4. Run
+from a normal WSL terminal, or bridge each command:
+
+```sh
+systemd-run --user --scope --quiet cara doctor
+systemd-run --user --scope --quiet cara run -- /bin/sh -c 'echo hello'
+```
+
+You can also define a shell helper:
+
+```sh
+cara() { systemd-run --user --scope --quiet "$HOME/.local/bin/cara" "$@"; }
+```
+
+The installer, `scripts/check.sh`, `scripts/mcp-smoke.py`, and `demo/demo.sh`
+all apply this bridge automatically for their own runs.
 
 ---
 
@@ -583,7 +619,7 @@ Run `cara doctor` to measure your exact environment. It prints exact remedies fo
 
 ## Limitations and Non-Goals
 
-- **Network allowlist.** `network = "allowlist"` is partially implemented (seccomp user-notification for `connect(2)` works; full sandbox integration has issues - test skipped). Use `none` or `full` for production.
+- **Network allowlist.** `network = "allowlist"` is not implemented. Carapace refuses it before any code runs (fail closed, with a clear "not implemented" error). Use `none` or `full`. The design is in [ADR-0004](docs/decisions/ADR-0004-network-modes.md); an example policy that shows the refused form is in [`examples/network-allowlist.toml`](examples/network-allowlist.toml).
 - **Windows and macOS native.** Linux only. WSL2 works. Windows `.exe` files not supported (see below).
 - **aarch64.** The native tier is x86_64 only.
 - **SDKs.** There is no Python or TypeScript SDK yet. Use MCP or the CLI.

@@ -8,12 +8,14 @@ the time.
 
 **Please do not open a public GitHub issue for security reports.**
 
-Report privately via:
+Report privately with GitHub's private vulnerability reporting:
 
-- Email: **TODO(verify)** — security contact address not yet provisioned
-  (pre-release). Until it is announced here, use a GitHub private
-  vulnerability report on the repository
-  (https://github.com/vanshcodeworks/Carapace/security/advisories/new).
+**https://github.com/vanshcodeworks/Carapace/security/advisories/new**
+
+No email address is published here, so there is no stale contact to rely on.
+If private reporting is unavailable to you, open a public issue that says
+only "security report requested" and wait for a private channel; do not
+include exploit details in a public issue.
 
 Include: affected commit or release, kernel and distro (`uname -a`),
 environment (bare metal / WSL2 / container — `cara doctor --json` output

@@ -1,0 +1,14 @@
+# Development preset for Carapace.
+# Copy this file next to your project, then:
+#   cara run --policy dev.toml -- /usr/bin/python3 your_script.py
+# or:
+#   id=$(cara session start --policy dev.toml)
+#
+# "dev" gives more room to work (60s timeout, 1 GiB memory, 128 processes,
+# 512 MiB scratch, exec_on_write = true for compile-and-run) but still has
+# NO network access. It is not the strict posture.
+
+preset = "dev"
+
+[network]
+mode = "none"

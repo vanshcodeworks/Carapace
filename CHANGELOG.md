@@ -7,6 +7,16 @@ Build from the `main` branch.
 
 ## Unreleased
 
+### Audit 2026-11-18
+
+- Removed the unsafe, non-working network allowlist implementation; the mode
+  is again refused before any code runs, with a real regression test.
+- Corrected Tier 3 status: experimental libkrun backend only, not usable for
+  untrusted code (no rootfs, no bounded console, no kill/timeout, no CLI).
+- Added runnable policy examples and fixed the missing `dev.toml` reference.
+- Added `cara-mcp --version/--help`, issue templates, PATH and WSL guidance,
+  a self-bridging demo, and accurate build prerequisites.
+
 ### Added
 
 - `cara run`: one-shot sandbox for untrusted programs, with CPU, memory,

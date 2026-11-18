@@ -8,8 +8,9 @@ and the public docs must match what is measured.
 
 - **Linux**, or **WSL2** with a systemd-enabled distro (the reference dev
   environment is Ubuntu 24.04 on WSL2 — see docs/agent/ENV.md).
-- Rust ≥ 1.85 (`rustup`, stable), `build-essential`, `pkg-config`,
-  `libseccomp-dev` on Debian/Ubuntu.
+- Rust ≥ 1.85 (`rustup`, stable), a C linker (`build-essential` on
+  Debian/Ubuntu), and git. `pkg-config` and `libseccomp-dev` are **not**
+  required: Carapace uses raw syscalls and does not link libseccomp.
 - Kernel ≥ 5.10 with cgroup v2, Landlock (≥ 5.13), seccomp-bpf, unprivileged
   user namespaces. Run `cara doctor` first — it measures all of this and
   prints remedies (docs/troubleshooting.md).

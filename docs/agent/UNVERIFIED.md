@@ -324,3 +324,21 @@ test or measurement in this repository currently demonstrates it.
 - Public docs refreshed: `faq.md`, `runtime-guide.md`, `CONTRIBUTING.md`,
   `release.md`, `mcp.md` reflect current state.
 
+
+
+## Audit cycle 19 (open items)
+
+- Tier 3 microVM is not usable for untrusted code: no guest rootfs
+  (`krun_set_root` declared but never called), console output is not
+  byte-capped, `kill()` is a no-op, no timeout, no CLI/MCP wiring, one
+  mapping unit test, never booted (no `/dev/kvm`). AUDIT-19.
+- The seccomp user-notification design for a network allowlist was removed
+  because it was unsafe: it dereferenced a foreign address-space pointer,
+  socket(2) was denied before connect(2), and the test was disabled. A real
+  implementation needs cross-process memory reads with a safe copy, CIDR
+  matching, a clean denial response, and a named test. AUDIT-19.
+- Hosted CI self-skips all environment-dependent tests; a green badge does
+  not prove isolation behavior. The local `scripts/check.sh` and the demo
+  are the authoritative gates. AUDIT-19.
+- No prebuilt binaries, Python/TypeScript SDKs, aarch64, or alternate
+  distros. AUDIT-19.

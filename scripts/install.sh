@@ -104,6 +104,19 @@ echo "    $PREFIX/bin/cara"
 echo "    $PREFIX/bin/cara-mcp"
 "$PREFIX/bin/cara" --version
 
+# Tell the user about PATH BEFORE anything else, so the "Next" commands work.
+case ":$PATH:" in
+    *":$PREFIX/bin:"*) ;;
+    *)
+        echo
+        echo "==> IMPORTANT: $PREFIX/bin is not on your PATH."
+        echo "    Add this to your shell profile (~/.bashrc or ~/.zshrc), then reopen the shell:"
+        echo "      export PATH=\"$PREFIX/bin:\$PATH\""
+        echo "    Until then, use the full path: $PREFIX/bin/cara"
+        echo
+        ;;
+esac
+
 run_doctor() {
     # WSL commands launched by wsl.exe sit outside the systemd user slice.
     # Bridge into it the same way scripts/check.sh does.
@@ -125,15 +138,6 @@ if ! run_doctor; then
     echo "Read docs/troubleshooting.md and apply the remedy printed above." >&2
     exit 4
 fi
-
-case ":$PATH:" in
-    *":$PREFIX/bin:"*) ;;
-    *)
-        echo
-        echo "Add $PREFIX/bin to PATH, for example:"
-        echo "  export PATH=\"$PREFIX/bin:\$PATH\""
-        ;;
-esac
 
 cat <<EOF
 

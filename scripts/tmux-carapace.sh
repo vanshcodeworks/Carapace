@@ -3,7 +3,7 @@
 # Usage: ./scripts/tmux-carapace.sh [attach|new|kill]
 
 SESSION="carapace"
-ROOT="/mnt/p/Carapace"
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 new_session() {
     # Kill existing session if any

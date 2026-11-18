@@ -502,3 +502,49 @@ Commands: `scripts/check.sh`, `cargo deny check`, `python3 scripts/mcp-smoke.py`
 
 Next: maintain public repo; track issues; network allowlist (P3 rest), SDKs,
 P4 (external review brief, escape challenge). Update agent journals per cycle.
+
+
+## Cycle 19 (audit) - 2026-11-18 - full repo audit and adoption hardening
+
+Task: audit the whole project, verify claims against code and tests, and fix
+the highest-impact blockers to developer adoption. Three independent audits
+covered engineering claims, developer UX, and git/CI state.
+
+Outcome: a broken, unsafe network-allowlist implementation was removed in
+favour of the honest fail-closed refusal; overstated Tier 3 and allowlist
+claims were corrected; the documented first-run path was made to work.
+
+Engineering:
+- Reverted the partial seccomp user-notification allowlist to the known-good
+  pre-implementation state (commit 9cec426 files). Evidence: the live handler
+  dereferenced a sandbox address-space pointer in the supervisor; socket(2)
+  was denied before connect(2) could be notified; the regression test had all
+  assertions commented out while CLAIMS.md still cited it.
+- Restored `cli_run.rs::run_fails_closed_on_unknown_network_mode_in_policy`
+  with its real "not implemented" assertion. Verified:
+  `cara run --policy examples/network-allowlist.toml -- /bin/true` exits with
+  a clear "not implemented" error before any payload runs.
+- Deleted the orphaned, non-compiling `crates/cara-native/src/seccomp_notif.rs`.
+- Corrected README Tier 3 claim: libkrun boot path exists, but no guest
+  rootfs, no byte-capped console, no timeout/kill, no CLI wiring, 1 unit test,
+  never booted. Marked experimental, not usable for untrusted code.
+
+Adoption:
+- Added `examples/dev.toml` and `examples/network-allowlist.toml`; README
+  session examples now use `examples/dev.toml` (previously a missing file).
+- `scripts/install.sh` now prints PATH guidance before the "Next" commands.
+- README Quick Start documents the WSL2 systemd slice bridge.
+- `cara-mcp --version` and `--help` now work (stdio protocol unchanged).
+- `demo/demo.sh` self-bridges into the user slice; verified 9/9 demo checks
+  pass from a plain `wsl.exe` shell.
+- Added `.github/ISSUE_TEMPLATE/{bug_report,feature_request}.md`.
+- SECURITY.md no longer has a TODO contact; private advisories only.
+- CONTRIBUTING.md corrected: libseccomp-dev/pkg-config not required.
+- `scripts/tmux-carapace.sh` no longer hardcodes /mnt/p/Carapace.
+
+Verification: `scripts/check.sh` all green (250 tests, 17/17 runtime
+matrix); MCP smoke 8/8; demo 9/9; `cara-mcp --version/--help`; session
+start with `examples/dev.toml`; network allowlist clean refusal.
+
+Next: Tier 3 needs a guest rootfs, bounded console, timeout/kill and boot
+tests before it can be called supported; Python/TypeScript SDKs remain open.

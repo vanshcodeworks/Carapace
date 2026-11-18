@@ -33,6 +33,19 @@ set -u -o pipefail
 CARA="${CARA:-cara}"
 DRY_RUN="${DEMO_DRY_RUN:-0}"
 
+# WSL2 / non-login shells: cgroup delegation is only writable from inside the
+# systemd user slice. Re-exec the whole demo there (same bridge check.sh uses)
+# so the documented one-line invocation works on the reference environment.
+if [ "$DRY_RUN" != "1" ] \
+   && ! grep -q "user.slice/user-$(id -u).slice" /proc/self/cgroup 2>/dev/null \
+   && command -v systemd-run >/dev/null 2>&1 \
+   && systemd-run --user true >/dev/null 2>&1; then
+  say() { printf '%s\n' "$*"; }
+  say "==> outside user slice; re-running demo under systemd-run --user --scope"
+  exec systemd-run --user --scope --quiet \
+    --setenv="CARA=$CARA" --setenv="DEMO_DRY_RUN=$DRY_RUN" "$0" "$@"
+fi
+
 # The canary file scenario (c) tries to plant on the host. If it ever
 # exists, the sandbox failed (or the demo was interrupted mid-fail) and
 # every subsequent "host untouched" check would be meaningless.

@@ -1,6 +1,6 @@
 # STATE - agent working state (overwritten every cycle)
 
-Last updated: cycle 18 (ship) - 2026-11-07.
+Last updated: cycle 19 (audit) - 2026-11-18.
 
 ## Done (all green via scripts/check.sh)
 - C0-C12 COMPLETE at 02044f0 (see FINAL_REPORT.md).
@@ -114,6 +114,13 @@ Last updated: cycle 18 (ship) - 2026-11-07.
     test, cargo deny). `cargo deny check` passes locally.
   - Repository: pushed to `agent/work`, fast-forwarded `main` to commit
     `eb8d4be`, made public via `gh repo edit`. Both branches at same commit.
+
+- **Cycle 19 audit (COMPLETE):** three independent audits (engineering
+  claims, developer UX, git/CI). Removed the unsafe partial network
+  allowlist and restored the tested fail-closed refusal; corrected Tier 3
+  and allowlist claims in README; added `examples/dev.toml`, issue
+  templates, PATH and WSL guidance, working `cara-mcp --version/--help`,
+  a self-bridging demo, and accurate prerequisites. All checks green.
 
 ## In progress
 - P3 rest: network allowlist (seccomp user-notification `connect` broker,
