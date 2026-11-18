@@ -182,6 +182,7 @@ dependencies = [
  "carapace-core",
  "carapace-mcp",
  "carapace-native",
+ "carapace-vm",
  "clap",
  "serde_json",
 ]

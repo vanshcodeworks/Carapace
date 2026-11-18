@@ -5,9 +5,23 @@ mod doctor_ui;
 mod exit_codes;
 mod run_ui;
 mod session_ui;
+mod style;
+mod vm_ui;
 
 #[derive(Parser)]
-#[command(name = "cara", version, about, long_about)]
+#[command(
+    name = "cara",
+    version,
+    color = clap::ColorChoice::Auto,
+    propagate_version = true,
+    arg_required_else_help = true,
+    about = "Local sandbox for untrusted code, built for AI agents",
+    long_about = "Carapace runs untrusted programs with hard limits on CPU, memory, time, \
+                  disk, output and processes. It adds Linux namespaces, cgroups v2, \
+                  Landlock, seccomp and capability dropping. There is no daemon, no \
+                  Docker and no root. Run cara doctor first to check your host.",
+    after_help = "Examples:\n  cara doctor\n  cara run -- /bin/sh -c 'echo hello'\n  cara policy check examples/dev.toml\n  cara session start --policy examples/dev.toml\n  cara mcp"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -48,7 +62,7 @@ enum Cmd {
     },
 
     /// Measure sandbox cold-start latency (median + p95, machine context
-    /// printed alongside — quote numbers only together with it).
+    /// printed alongside - quote numbers only together with it).
     Bench {
         /// Runs per case.
         #[arg(long, default_value_t = 100)]
@@ -57,6 +71,19 @@ enum Cmd {
 
     /// Serve the MCP (Model Context Protocol) server on stdio.
     Mcp,
+
+    /// Run one program in a Tier 3 microVM (experimental, needs KVM).
+    Vm {
+        /// Policy file (TOML). Without one, the `strict` preset applies.
+        #[arg(long)]
+        policy: Option<String>,
+        /// Machine-readable JSON report on stdout.
+        #[arg(long)]
+        json: bool,
+        /// The program and its arguments (after --).
+        #[arg(last = true, required = true)]
+        argv: Vec<String>,
+    },
 
     /// Manage persistent sandbox sessions (persistent /work, no daemon).
     Session {
@@ -155,6 +182,7 @@ fn main() -> ExitCode {
             PolicyCmd::Explain { file } => policy_explain(&file),
         },
         Cmd::Mcp => mcp_main(),
+        Cmd::Vm { policy, json, argv } => vm_ui::vm_main(policy.as_deref(), json, &argv),
         Cmd::Session { cmd } => match cmd {
             SessionCmd::Start { policy, json } => session_ui::start_main(policy.as_deref(), json),
             SessionCmd::Exec {
@@ -179,11 +207,15 @@ fn main() -> ExitCode {
                 ExitCode::from(exit_codes::OK)
             }
             Err(e) => {
-                eprintln!("cara bench: {e}");
+                err("cara bench:", &e.to_string());
                 ExitCode::from(exit_codes::ENV_NOT_READY)
             }
         },
     }
+}
+
+fn err(prefix: &str, message: &str) {
+    eprintln!("{} {}", style::fail(prefix), message);
 }
 
 fn mcp_main() -> ExitCode {
@@ -194,7 +226,7 @@ fn mcp_main() -> ExitCode {
     match server.serve() {
         Ok(()) => ExitCode::from(exit_codes::OK),
         Err(e) => {
-            eprintln!("cara mcp: {e}");
+            err("cara mcp:", &e.to_string());
             ExitCode::from(exit_codes::ENV_NOT_READY)
         }
     }
@@ -240,7 +272,7 @@ fn policy_check(file: &str, json: bool) -> ExitCode {
                     serde_json::json!({ "valid": false, "error": e.to_string() })
                 );
             } else {
-                eprintln!("{file}: {e}");
+                err(file, &e.to_string());
             }
             ExitCode::from(exit_codes::INVALID_POLICY)
         }
@@ -254,7 +286,7 @@ fn policy_explain(file: &str) -> ExitCode {
             ExitCode::from(exit_codes::OK)
         }
         Err(e) => {
-            eprintln!("{file}: {e}");
+            err(file, &e.to_string());
             ExitCode::from(exit_codes::INVALID_POLICY)
         }
     }
@@ -265,7 +297,13 @@ fn preset_summary(p: &carapace_core::Policy) -> String {
     let net = match p.network {
         NetworkMode::None => "no network",
         NetworkMode::Full => "full network",
-        NetworkMode::Allowlist(_) => "allowlisted network (unimplemented)",
+        NetworkMode::Allowlist(ref entries) => {
+            if entries.is_empty() {
+                "allowlisted network (no destinations)"
+            } else {
+                "allowlisted network"
+            }
+        }
     };
     format!("{net}; timeout {:?}", p.limits.timeout)
 }

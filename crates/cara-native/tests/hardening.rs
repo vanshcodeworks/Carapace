@@ -150,6 +150,89 @@ fn network_full_mode_permits_loopback_sockets() {
     );
 }
 
+/// Real allowlist round-trip at the backend level: socket() works, the
+/// listed loopback listener answers, an unlisted live listener is refused
+/// by the broker, and the run finishes normally (no kill reason).
+#[test]
+fn network_allowlist_permits_listed_connect_and_denies_others() {
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
+    let b = backend();
+    if maybe_skip(&b) {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+    if !have_python3() {
+        eprintln!("skipping: no python3");
+        return;
+    }
+    let allowed = std::net::TcpListener::bind("127.0.0.1:0").expect("bind allowed port");
+    allowed.set_nonblocking(true).expect("nonblocking");
+    let allowed_port = allowed.local_addr().unwrap().port();
+    let denied = std::net::TcpListener::bind("127.0.0.1:0").expect("bind denied port");
+    denied.set_nonblocking(true).expect("nonblocking");
+    let denied_port = denied.local_addr().unwrap().port();
+
+    let server = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            match allowed.accept() {
+                Ok((mut conn, _)) => {
+                    let mut req = [0u8; 4];
+                    conn.read_exact(&mut req).expect("read request");
+                    conn.write_all(b"pong").expect("write reply");
+                    return req;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("allowed listener failed: {e}"),
+            }
+        }
+    });
+
+    let mut spec = py(&format!(
+        "import socket\n\
+         s = socket.create_connection(('127.0.0.1', {allowed_port}), timeout=5)\n\
+         s.sendall(b'ping')\n\
+         print('allowed:' + s.recv(4).decode())\n\
+         s.close()\n\
+         try:\n\
+         \x20   s2 = socket.create_connection(('127.0.0.1', {denied_port}), timeout=5)\n\
+         \x20   print('denied:unexpected-success')\n\
+         \x20   s2.close()\n\
+         except (ConnectionRefusedError, PermissionError):\n\
+         \x20   print('denied:refused')\n"
+    ));
+    spec.network = carapace_core::NetworkMode::Allowlist(vec![
+        carapace_core::AllowlistEntry::parse(&format!("127.0.0.1:{allowed_port}")).unwrap(),
+    ]);
+    let r = run(spec);
+    let stdout = String::from_utf8_lossy(&r.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&r.stderr).into_owned();
+    assert_eq!(
+        r.exit_code,
+        Some(0),
+        "stdout={stdout:?} stderr={stderr:?} {r:?}"
+    );
+    assert!(r.kill_reason.is_none(), "sandbox must keep running: {r:?}");
+    assert!(stdout.contains("allowed:pong"), "stdout={stdout:?}");
+    assert!(stdout.contains("denied:refused"), "stdout={stdout:?}");
+    assert!(
+        stderr.contains(&format!("deny connect 127.0.0.1:{denied_port}")),
+        "stderr={stderr:?}"
+    );
+    assert_eq!(server.join().expect("server thread"), *b"ping");
+    match denied.accept() {
+        Ok(_) => panic!("denied connect reached the listener"),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => panic!("denied listener error: {e}"),
+    }
+}
+
 #[test]
 fn seccomp_blocks_unshare() {
     let b = backend();

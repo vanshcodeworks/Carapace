@@ -10,9 +10,9 @@ by construction (see `crates/cara-core/src/policy.rs`):
 - Omitted fields inherit from the selected `preset` (`strict` if none).
 
 Status note: policy files, `cara policy check|explain`, filesystem binds and
-network modes `none`/`full` are implemented and tested (milestone C5). The
-`allowlist` network mode **validates but refuses to run** — see
-[Network modes](#network-modes) and ADR-0004.
+all three network modes (`none`, `full`, `allowlist`) are implemented and
+tested (milestone C5). See [Network](#network) and ADR-0004 for the exact
+semantics and the network-namespace trade-off of `allowlist`.
 
 ---
 
@@ -66,7 +66,7 @@ Selects the base posture; per-field settings below override it.
 |---|---|---|---|---|---|---|---|---|
 | `strict` (default) | 10s | 256 MiB | 100% | 32 | 64 MiB | 1 MiB | no | `none` |
 | `dev` | 60s | 1 GiB | 200% | 128 | 512 MiB | 8 MiB | yes | `none` |
-| `network-light` | 60s | 1 GiB | 200% | 128 | 512 MiB | 8 MiB | yes | `allowlist` (unimplemented — refuses at run time) |
+| `network-light` | 60s | 1 GiB | 200% | 128 | 512 MiB | 8 MiB | yes | `allowlist` with an empty list (denies every connect) |
 
 Preset numbers are computed as 1024-based (MiB/GiB). Note the distinction
 with string values below: in a file, `256MB` means 256,000,000 bytes
@@ -197,21 +197,53 @@ mount happens to be writable (test: `hardening.rs::landlock_denies_writes_outsid
 
 ```toml
 [network]
-mode = "none"              # "none" (default) | "full" | "allowlist"
-allow = ["pypi.org"]       # ONLY valid together with mode = "allowlist"
+mode = "none"                  # "none" (default) | "full" | "allowlist"
+allow = ["127.0.0.1:8080"]     # ONLY valid together with mode = "allowlist"
 ```
 
 | Mode | What happens |
 |---|---|
-| `none` (default) | The child unshares `CLONE_NEWNET`: an empty network namespace with only a down `lo`. Nothing to dial, nothing to resolve, no host-shared abstract UNIX sockets. seccomp additionally denies `socket`/`connect`/... — two independent layers (ADR-0004) |
+| `none` (default) | The child unshares `CLONE_NEWNET`: an empty network namespace with only a down `lo`. Nothing to dial, nothing to resolve, no host-shared abstract UNIX sockets. seccomp additionally denies `socket`/`connect`/... - two independent layers (ADR-0004) |
 | `full` | The payload **shares the host's network namespace** (no `CLONE_NEWNET`) and seccomp allows the socket-family syscalls. The loud opt-in for tools that legitimately need the network. All other isolation is unchanged |
-| `allowlist` | Designed in ADR-0004, **not implemented**. Parsing and `policy check` succeed; `cara run` fails closed with an explicit "not implemented" error rather than pretending (test: `cli_run.rs::run_fails_closed_on_unknown_network_mode_in_policy`) |
+| `allowlist` | The payload also shares the host network namespace, so ordinary clients can create sockets. seccomp returns `SECCOMP_RET_USER_NOTIF` for `connect(2)` only. A broker in stage-1 reads the target `sockaddr` from the payload with `process_vm_readv` and either continues the syscall (allowed) or returns a clean `ECONNREFUSED`/`EACCES` (denied). A denied connect does not kill the sandbox and the JSON report is still produced |
 
 `allow` given without `mode = "allowlist"` is an error. `mode = "allowlist"`
-with an empty `allow` list is what the `network-light` preset produces.
+with an empty `allow` list is what the `network-light` preset produces: no
+destination is reachable.
 
-Interim guidance: `none` for anything untrusted; `full` only when you would
-have run the code bare anyway.
+### Entries in `allow`
+
+Each entry is one literal destination. Four forms are accepted:
+
+| Entry | Meaning |
+|---|---|
+| `127.0.0.1:8080` | exactly this IPv4 address and port |
+| `10.0.0.0/8:443` | any IPv4 address in the `/8` range, port 443 |
+| `[::1]:5432` | exactly this IPv6 address and port |
+| `[2001:db8::/32]:443` | any IPv6 address in the `/32` range, port 443 |
+
+CIDR prefixes are matched by masking the address bits, so a host address
+with a prefix (`10.1.2.3/8:443`) means the same range as `10.0.0.0/8:443`.
+Ports must be between 1 and 65535. IPv4 prefixes must be 0 to 32 and IPv6
+prefixes 0 to 128.
+
+**Hostnames are refused at policy check time.** Resolve the name to an IP
+yourself before writing the policy. The broker never performs DNS lookups:
+a name in `allow` would depend on resolver state and would be a second
+attack surface. Malformed entries, unknown address families, unreadable
+`sockaddr` structures and internal broker errors all deny the connect.
+
+### What the allowlist does and does not cover
+
+The broker checks outbound `connect(2)` only. It reads at most 128 bytes of
+`sockaddr` from the target, accepts `AF_INET` and `AF_INET6`, and checks
+family, address and port against the list. Other address families are
+denied. Because the mode shares the host network namespace and allows
+`bind`/`listen`, **inbound listeners are not filtered by this allowlist**:
+the payload can create a listening socket on the host stack. Use `none`
+when the payload must have no network surface at all, and `full` only when
+you would have run the code bare anyway. See ADR-0004 for the design and
+the residual risk.
 
 ## `[runtime]`
 
@@ -268,6 +300,16 @@ preset = "dev"
 
 [network]
 mode = "full"
+```
+
+A run that may only connect to a local service:
+
+```toml
+preset = "dev"
+
+[network]
+mode = "allowlist"
+allow = ["127.0.0.1:8080", "[::1]:5432"]
 ```
 
 ## Verifying a policy

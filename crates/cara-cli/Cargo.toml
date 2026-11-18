@@ -14,5 +14,6 @@ path = "src/main.rs"
 carapace-core = { workspace = true }
 carapace-native = { workspace = true }
 carapace-mcp = { workspace = true }
+carapace-vm = { version = "0.1.0", path = "../cara-vm" }
 clap = { workspace = true }
 serde_json = { workspace = true }

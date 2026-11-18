@@ -46,7 +46,7 @@ test lands at listed milestone.
 |---|---|---|
 | Policy files reject unknown fields/units/presets (fail closed) | cara-core policy tests + cli_run policy_check_valid_and_invalid | verified C5 |
 | read_write binds expose exactly the listed host dirs inside the sandbox | cli_run run_with_read_write_bind_sees_host_dir | verified C5 |
-| network mode allowlist fails closed before any payload runs (not implemented) | cli_run.rs::run_fails_closed_on_unknown_network_mode_in_policy (real assertion, restored cycle 19) | verified C5, re-verified cycle 19 |
+| network mode allowlist enforces an IP/port/CIDR outbound connect list end to end; allowed connects succeed, denied ones get a clean refusal, the sandbox keeps running and the report is produced | hardening.rs::network_allowlist_permits_listed_connect_and_denies_others (live listeners on the reference WSL host); cli_run.rs::run_allowlist_permits_listed_connect_and_denies_others (same via `cara run --json`) | verified cycle 20 (WSL2 kernel 6.18.54.1, Ubuntu 24.04.5) |
 | network mode full permits sockets end to end (loopback round-trip); none denies them | hardening.rs::network_full_mode_permits_loopback_sockets + seccomp_blocks_socket_creation | ✅ verified cycle 15 |
 | cara run --json has a stable report schema | run_ui json tests (kill_reason strings) | verified C5 |
 | cara run exit codes documented (0/2/3/4) | exit_codes.rs + cli tests | verified C5 |
@@ -87,7 +87,7 @@ test lands at listed milestone.
 | Claim | Basis | Status |
 |---|---|---|
 | MicroVM tier evaluation: libkrun first (in-process, bundled kernel, directory rootfs), Firecracker second, cloud-hypervisor rejected for v1 — all versions/facts sourced | ADR-0006 with inline URLs | verified C10 (research) |
-| cara-vm fails closed both with and without KVM; VmPlan mapping clamps and rejects zero budgets | cara-vm 9 unit tests | verified C10 |
+| cara-vm fails closed without KVM; a KVM-host setup failure is reported as `BackendError::Setup` before the payload runs; VmPlan mapping clamps and rejects zero budgets | `carapace-vm::tests::without_kvm_spawn_fails_closed`, `vm_plan_rounds_up_and_clamps`, `vm_plan_rejects_zero_budgets`; setup handshake in `spawn` (source-reviewed, not booted) | logic verified; KVM path unverified |
 | Release runbook: topological publish order core -> sys -> native -> {mcp,wasm,vm} -> cli; audit/deny/SBOM commands real | docs/release.md (agent verified against Cargo.tomls) | verified C12 (docs); musl build verified cycle 15 |
 | Product demo: 6 scenarios, 9 checks, all PASS on the reference env; host untouched after every scenario | demo/demo.sh run cycle 9 | verified C12 |
 | Caps may hold by denial (fork denial, MemoryError) as well as by kill — both accepted and documented | demo/demo.sh checks d + f | verified C12 |
@@ -156,7 +156,7 @@ test lands at listed milestone.
 | Animated README hero (`docs/assets/hero.svg`) renders in-browser and shows agent code being blocked by Carapace | SVG is valid XML; GitHub README renders it | ✅ cycle 18 |
 | README is written in very simple English with no em dash characters | `scripts/check-docs.py` enforces the rule; CI runs it | ✅ cycle 18 |
 | "What Carapace stops" table uses 3-column format (Test, Attack, Result) generated from escape catalog | `table::markdown()` updated; test `readme_table_matches_the_catalog` passes | ✅ cycle 18 |
-| README only documents what exists today: run, session, mcp, doctor, policy, Tier 1; "What it does not do yet" section lists network allowlist, aarch64, SDKs, prebuilt binaries, kernel exploits | Manual review + cycle 18 diff | ✅ cycle 18 |
+| README only documents what exists today: run, session, mcp, doctor, policy, Tier 1; "What it does not do yet" section lists network allowlist, aarch64, SDKs, prebuilt binaries, kernel exploits | Manual review + cycle 18 diff | ✅ cycle 18; README network-allowlist status must be updated by its owner for cycle 20 |
 | `AGENT_SETUP.md` is a complete step-by-step file an agent can follow to set up Carapace | Manual verification: host check, clone, build, install, doctor, MCP config, smoke test | ✅ cycle 18 |
 | `docs/agents.md` is a complete human guide to agent workflows: MCP config, sessions, policy recipes, safety rules, verify commands | Manual verification | ✅ cycle 18 |
 | MCP smoke test `scripts/mcp-smoke.py` performs real handshake, lists 8 tools, runs one `run_code` through sandbox | Tested on WSL2 with `systemd-run --user --scope` bridge; output "mcp smoke: ok" | ✅ cycle 18 |
@@ -167,11 +167,46 @@ test lands at listed milestone.
 | `cargo deny check` passes (advisories, bans, licenses, sources all ok) | Local and CI run; wasmtime 50.0.1 for RUSTSEC-2026-0420 | ✅ cycle 18 |
 | Repository is public; `main` and `agent/work` both at commit `eb8d4be`; CI green on both | `gh repo view`, `gh run list`, branch pointers | ✅ cycle 18 |
 
+## Cycle 20 claims (network allowlist)
+| Claim | Basis | Status |
+|---|---|---|
+| Only `connect(2)` goes to the broker; `socket`/`bind`/`listen` and friends stay allowed so ordinary clients work. All other syscalls keep their allow/EPERM action, and a wrong-arch target is killed | carapace_sys::seccomp::tests::only_connect_routes_to_user_notification (BPF mini-interpreter); carapace_sys::seccomp::tests::plain_filter_never_uses_user_notification (modes none/full unchanged) | verified cycle 20 |
+| The kernel notification structs, ioctl encodings and family constants match the Linux ABI; seccomp user notifications are available on the reference host | carapace_sys::notif::tests::{notification_struct_layouts_are_kernel_abi, ioctl_requests_match_linux_headers, sockaddr_family_constants_match_libc, process_vm_readv_copies_from_a_live_child}; seccomp::tests::strict_env_has_seccomp | verified cycle 20 |
+| The supervisor reads the target `sockaddr` with `process_vm_readv`, capped at 128 bytes; malformed, truncated, unsupported-family or unreadable data is denied | child.rs::tests::sockaddr_decoder_is_fail_closed + child.rs `parse_connect_target` (cross-process read proven by notif test above) | verified cycle 20 |
+| `IP:port`, `CIDR:port` and `[IPv6]:port` entries parse; CIDR matches by prefix bits; hostnames, bad ports/prefixes and ambiguous input are refused at policy check time | policy.rs::tests::{allowlist_requires_mode, allowlist_rejects_hostnames_and_malformed_entries, cidr_and_ip_port_matching_is_exact}; cli_run.rs::run_fails_closed_on_malformed_allowlist_entry | verified cycle 20 |
+| Allowlist mode shares the host network namespace (working sockets); mode none still unshares it | supervisor::compatibility_tests::allowlist_and_full_share_host_netns_while_none_unshares | verified cycle 20 |
+| Sessions accept and round-trip allowlist entries; unknown session network modes fail closed | session.rs::tests::{session_policy_rejects_tiny_memory_and_unknown_network, session_policy_round_trips_allowlist_entries} | verified cycle 20 |
+
 ## Cycle 19 claims (audit)
 | Claim | Basis | Status |
 |---|---|---|
 | README Tier 3 section does not claim usable sandbox behavior | README.md Tier 3 experimental section lists missing rootfs, console cap, timeout/kill, CLI wiring and 1 unit test | verified cycle 19 |
-| The network allowlist refuses before code runs with a clear error | `cara run --policy examples/network-allowlist.toml -- /bin/true` + restored cli_run assertion | verified cycle 19 |
+| ~~The network allowlist refuses before code runs with a clear error~~ SUPERSEDED in cycle 20: the allowlist now runs; malformed entries are still refused at policy check time | cli_run.rs::run_fails_closed_on_malformed_allowlist_entry; examples/network-allowlist.toml is now runnable | superseded cycle 20 |
 | `cara-mcp --version` and `--help` work without breaking stdio | crates/cara-mcp/src/main.rs + `python3 scripts/mcp-smoke.py` (8 tools, run_code marker) | verified cycle 19 |
 | The product demo works from a plain wsl.exe shell | `CARA=... demo/demo.sh` self-bridges via systemd-run; 9 passed, 0 failed | verified cycle 19 |
 | All documented policy files exist | examples/README.md, examples/dev.toml, examples/network-allowlist.toml | verified cycle 19 |
+
+## Tier 3 microVM implementation (task update, 2026-11-18)
+
+| Claim | Basis | Status |
+|---|---|---|
+| The guest rootfs planner produces a disposable temp skeleton with `bin`, `lib`, `lib64`, `usr`, `etc`, `work`, `proc`, `dev`, `tmp` and removes it on Drop | `carapace-vm::tests::rootfs_plan_lists_required_dirs`, `rootfs_materialize_creates_and_removes_dirs` (no KVM needed) | ✅ verified |
+| Console output is capped at 8 MiB per stream (`VM_STREAM_CAP`) with an explicit overflow flag; no unbounded temp log file is written | `carapace-vm::tests::capped_output_enforces_hard_limit_and_flags_overflow`; `CappedOutput` plus `krun_add_virtio_console_default` pipe wiring in `spawn` | ✅ cap logic verified; guest fd delivery unverified without KVM |
+| `kill()` stops the VM process group and the first kill reason wins | `carapace-vm::tests::kill_reason_is_first_wins_and_kill_stops_a_real_group` (real SIGKILL to a spawned process group), `handle_kill_records_reason_without_kvm`; `VmState::stop_and_reap` | ✅ kill primitive and bookkeeping verified; live-VM kill unverified |
+| A watchdog thread enforces `limits.timeout` and reports `KillReason::Timeout` | `watchdog()` + `VmHandle::wait()` backup deadline in `crates/cara-vm/src/lib.rs` (source review); `handle_kill_records_reason_without_kvm` covers reason reporting | ⏳ source-reviewed, not exercised on a booted VM |
+| Host `/usr` is planned as a read-only virtiofs export at guest `/usr` | `RootfsPlan::default().usr_bind` + `krun_add_virtiofs3(..., read_only=true)` in `child_boot`; `rootfs_plan_lists_required_dirs` | ✅ planner verified; guest mount unverified without KVM |
+| FFI signatures match libkrun 1.19.8, including a 4-argument `krun_set_exec` (argv + envp) and 3/5-argument virtiofs variants | libkrun-1.19.8 crate source and v1.19.8 `include/libkrun.h`; `nm -D` on the built `libkrun.so` | ✅ verified by source and symbol inspection |
+| `krun_get_shutdown_eventfd` is absent on Linux x86_64, so the kill path uses SIGKILL to the child process group instead | `nm -D` of the built `libkrun.so` (symbol absent); libkrun.h says "Only available on macOS/aarch64" | ✅ verified by symbol inspection |
+| `cara vm` is exposed through `vm_ui::vm_main(policy, json, argv)` and compiles against the existing `Cmd::Vm` wiring | `crates/cara-cli/src/vm_ui.rs`; `cargo check -p carapace-cli` | ✅ compile-verified; no boot attempted |
+| A real microVM boot has NOT been observed in the reference environment | `kvm_boot_e2e_when_available` prints `SKIP: /dev/kvm absent; VM boot not exercised on this host` and returns (run with `--nocapture`) | ✅ verified skip; no boot-success claim |
+
+### README mirror lines (for the owner of README.md)
+
+- Tier 3 now builds a disposable guest rootfs skeleton, exports host `/usr`
+  read-only via virtiofs and a writable `/work`, and exposes `cara vm`.
+- Console output is capped at 8 MiB per stream; `kill()` and the timeout
+  watchdog stop the VM process group.
+- It still fails closed without `/dev/kvm` and has never been booted in the
+  reference environment. virtio-fs is not a host filesystem boundary, so
+  this tier is experimental and not for untrusted code yet.
+- Tests: 9 `carapace-vm` unit tests pass; the boot test skips without KVM.

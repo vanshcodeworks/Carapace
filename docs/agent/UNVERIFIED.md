@@ -31,6 +31,35 @@ test or measurement in this repository currently demonstrates it.
    filter kills the process by design (fail closed), so the native tier is
    x86_64-only in practice. No aarch64 seccomp table exists. Verify by:
    cross-building + QEMU (P1) or a native ARM host.
+5. **No microVM boot has been observed.** The reference environment has no
+   `/dev/kvm`; `carapace-vm::tests::kvm_boot_e2e_when_available` skips with
+   a clear message. Everything after the setup handshake is untested at
+   runtime: whether the skeleton root and the read-only `/usr` and writable
+   `/work` virtiofs exports appear at the expected guest paths, whether
+   `krun_add_virtio_console_default` delivers payload stdout/stderr to the
+   supervisor pipes, whether the child status carries the guest exit code,
+   and whether SIGKILL to the process group tears the VMM down cleanly. The
+   upstream virtio-console output-truncation race noted in ADR-0006 (fix
+   reverted in 1.19.2) is also unverified against 1.19.8. Verify by: enable
+   nested virtualization, then run the KVM-gated test and VM-tier escape
+   scenarios. AUDIT-19/T3.
+6. **virtio-fs is not a host filesystem boundary.** libkrun's own README
+   states that a guest using virtio-fs may access other directories on the
+   same host filesystem, and even other host filesystems, because the VMM
+   acts as the guest's proxy on the host. The Tier 3 plan exports host
+   `/usr` read-only into the guest, which is NOT a confinement boundary.
+   The VMM process must itself be isolated with host mount/namespace/chroot
+   controls before an untrusted payload runs this way; this backend does
+   not apply those controls yet. Verify by: a guest probe that walks
+   outside the exported `/usr` tree, then a host-side mount namespace
+   around the VM child. AUDIT-19/T3.
+7. **Timeout and output-overflow enforcement on a live VM are untested.**
+   The watchdog, the byte cap and the process-group kill are implemented and
+   unit-tested in isolation, but no booted VM has been driven into a
+   wall-clock limit or an output overflow with the resulting
+   `KillReason::Timeout` / `KillReason::OutputOverflow` read back from the
+   report. Verify by: on a KVM host, run a `sleep 30` payload with a 1 s
+   timeout and a high-volume writer with a small output cap. AUDIT-19/T3.
 
 ## R2 — Medium risk (correctness/completeness, unproven)
 
@@ -328,17 +357,37 @@ test or measurement in this repository currently demonstrates it.
 
 ## Audit cycle 19 (open items)
 
-- Tier 3 microVM is not usable for untrusted code: no guest rootfs
-  (`krun_set_root` declared but never called), console output is not
-  byte-capped, `kill()` is a no-op, no timeout, no CLI/MCP wiring, one
-  mapping unit test, never booted (no `/dev/kvm`). AUDIT-19.
-- The seccomp user-notification design for a network allowlist was removed
-  because it was unsafe: it dereferenced a foreign address-space pointer,
-  socket(2) was denied before connect(2), and the test was disabled. A real
-  implementation needs cross-process memory reads with a safe copy, CIDR
-  matching, a clean denial response, and a named test. AUDIT-19.
+- Tier 3 microVM: the missing rootfs planner, bounded console, timeout/kill
+  and `cara vm` CLI module have been implemented with named tests (R1.5 to
+  R1.7 above now carry the open risks). It is still not usable for
+  untrusted code and has never been booted on this host. AUDIT-19/T3.
+- ~~The seccomp user-notification design for a network allowlist was removed
+  because it was unsafe.~~ RESOLVED in cycle 20: the broker now reads the
+  target `sockaddr` with `process_vm_readv` (never dereferences a foreign
+  pointer), socket(2) stays allowed, CIDR matching and a clean denial
+  response are implemented and proven by named tests. AUDIT-19.
 - Hosted CI self-skips all environment-dependent tests; a green badge does
   not prove isolation behavior. The local `scripts/check.sh` and the demo
   are the authoritative gates. AUDIT-19.
-- No prebuilt binaries, Python/TypeScript SDKs, aarch64, or alternate
-  distros. AUDIT-19.
+- No published prebuilt release. A manual workflow can build glibc, musl
+  and aarch64 artifacts, but none has been published or runtime-verified.
+  Python/TypeScript SDKs exist (thin stdio clients). aarch64 and alternate
+  distros remain unverified. AUDIT-19, cycle 20.
+
+## Network allowlist open items (cycle 20)
+
+- The broker filters outbound `connect(2)` only. It does not filter inbound
+  `bind`/`listen`, UDP `sendto`, or DNS. These are documented in
+  docs/policy.md and ADR-0004, but not measured as denials because the mode
+  deliberately shares the host network namespace. Verifying them would
+  need an explicit policy decision (a private netns + proxy) rather than a
+  test fix.
+- seccomp user notification requires kernel >= 5.0; the host capability is
+  probed and the run fails closed if absent, but no non-supporting kernel
+  was available to measure that refusal path end to end.
+- Concurrent connect storms and the kernel's notification queue depth are
+  handled by sequential processing with a 50 ms poll; no stress test with
+  many simultaneous payload threads has been run. The cap is one decision
+  in flight at a time by design (no unbounded allocation).
+- The allowlist broker has not been exercised on a non-x86_64 architecture
+  (the seccomp filter is x86_64-only overall; see R1.3).

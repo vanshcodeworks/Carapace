@@ -183,8 +183,8 @@ flowchart TD
 
 Carapace Tier 3 uses **libkrun** to boot a disposable Linux kernel under KVM.
 The goal is that the host kernel is never shared with the payload. The
-`carapace-vm` crate contains a real libkrun FFI boot path, but it is **not a
-usable sandbox yet** and is not wired into the CLI or MCP server.
+`carapace-vm` crate has a real libkrun boot path and a `cara vm` command, but
+it is **still experimental** and is not for untrusted code yet.
 
 | Property | Current state |
 |----------|---------------|
@@ -192,24 +192,28 @@ usable sandbox yet** and is not wired into the CLI or MCP server.
 | Kernel | Bundled minimal kernel (init-blob) |
 | Memory mapping | 64 MiB - 16 GiB, floors/ceilings applied (unit tested) |
 | vCPU mapping | 1 - 64, `ceil(cpu_percent / 100)` (unit tested) |
-| `/work` | virtiofs export (size-capped) |
-| Rootfs | **Not provided** - `krun_set_root` is declared but never called |
-| Network | libkrun `net` feature is enabled; no policy enforcement yet |
-| Console | Written to a temp file, **no byte cap yet** |
-| Timeout / kill | **Not implemented** - `kill()` is a no-op TODO |
-| Tests | 1 mapping unit test; never booted (no `/dev/kvm` in dev env) |
+| Guest rootfs | Disposable skeleton created and removed on Drop (unit tested) |
+| Host `/usr` | Exported read-only via virtiofs |
+| `/work` | Writable virtiofs export |
+| Console | Two streams capped at 8 MiB each; overflow reported |
+| Timeout / kill | Watchdog and `kill()` stop the VM process group (tested without KVM) |
+| Gate | Fails closed without `/dev/kvm` |
+| Boot test | Skips when `/dev/kvm` is absent |
 
-**What this means:** do not use Tier 3 to run untrusted code today. It fails
-closed on hosts without `/dev/kvm`. It needs a guest rootfs, a bounded
-console, a timeout/kill path, and real boot tests before it can be called
-supported. See [ADR-0006](docs/decisions/ADR-0006-microvm-tier.md).
+Run it through the CLI (needs `/dev/kvm`):
 
-```rust
-use carapace_vm::{VmBackend, VmPlan};
-let backend = VmBackend::new();
-let plan = VmPlan::from_limits(&limits).unwrap();
-// backend.spawn(&spec) // blocks until VM exits (no timeout/kill)
+```sh
+cara vm -- /usr/bin/echo hello
+cara vm --json -- /usr/bin/echo hello
 ```
+
+**Why it is still experimental:** Tier 3 has never booted in the reference
+environment (no `/dev/kvm`), so guest paths, exit codes, and live kill paths
+are unverified. libkrun's own documentation also states that virtio-fs is
+**not** a host filesystem boundary. Do not use this tier to contain hostile
+code. Tier 1 is the supported backend. See
+[ADR-0006](docs/decisions/ADR-0006-microvm-tier.md) and
+[docs/platform-matrix.md](docs/platform-matrix.md).
 
 ---
 
@@ -414,7 +418,12 @@ cara policy explain FILE           # Print what the policy allows in plain Engli
 ```sh
 cara doctor [--json]               # Check host capabilities
 cara mcp                           # Run MCP server on stdio
+cara vm [--policy FILE] [--json] -- <PROGRAM> [ARGS...]  # Experimental Tier 3
 ```
+
+The CLI uses color only in a real terminal. Set `NO_COLOR` to turn it off, or
+`CLICOLOR_FORCE=1` to keep it in a pipe or screenshot. JSON output is never
+colored, so scripts stay reliable.
 
 ---
 
@@ -498,7 +507,7 @@ preset = "strict"
 # Dev: room to work, still no network, exec_on_write = true
 preset = "dev"
 
-# Network-light: dev limits with allowlist network (not implemented, fails closed)
+# network-light: dev limits with an empty allowlist (all connects denied)
 preset = "network-light"
 ```
 
@@ -548,7 +557,19 @@ mode = "none"
 |------|----------|
 | `none` | Empty network namespace, seccomp denies socket(2) |
 | `full` | Share host network namespace (loud opt-in) |
-| `allowlist` | Not implemented, fails closed at run time |
+| `allowlist` | Only listed outbound `connect(2)` destinations are allowed; everything else refused |
+
+Example:
+
+```toml
+[network]
+mode = "allowlist"
+allow = ["127.0.0.1:8080", "10.0.0.0/8:443", "[::1]:53"]
+```
+
+Files without `allow` deny every connect. The broker copies the destination
+from the sandbox with `process_vm_readv`; it never dereferences a sandbox
+pointer in the supervisor. Malformed entries are rejected by `cara policy check`.
 
 ---
 
@@ -619,12 +640,13 @@ Run `cara doctor` to measure your exact environment. It prints exact remedies fo
 
 ## Limitations and Non-Goals
 
-- **Network allowlist.** `network = "allowlist"` is not implemented. Carapace refuses it before any code runs (fail closed, with a clear "not implemented" error). Use `none` or `full`. The design is in [ADR-0004](docs/decisions/ADR-0004-network-modes.md); an example policy that shows the refused form is in [`examples/network-allowlist.toml`](examples/network-allowlist.toml).
+- **Network allowlist.** `network = "allowlist"` is implemented. It allows only listed outbound `connect(2)` destinations and refuses the rest with a connection error. It does not filter inbound listeners, UDP, or DNS; the run shares the host network namespace. Use `none` for a fully isolated network. Entries use `IP:port`, `CIDR:port`, or `[IPv6]:port`; hostnames are rejected. See [docs/policy.md](docs/policy.md) and [`examples/network-allowlist.toml`](examples/network-allowlist.toml).
 - **Windows and macOS native.** Linux only. WSL2 works. Windows `.exe` files not supported (see below).
 - **aarch64.** The native tier is x86_64 only.
-- **SDKs.** There is no Python or TypeScript SDK yet. Use MCP or the CLI.
-- **Prebuilt binaries.** There is no release download yet. Build from source.
-- **Kernel exploits.** Tier 1 shares the host kernel. A kernel exploit can escape. Tier 2 and Tier 3 exist to change that; Tier 2 not in CLI, Tier 3 implemented via libkrun (not in CLI).
+- **SDKs.** Python and TypeScript MCP clients exist under `sdk/`. They are thin stdio clients, not full SDKs with retries or reconnect logic. See [sdk/python/README.md](sdk/python/README.md) and [sdk/typescript/README.md](sdk/typescript/README.md).
+- **Prebuilt binaries.** A manual release workflow can build x86_64 glibc, x86_64 musl, and aarch64 binaries, but no public release has been published. Build from source or dispatch the release workflow. aarch64 binaries are cross-built but the runtime is unverified (see [docs/platform-matrix.md](docs/platform-matrix.md)).
+- **Hosted CI.** Public CI proves compile, clippy, unit tests and policy checks. It does not prove sandbox isolation because hosted runners skip environment-dependent tests. `scripts/check.sh` and `.github/workflows/self-hosted-check.yml` are the authoritative gates.
+- **Kernel exploits.** Tier 1 shares the host kernel. A kernel exploit can escape. Tier 2 is a library backend with no CLI wiring. Tier 3 has a `cara vm` command and a libkrun boot path, but it is experimental, has never booted in the reference environment, and is not a filesystem boundary.
 - **Other distros.** The measured environment is WSL2 Ubuntu 24.04, kernel 6.18, x86_64. Other distros are not supported until they are measured. `cara doctor` is the gate.
 
 ---
@@ -642,6 +664,9 @@ Run `cara doctor` to measure your exact environment. It prints exact remedies fo
 - [FAQ](docs/faq.md)
 - [Claims ledger](docs/agent/CLAIMS.md) - every claim and its test
 - [Unverified list](docs/agent/UNVERIFIED.md) - what is not proven yet
+- [Platform matrix](docs/platform-matrix.md) - built and tested per platform
+- [Python SDK](sdk/python/README.md) - MCP client in Python
+- [TypeScript SDK](sdk/typescript/README.md) - MCP client in Node/TypeScript
 
 ---
 

@@ -220,13 +220,15 @@ bash scripts/check.sh
 
 ## Limits
 
-- Linux x86_64 only. WSL2 works.
-- No network allowlist.
-- No Python or TypeScript SDK. MCP and the CLI are the interfaces.
-- No prebuilt binaries yet. Build from source.
-- Tier 1 shares the host kernel. A kernel exploit can escape. Tier 2 and
-  Tier 3 are the answer to that, but Tier 2 is not in the CLI yet and Tier 3
-  is not usable.
+- Linux x86_64 is the supported native tier. WSL2 works.
+- Network allowlist support is in progress. Check `cara policy check` before relying on it.
+- Python and TypeScript MCP clients exist under `sdk/`. They are thin stdio
+  clients, not full SDKs with retries or reconnects.
+- No published prebuilt binaries. A manual release workflow can build them,
+  but aarch64 binaries are cross-built and the runtime is unverified.
+- Tier 1 shares the host kernel. A kernel exploit can escape. Tier 2 is a
+  library backend. Tier 3 has a libkrun boot path but no guest rootfs,
+  bounded console, kill path, or CLI wiring, so it is not usable yet.
 - The measured environment is WSL2 Ubuntu 24.04, kernel 6.18, x86_64. Other
   distros are unverified until measured. See
   [docs/agent/UNVERIFIED.md](agent/UNVERIFIED.md).

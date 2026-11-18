@@ -1,9 +1,12 @@
-# This policy is intentionally NOT runnable yet.
-# The allowlist mode is designed in docs/decisions/ADR-0004-network-modes.md
-# but not implemented. Carapace refuses it before any code runs (fail closed).
-# Use mode = "none" or mode = "full" instead.
-preset = "strict"
+# A runnable network allowlist policy. Outbound connect(2) is allowed only
+# to the destinations below, which are checked by a seccomp broker.
+# Hostnames are not accepted: write the resolved IP or CIDR range.
+preset = "dev"
 
 [network]
 mode = "allowlist"
-allow = ["pypi.org"]
+allow = [
+  "127.0.0.1:8080",
+  "10.0.0.0/8:443",
+  "[::1]:5432",
+]

@@ -149,7 +149,27 @@ pub(crate) struct ChildConfig {
     /// Compiled seccomp filter (parent-side compilation; installed by
     /// stage-2 as the LAST setup step before exec).
     pub seccomp_filter: Vec<libc::sock_filter>,
+    /// True when the filter routes `connect(2)` to a user-notification
+    /// listener. Stage-2 installs the listener and sends it to stage-1,
+    /// which brokers every connect. False for modes `none` and `full`.
+    pub user_notif: bool,
+    /// The parsed `network.allow` entries, prepared parent-side and read
+    /// (never modified) by stage-1's notification broker.
+    pub allowlist: Vec<carapace_core::AllowlistEntry>,
+    /// Stage-1 end of the CLOEXEC socketpair used to transfer the seccomp
+    /// notification fd from stage-2.
+    pub notif_sock1: RawFd,
+    /// Stage-2 end of that socketpair. `-1` when `user_notif` is false.
+    pub notif_sock2: RawFd,
 }
+
+/// Hard cap on the `sockaddr` bytes copied from the target process. A
+/// `sockaddr_in` is 16 bytes and a `sockaddr_in6` is 28; 128 leaves room
+/// for future families without letting a hostile addrlen drive an
+/// unbounded allocation in the supervisor.
+const MAX_SOCKADDR: usize = 128;
+const AF_INET: u16 = 2;
+const AF_INET6: u16 = 10;
 
 // ---------------------------------------------------------------- raw I/O
 
@@ -1140,14 +1160,19 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
     }
 
     // ---- stage-1: supervisor proxy ----
-    // Drop every inherited descriptor except our result pipe. Stage-1 is a
-    // fork of the embedding process: without this it retains every fd the
-    // embedder had open, including other concurrent sandboxes' status and
-    // result pipe write ends. Holding those blocks their EOF detection
-    // until this sandbox exits — a deadlock when both payloads are
-    // long-lived (regression test RT22). This also removes the embedder's
-    // stdin/stdout/stderr and any unrelated host fds from the proxy.
-    close_fds_except(cfg.result_wr);
+    // Drop every inherited descriptor except the ones we still need.
+    // Stage-1 is a fork of the embedding process: without this it retains
+    // every fd the embedder had open, including other concurrent
+    // sandboxes' status and result pipe write ends. Holding those blocks
+    // their EOF detection until this sandbox exits (regression test RT22).
+    // In allowlist mode we additionally keep the notification socket and
+    // stderr, so we can receive the listener and log broker decisions.
+    let keep: &[RawFd] = if cfg.user_notif {
+        &[cfg.result_wr, cfg.notif_sock1, cfg.stderr_fd]
+    } else {
+        &[cfg.result_wr]
+    };
+    close_fds_except(keep);
     // Tell the parent which pid to watch (the payload init).
     let notice = ChildError {
         stage: msg::PID2_NOTICE,
@@ -1159,20 +1184,68 @@ pub(crate) extern "C" fn child_main(arg: *mut libc::c_void) -> libc::c_int {
         // bytes of a local struct alive across this call.
         std::slice::from_raw_parts(bytes, std::mem::size_of::<ChildError>())
     });
-    // Wait for the payload init and forward its raw status, then exit.
+
+    // Wait for stage-2. In allowlist mode stage-2 sends us the seccomp
+    // listener just before exec; from then on we broker every connect(2)
+    // while the payload runs. We handle one notification at a time, so the
+    // kernel queues the rest and no unbounded state is ever allocated.
     let mut st2: libc::c_int = 0;
+    let mut listener: Option<RawFd> = None;
+    let mut sock_open = cfg.user_notif;
     loop {
+        if !cfg.user_notif {
+            let r = unsafe {
+                // SAFETY: blocking waitpid on our direct child (stage-2).
+                libc::waitpid(pid2, &mut st2, 0)
+            };
+            if r == pid2 || errno() != libc::EINTR {
+                if r != pid2 {
+                    st2 = 128 + libc::SIGKILL; // stage-2 vanished abnormally
+                }
+                break;
+            }
+            continue;
+        }
+
+        // Non-blocking child check so connect notifications keep moving.
         let r = unsafe {
-            // SAFETY: blocking waitpid on our direct child (stage-2).
-            libc::waitpid(pid2, &mut st2, 0)
+            // SAFETY: waitpid(WNOHANG) on our direct child; no pointers.
+            libc::waitpid(pid2, &mut st2, libc::WNOHANG)
         };
         if r == pid2 {
             break;
         }
-        let e = errno();
-        if e != libc::EINTR {
-            st2 = 128 + libc::SIGKILL; // stage-2 vanished abnormally
+        if r < 0 && errno() != libc::EINTR {
+            st2 = 128 + libc::SIGKILL;
             break;
+        }
+        if sock_open && listener.is_none() {
+            if poll_fd(cfg.notif_sock1, 50).0 {
+                match recv_listener_fd(cfg.notif_sock1) {
+                    Ok(Some(fd)) => listener = Some(fd),
+                    Ok(None) => sock_open = false, // stage-2 died before sending
+                    Err(_) => sock_open = false,   // fail closed: no broker
+                }
+            }
+        } else if let Some(fd) = listener {
+            if poll_fd(fd, 50).0 {
+                broker_one_connect(cfg, fd);
+            }
+        } else {
+            // No listener can arrive; sleep briefly instead of spinning.
+            sleep_short();
+        }
+    }
+    if let Some(fd) = listener {
+        unsafe {
+            // SAFETY: fd received via SCM_RIGHTS and owned by us.
+            libc::close(fd);
+        }
+    }
+    if cfg.notif_sock1 >= 0 {
+        unsafe {
+            // SAFETY: our copy of the socketpair fd.
+            libc::close(cfg.notif_sock1);
         }
     }
     let fwd = ChildError {
@@ -1280,44 +1353,69 @@ fn fail(cfg: &ChildConfig, stage: u8, errno: i32) -> ! {
 /// unrelated host fds). Best-effort by design: `close_range` is a
 /// doctor-gated platform requirement, and stage-2 fails closed if the
 /// syscall is unavailable before the payload can run.
-fn close_fds_except(keep: RawFd) {
-    if keep > 3 {
-        unsafe {
-            // SAFETY: close_range(3, keep-1, 0) closes our own inherited fds.
-            libc::syscall(libc::SYS_close_range, 3u32, (keep - 1) as u32, 0u32);
+fn close_fds_except(keep: &[RawFd]) {
+    // Stage-1: drop the inherited stdio too (it only writes via its pipe).
+    let _ = close_fds_except_checked(keep, false);
+}
+
+/// Closes every fd except those in `keep`, using at most a handful of
+/// `close_range` calls (the fd limit can be very large, so a per-fd loop is
+/// not acceptable). `preserve_stdio` keeps fds 0/1/2: stage-2 has already
+/// dup2'd its pipes there and closing them would silently discard all
+/// payload output. Returns errno on failure so stage-2 can fail closed.
+fn close_fds_except_checked(keep: &[RawFd], preserve_stdio: bool) -> Result<(), i32> {
+    let mut sorted = [0 as RawFd; 8];
+    let mut n = 0usize;
+    for &fd in keep {
+        if fd < 0 || n == sorted.len() {
+            continue;
         }
-    }
-    unsafe {
-        // SAFETY: close_range(keep+1, UINT_MAX, 0) closes the rest.
-        libc::syscall(libc::SYS_close_range, (keep + 1) as u32, u32::MAX, 0u32);
-    }
-    for fd in 0..3 {
-        if fd != keep {
-            unsafe {
-                // SAFETY: stdio fds we no longer need in the proxy.
-                libc::close(fd);
-            }
+        let mut i = 0;
+        while i < n && sorted[i] < fd {
+            i += 1;
         }
+        if i > 0 && sorted[i - 1] == fd {
+            continue;
+        }
+        for j in (i..n).rev() {
+            sorted[j + 1] = sorted[j];
+        }
+        sorted[i] = fd;
+        n += 1;
     }
+    let mut next = if preserve_stdio { 3 } else { 0 };
+    for &fd in &sorted[..n] {
+        if (fd as u32) > next {
+            close_range(next, fd as u32 - 1)?;
+        }
+        next = fd as u32 + 1;
+    }
+    close_range(next, u32::MAX)
+}
+
+fn close_range(first: u32, last: u32) -> Result<(), i32> {
+    if first > last {
+        return Ok(());
+    }
+    let r = unsafe {
+        // SAFETY: close_range(2) on our own descriptor table; no pointers.
+        libc::syscall(libc::SYS_close_range, first, last, 0u32) as libc::c_int
+    };
+    errno_of(r)
 }
 
 /// Closes every fd above 2 except the exec-status write end (still needed
 /// to report an exec failure): two close_range calls bracketing it. The
 /// payload inherits exactly {0,1,2}.
 fn harden_fds(cfg: &ChildConfig) {
-    let keep = cfg.status_wr;
-    if keep > 3 {
-        errno_of(unsafe {
-            // SAFETY: close_range(3, keep-1, 0): plain closes.
-            libc::syscall(libc::SYS_close_range, 3u32, (keep - 1) as u32, 0u32) as libc::c_int
-        })
-        .or_fail(cfg, stage::FD_CLOSE);
-    }
-    errno_of(unsafe {
-        // SAFETY: close_range(keep+1, UINT_MAX, 0).
-        libc::syscall(libc::SYS_close_range, (keep + 1) as u32, u32::MAX, 0u32) as libc::c_int
-    })
-    .or_fail(cfg, stage::FD_CLOSE);
+    let keep = if cfg.user_notif {
+        // The payload must never inherit the notification socket or the
+        // listener: both are closed at exec (CLOEXEC) after the transfer.
+        [cfg.status_wr, cfg.notif_sock2]
+    } else {
+        [cfg.status_wr, -1]
+    };
+    close_fds_except_checked(&keep, true).or_fail(cfg, stage::FD_CLOSE);
 }
 
 /// RLIMIT_FSIZE caps any single file the payload writes (the /work tmpfs
@@ -1491,10 +1589,355 @@ fn apply_landlock(cfg: &ChildConfig) {
     }
 }
 
+// ---------------------------------------------- network allowlist broker
+
+/// Poll one fd with a bounded wait. Returns (readable, hung-up-or-error).
+fn poll_fd(fd: RawFd, timeout_ms: i32) -> (bool, bool) {
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let r = unsafe {
+        // SAFETY: poll(2) over one valid pollfd with a bounded timeout.
+        libc::poll(std::ptr::from_mut(&mut pfd), 1, timeout_ms)
+    };
+    if r < 0 && errno() == libc::EINTR {
+        return (false, false);
+    }
+    let readable = pfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0;
+    let hup = pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0;
+    (readable, hup)
+}
+
+/// Short idle wait when no listener can arrive (no busy spin).
+fn sleep_short() {
+    unsafe {
+        // SAFETY: poll(2) with a NULL fds array and zero count is nanosleep.
+        libc::poll(std::ptr::null_mut(), 0, 10);
+    }
+}
+
+/// Receives the seccomp listener fd from stage-2 over SCM_RIGHTS. The
+/// kernel sets CLOEXEC on the received fd via MSG_CMSG_CLOEXEC.
+fn recv_listener_fd(sock: RawFd) -> Result<Option<RawFd>, i32> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: 1,
+    };
+    let mut control = [0u64; 4]; // CMSG_SPACE(sizeof(int)) fits in 32 bytes
+    let mut msg: libc::msghdr = unsafe {
+        // SAFETY: zeroed msghdr is a valid empty message header.
+        std::mem::zeroed()
+    };
+    msg.msg_iov = std::ptr::from_mut(&mut iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = control.len() * std::mem::size_of::<u64>();
+    let n = unsafe {
+        // SAFETY: recvmsg on a valid CLOEXEC AF_UNIX socketpair end; the
+        // control buffer matches msg_controllen and is exclusively ours.
+        libc::recvmsg(
+            sock,
+            std::ptr::from_mut(&mut msg),
+            libc::MSG_DONTWAIT | libc::MSG_CMSG_CLOEXEC,
+        )
+    };
+    if n < 0 {
+        return Err(errno());
+    }
+    if n == 0 {
+        return Ok(None); // stage-2 exited before sending the listener
+    }
+    let mut cmsg = unsafe {
+        // SAFETY: CMSG_FIRSTHDR returns the first cmsg in the buffer we just
+        // filled, or NULL; msg_controllen bounds the walk.
+        libc::CMSG_FIRSTHDR(std::ptr::from_ref(&msg))
+    };
+    while !cmsg.is_null() {
+        unsafe {
+            // SAFETY: cmsg points inside our own aligned control buffer;
+            // CMSG_NXTHDR stays within msg_controllen.
+            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                let data = libc::CMSG_DATA(cmsg);
+                return Ok(Some(*data.cast::<RawFd>()));
+            }
+            cmsg = libc::CMSG_NXTHDR(std::ptr::from_ref(&msg), cmsg);
+        }
+    }
+    Ok(None)
+}
+
+/// Sends one fd from stage-2 to stage-1. Fails closed if the transfer
+/// fails: stage-2 dies before exec and the supervisor reports a Setup error.
+fn send_listener_fd(sock: RawFd, fd: RawFd) -> Result<(), i32> {
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast::<libc::c_void>(),
+        iov_len: 1,
+    };
+    let mut control = [0u64; 4];
+    let mut msg: libc::msghdr = unsafe {
+        // SAFETY: zeroed msghdr is a valid empty message header.
+        std::mem::zeroed()
+    };
+    msg.msg_iov = std::ptr::from_mut(&mut iov);
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast::<libc::c_void>();
+    msg.msg_controllen = unsafe {
+        // SAFETY: pure size computation for an int payload.
+        libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as u32) as usize
+    };
+    unsafe {
+        // SAFETY: our own aligned control buffer, sized above.
+        let cmsg = libc::CMSG_FIRSTHDR(std::ptr::from_ref(&msg));
+        if cmsg.is_null() {
+            return Err(libc::EINVAL);
+        }
+        (*cmsg).cmsg_level = libc::SOL_SOCKET;
+        (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as u32) as usize;
+        *libc::CMSG_DATA(cmsg).cast::<RawFd>() = fd;
+    }
+    let r = unsafe {
+        // SAFETY: sendmsg on a valid CLOEXEC AF_UNIX socketpair end with a
+        // correctly formed SCM_RIGHTS control message.
+        libc::sendmsg(sock, std::ptr::from_ref(&msg), 0)
+    };
+    if r < 0 { Err(errno()) } else { Ok(()) }
+}
+
+/// Reads the `sockaddr` from the NOTIFYING PROCESS with process_vm_readv,
+/// then extracts family, port and address bytes. Never dereferences the
+/// sandbox pointer in this process. Any malformed or unsupported input
+/// returns None, which the caller turns into a clean denial.
+fn parse_connect_target(
+    notif: &carapace_sys::notif::SeccompNotif,
+) -> Option<(u16, [u8; 16], u16, usize)> {
+    let len = notif.data.args[2] as usize;
+    if !(4..=MAX_SOCKADDR).contains(&len) {
+        return None;
+    }
+    let ptr = notif.data.args[1];
+    let mut buf = [0u8; MAX_SOCKADDR];
+    let n =
+        carapace_sys::notif::read_process_memory(notif.pid as libc::pid_t, ptr, &mut buf[..len])
+            .ok()?;
+    if n != len {
+        return None; // short read: fail closed
+    }
+    parse_sockaddr(&buf[..len])
+}
+
+/// Pure `sockaddr` decoder; separated from the process_vm_readv call so
+/// malformed and unsupported structures can be unit-tested without a
+/// live target.
+fn parse_sockaddr(buf: &[u8]) -> Option<(u16, [u8; 16], u16, usize)> {
+    if buf.len() < 4 || buf.len() > MAX_SOCKADDR {
+        return None;
+    }
+    let family = u16::from_ne_bytes([buf[0], buf[1]]);
+    let port = u16::from_be_bytes([buf[2], buf[3]]); // network byte order
+    let mut addr = [0u8; 16];
+    let addr_len = match family {
+        AF_INET if buf.len() >= 16 => {
+            addr[..4].copy_from_slice(&buf[4..8]);
+            4
+        }
+        AF_INET6 if buf.len() >= 28 => {
+            addr[..16].copy_from_slice(&buf[8..24]);
+            16
+        }
+        // Anything else (AF_UNIX, unknown families, truncated structs) is
+        // unsupported and therefore denied.
+        _ => return None,
+    };
+    Some((family, addr, port, addr_len))
+}
+
+/// Handles exactly one queued notification. Sequential handling means at
+/// most one decision is in flight; the kernel queues the rest.
+fn broker_one_connect(cfg: &ChildConfig, fd: RawFd) {
+    let notif = match carapace_sys::notif::recv_notif(fd) {
+        Ok(n) => n,
+        Err(_) => return, // unreadable notification: no response, no allow
+    };
+    if notif.data.nr != libc::SYS_connect as libc::c_int {
+        log_bad_sockaddr(cfg, notif.data.nr);
+        send_response(fd, &notif, false, libc::EACCES);
+        return;
+    }
+    match parse_connect_target(&notif) {
+        Some((family, addr, port, addr_len)) => {
+            let allowed = cfg
+                .allowlist
+                .iter()
+                .any(|e| e.matches(family, &addr[..addr_len], port));
+            log_decision(cfg, allowed, family, &addr[..addr_len], port);
+            let errno = if allowed { 0 } else { libc::ECONNREFUSED };
+            send_response(fd, &notif, allowed, errno);
+        }
+        None => {
+            log_bad_sockaddr(cfg, notif.data.nr);
+            send_response(fd, &notif, false, libc::EACCES);
+        }
+    }
+}
+
+/// Sends the decision. `SECCOMP_IOCTL_NOTIF_ID_VALID` re-checks the id
+/// immediately before the response so an exited target or reused pid can
+/// never receive a decision meant for another task.
+fn send_response(fd: RawFd, notif: &carapace_sys::notif::SeccompNotif, allowed: bool, errno: i32) {
+    if !carapace_sys::notif::id_valid(fd, notif.id) {
+        return; // stale notification: the kernel cleans it up
+    }
+    let resp = carapace_sys::notif::SeccompNotifResp {
+        id: notif.id,
+        val: 0,
+        error: if errno == 0 { 0 } else { -errno },
+        flags: if allowed {
+            carapace_sys::notif::USER_NOTIF_FLAG_CONTINUE
+        } else {
+            0
+        },
+    };
+    let _ = carapace_sys::notif::send_resp(fd, &resp);
+}
+
+// Logging stays allocation-free: stage-1 runs after fork, so only raw
+// syscalls are safe here. The line is deliberately short.
+fn log_decision(cfg: &ChildConfig, allowed: bool, family: u16, addr: &[u8], port: u16) {
+    let fd = cfg.stderr_fd;
+    if allowed {
+        let _ = write_all(fd, b"carapace: allowlist: allow connect ");
+    } else {
+        let _ = write_all(fd, b"carapace: allowlist: deny connect ");
+    }
+    if family == AF_INET {
+        for (i, b) in addr.iter().take(4).enumerate() {
+            if i > 0 {
+                let _ = write_all(fd, b".");
+            }
+            write_u8(fd, *b);
+        }
+    } else {
+        let _ = write_all(fd, b"[ipv6:");
+        for (i, b) in addr.iter().take(16).enumerate() {
+            if i > 0 {
+                let _ = write_all(fd, b":");
+            }
+            write_hex(fd, *b);
+        }
+        let _ = write_all(fd, b"]");
+    }
+    let _ = write_all(fd, b":");
+    write_u16(fd, port);
+    let _ = write_all(fd, b"\n");
+}
+
+fn log_bad_sockaddr(cfg: &ChildConfig, nr: libc::c_int) {
+    let _ = write_all(
+        cfg.stderr_fd,
+        b"carapace: allowlist: deny connect (unreadable sockaddr, syscall ",
+    );
+    write_i32(cfg.stderr_fd, nr);
+    let _ = write_all(cfg.stderr_fd, b")\n");
+}
+
+fn write_u8(fd: RawFd, v: u8) {
+    let mut out = [0u8; 3];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        out[n] = b'0' + x % 10;
+        n += 1;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    for b in out[..n].iter().rev() {
+        let _ = write_all(fd, std::slice::from_ref(b));
+    }
+}
+
+fn write_u16(fd: RawFd, v: u16) {
+    let mut out = [0u8; 5];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        out[n] = b'0' + (x % 10) as u8;
+        n += 1;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    for b in out[..n].iter().rev() {
+        let _ = write_all(fd, std::slice::from_ref(b));
+    }
+}
+
+fn write_i32(fd: RawFd, v: i32) {
+    if v < 0 {
+        let _ = write_all(fd, b"-");
+    }
+    write_u32(fd, v.unsigned_abs());
+}
+
+fn write_u32(fd: RawFd, v: u32) {
+    let mut out = [0u8; 10];
+    let mut n = 0;
+    let mut x = v;
+    loop {
+        out[n] = b'0' + (x % 10) as u8;
+        n += 1;
+        x /= 10;
+        if x == 0 {
+            break;
+        }
+    }
+    for b in out[..n].iter().rev() {
+        let _ = write_all(fd, std::slice::from_ref(b));
+    }
+}
+
+fn write_hex(fd: RawFd, v: u8) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let out = [HEX[(v >> 4) as usize], HEX[(v & 0xf) as usize]];
+    let _ = write_all(fd, &out);
+}
+
 /// seccomp LAST: with Landlock applied and fds sanitized, the allowlist
-/// filter seals the syscall surface until exec.
+/// filter seals the syscall surface until exec. In allowlist mode the
+/// listener fd is transferred to stage-1 before exec so the payload never
+/// holds it.
 fn install_seccomp(cfg: &ChildConfig) {
-    if let Err(e) = carapace_sys::seccomp::install(&cfg.seccomp_filter) {
+    if cfg.user_notif {
+        let fd = match carapace_sys::seccomp::install_with_listener(&cfg.seccomp_filter) {
+            Ok(fd) => fd,
+            Err(e) => fail(cfg, stage::SECCOMP, e),
+        };
+        if let Err(e) = carapace_sys::notif::set_cloexec(fd) {
+            unsafe {
+                // SAFETY: fd we just created; close it on the error path.
+                libc::close(fd);
+            }
+            fail(cfg, stage::SECCOMP, e);
+        }
+        if let Err(e) = send_listener_fd(cfg.notif_sock2, fd) {
+            unsafe {
+                // SAFETY: fd we just created; close it on the error path.
+                libc::close(fd);
+            }
+            fail(cfg, stage::SECCOMP, e);
+        }
+        unsafe {
+            // SAFETY: stage-1 holds its own copy; close ours before exec.
+            libc::close(fd);
+        }
+    } else if let Err(e) = carapace_sys::seccomp::install(&cfg.seccomp_filter) {
         fail(cfg, stage::SECCOMP, e);
     }
 }
@@ -1517,5 +1960,47 @@ mod tests {
         assert_eq!(map_line(1000, &mut buf), b"0 1000 1\n");
         let mut buf = [0u8; 32];
         assert_eq!(map_line(0, &mut buf), b"0 0 1\n");
+    }
+
+    /// The broker decodes only AF_INET/AF_INET6 with complete structures.
+    /// Everything else must return None so the caller denies it (there is
+    /// no "best effort" path that could accidentally allow a connect).
+    #[test]
+    fn sockaddr_decoder_is_fail_closed() {
+        let mut v4 = [0u8; 16];
+        v4[..2].copy_from_slice(&AF_INET.to_ne_bytes());
+        v4[2..4].copy_from_slice(&8080u16.to_be_bytes());
+        v4[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        let (fam, addr, port, len) = parse_sockaddr(&v4).expect("valid sockaddr_in");
+        assert_eq!(fam, AF_INET);
+        assert_eq!(&addr[..len], &[127, 0, 0, 1]);
+        assert_eq!(port, 8080);
+
+        assert!(
+            parse_sockaddr(&v4[..15]).is_none(),
+            "truncated v4 is denied"
+        );
+        assert!(parse_sockaddr(&v4[..2]).is_none(), "no port is denied");
+        assert!(
+            parse_sockaddr(&[0u8; MAX_SOCKADDR + 1]).is_none(),
+            "cap enforced"
+        );
+
+        let mut unix = [0u8; 16];
+        unix[..2].copy_from_slice(&(1u16).to_ne_bytes()); // AF_UNIX
+        assert!(parse_sockaddr(&unix).is_none(), "unix sockets are denied");
+
+        let mut v6 = [0u8; 28];
+        v6[..2].copy_from_slice(&AF_INET6.to_ne_bytes());
+        v6[2..4].copy_from_slice(&443u16.to_be_bytes());
+        v6[8..24].copy_from_slice(&std::net::Ipv6Addr::LOCALHOST.octets());
+        let (fam, addr, port, len) = parse_sockaddr(&v6).expect("valid sockaddr_in6");
+        assert_eq!(fam, AF_INET6);
+        assert_eq!(&addr[..len], &std::net::Ipv6Addr::LOCALHOST.octets());
+        assert_eq!(port, 443);
+        assert!(
+            parse_sockaddr(&v6[..27]).is_none(),
+            "truncated v6 is denied"
+        );
     }
 }

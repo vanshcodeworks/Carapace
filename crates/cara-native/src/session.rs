@@ -21,7 +21,7 @@
 //! absolute paths, `..`, and symlinks are refused.
 
 use carapace_core::KillReason;
-use carapace_core::policy::{NetworkMode, Policy};
+use carapace_core::policy::{AllowlistEntry, NetworkMode, Policy};
 use carapace_core::spec::{Limits, SandboxSpec};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -117,8 +117,11 @@ pub struct SessionPolicy {
     pub memory_bytes: u64,
     pub cpu_percent: u32,
     pub max_processes: u32,
-    /// `"none"` or `"full"`; `allowlist` fails closed (ADR-0004).
+    /// `"none"`, `"full"` or `"allowlist"`.
     pub network: String,
+    /// Parsed `network.allow` entries; only used when network is allowlist.
+    #[serde(default)]
+    pub allow: Vec<AllowlistEntry>,
     pub exec_on_write: bool,
     pub read_only: Vec<String>,
     pub read_write: Vec<String>,
@@ -127,16 +130,10 @@ pub struct SessionPolicy {
 impl SessionPolicy {
     /// Converts a validated [`Policy`] into the keeper's wire form.
     pub fn from_policy(policy: &Policy) -> SessionResult<Self> {
-        let network = match &policy.network {
-            NetworkMode::None => "none".to_string(),
-            NetworkMode::Full => "full".to_string(),
-            NetworkMode::Allowlist(_) => {
-                return Err(SessionError::Invalid(
-                    "network mode \"allowlist\" is not implemented yet (ADR-0004); \
-                     use mode = \"none\" or \"full\""
-                        .to_string(),
-                ));
-            }
+        let (network, allow) = match &policy.network {
+            NetworkMode::None => ("none".to_string(), Vec::new()),
+            NetworkMode::Full => ("full".to_string(), Vec::new()),
+            NetworkMode::Allowlist(entries) => ("allowlist".to_string(), entries.clone()),
         };
         let env = policy.to_spec("", &[]).env;
         let out = Self {
@@ -148,6 +145,7 @@ impl SessionPolicy {
             cpu_percent: policy.limits.cpu_percent,
             max_processes: policy.limits.max_processes,
             network,
+            allow,
             exec_on_write: policy.exec_on_write,
             read_only: policy
                 .read_only
@@ -215,7 +213,23 @@ impl SessionPolicy {
             )));
         }
         match self.network.as_str() {
-            "none" | "full" => {}
+            "none" | "full" => {
+                if !self.allow.is_empty() {
+                    return Err(SessionError::Invalid(
+                        "network.allow given without network mode \"allowlist\"".to_string(),
+                    ));
+                }
+            }
+            "allowlist" => {
+                // Entries were already parsed by the host-side Policy; cap
+                // the wire form here so a hostile control socket cannot
+                // make the keeper build an unbounded spec.
+                if self.allow.len() > 256 {
+                    return Err(SessionError::Invalid(
+                        "session network allowlist has too many entries".to_string(),
+                    ));
+                }
+            }
             other => {
                 return Err(SessionError::Invalid(format!(
                     "session network mode {other:?} is not supported"
@@ -266,6 +280,7 @@ impl SessionPolicy {
         let network = match self.network.as_str() {
             "none" => NetworkMode::None,
             "full" => NetworkMode::Full,
+            "allowlist" => NetworkMode::Allowlist(self.allow.clone()),
             other => {
                 return Err(SessionError::Invalid(format!(
                     "unsupported session network mode {other:?}"
@@ -1965,14 +1980,44 @@ mod tests {
     }
 
     #[test]
-    fn session_policy_rejects_allowlist_and_tiny_memory() {
+    fn session_policy_rejects_tiny_memory_and_unknown_network() {
         let mut policy = Policy::strict();
-        policy.network = NetworkMode::Allowlist(vec!["example.com".into()]);
-        assert!(SessionPolicy::from_policy(&policy).is_err());
+        policy.network = NetworkMode::Allowlist(Vec::new());
+        assert!(
+            SessionPolicy::from_policy(&policy).is_ok(),
+            "allowlist works in sessions"
+        );
 
         let mut policy = Policy::strict();
         policy.limits.memory_bytes = 8 * 1024 * 1024;
         assert!(SessionPolicy::from_policy(&policy).is_err());
+
+        let wire = SessionPolicy::from_policy(&Policy::strict()).unwrap();
+        let mut wire = wire;
+        wire.network = "sneaky".to_string();
+        assert!(
+            wire.validate().is_err(),
+            "unknown session network mode fails closed"
+        );
+    }
+
+    #[test]
+    fn session_policy_round_trips_allowlist_entries() {
+        let entries = vec![
+            carapace_core::AllowlistEntry::parse("127.0.0.1:8080").unwrap(),
+            carapace_core::AllowlistEntry::parse("10.0.0.0/8:443").unwrap(),
+        ];
+        let mut policy = Policy::strict();
+        policy.network = NetworkMode::Allowlist(entries.clone());
+        let wire = SessionPolicy::from_policy(&policy).unwrap();
+        let text = serde_json::to_string(&wire).unwrap();
+        let back: SessionPolicy = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.network, "allowlist");
+        assert_eq!(back.allow, entries);
+        match back.to_spec("/bin/true", &[], 1_000) {
+            Ok(spec) => assert_eq!(spec.network, policy.network),
+            Err(e) => panic!("allowlist session spec: {e}"),
+        }
     }
 
     #[test]

@@ -3,6 +3,8 @@
 use carapace_core::{Backend, ExitReport, KillReason, Policy};
 use std::process::ExitCode;
 
+use crate::style;
+
 pub(crate) fn run_main(
     policy_path: Option<&str>,
     json: bool,
@@ -107,24 +109,30 @@ fn json_report(r: &ExitReport) -> String {
 fn human_report(r: &ExitReport) -> String {
     let mut out = String::new();
     if let Some(reason) = &r.kill_reason {
-        out.push_str(&format!("cara: run terminated: {}\n", kill_text(reason)));
+        out.push_str(&format!(
+            "{} {}\n",
+            style::fail("cara: run terminated"),
+            kill_text(reason)
+        ));
     }
     out
 }
 
 fn human_summary(r: &ExitReport) -> String {
+    let status = match (&r.exit_code, r.signal) {
+        (Some(0), _) => style::ok("ok").to_string(),
+        (Some(c), _) => style::warn(&format!("exit {c}")).to_string(),
+        (None, Some(s)) => style::fail(&format!("signal {s}")).to_string(),
+        _ => style::dim("unknown").to_string(),
+    };
     format!(
-        "cara: wall {:?}, cpu {:?}, peak mem {}{}\n",
+        "{} wall {:?}, cpu {:?}, peak mem {}\n",
+        status,
         r.wall_time,
         r.cpu_time.unwrap_or_default(),
         r.peak_memory_bytes
             .map(human_bytes)
             .unwrap_or_else(|| "?".into()),
-        match (&r.exit_code, r.signal) {
-            (Some(c), _) => format!(", exit code {c}"),
-            (None, Some(s)) => format!(", killed by signal {s}"),
-            _ => String::new(),
-        }
     )
 }
 

@@ -2,12 +2,15 @@
 //! human-readable table or JSON. Kept separate from main() so it is
 //! unit-testable.
 
+use crate::style;
 use carapace_core::{DoctorReport, Status};
 
 /// Renders the human-readable report. Ends with a verdict line.
+/// Colors are added only when the style module detects a real terminal.
 pub fn render_human(report: &DoctorReport) -> String {
     let mut out = String::new();
-    out.push_str("cara doctor — Tier 1 (native sandbox) environment check\n\n");
+    out.push_str(&style::accent("cara doctor"));
+    out.push_str(&style::dim(" - Tier 1 native sandbox check\n\n"));
     let width = report
         .checks
         .iter()
@@ -15,17 +18,23 @@ pub fn render_human(report: &DoctorReport) -> String {
         .max()
         .unwrap_or(10);
     for c in &report.checks {
+        let glyph = style::glyph(c.status);
         let tag = match c.status {
-            Status::Ok => " ok  ",
-            Status::Warn => "WARN ",
-            Status::Fail => "FAIL ",
-            Status::Info => " --  ",
+            Status::Ok => style::ok(&format!("[{glyph}]")),
+            Status::Warn => style::warn(&format!("[{glyph}]")),
+            Status::Fail => style::fail(&format!("[{glyph}]")),
+            Status::Info => style::info(&format!("[{glyph}]")),
         };
-        let req = if c.required { "" } else { " (optional)" };
+        let req = if c.required {
+            String::new()
+        } else {
+            style::dim(" (optional)").to_string()
+        };
         out.push_str(&format!(
-            "{tag}{:<width$}  {}{req}\n",
+            "{tag} {:<width$}  {}{}\n",
             c.name,
             c.detail,
+            req,
             width = width
         ));
         if let Some(r) = &c.remedy
@@ -44,12 +53,26 @@ pub fn render_human(report: &DoctorReport) -> String {
     out.push('\n');
     if report.ready() {
         match report.overall() {
-            Status::Warn => out.push_str("Result: READY (with warnings listed above)\n"),
-            _ => out.push_str("Result: READY — the native sandbox can run here\n"),
+            Status::Warn => out.push_str(&format!(
+                "{} {}\n",
+                style::warn("Result: READY"),
+                style::dim("with warnings listed above")
+            )),
+            _ => out.push_str(&format!(
+                "{} {}\n",
+                style::ok("Result: READY"),
+                style::dim("the native sandbox can run here")
+            )),
         }
     } else {
-        out.push_str("Result: NOT READY — required capabilities missing. Carapace refuses\n");
-        out.push_str("to run untrusted code in this environment (fail closed).\n");
+        out.push_str(&format!(
+            "{} {}\n",
+            style::fail("Result: NOT READY"),
+            style::dim("required capabilities missing")
+        ));
+        out.push_str(&style::dim(
+            "Carapace refuses to run untrusted code here (fail closed).\n",
+        ));
     }
     out
 }

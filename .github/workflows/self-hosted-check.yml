@@ -1,0 +1,43 @@
+name: Self-hosted check
+
+# The authoritative isolation gate. Hosted runners cannot create user
+# namespaces or delegate cgroups, so `scripts/check.sh` skips the strict
+# environment tests there (see .github/workflows/ci.yml). This workflow runs
+# the FULL loop on a self-hosted runner that has cgroup v2 delegation and can
+# run `systemd-run --user --scope`.
+#
+# The runner must be set up with a delegated user slice, for example:
+#   sudo systemctl edit user@$(id -u).service
+#   [Service]
+#   Delegate=yes
+#   TasksMax=infinity
+# then reboot and confirm `systemd-run --user --scope true` works as the
+# runner user. No secrets or machine paths are stored in this file.
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, Mondays 06:17 UTC.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  full-check:
+    name: full check (cgroup-delegated)
+    runs-on: [self-hosted, linux, cgroup-delegated]
+    env:
+      CARGO_TERM_COLOR: always
+      CARA_STRICT_ENV_TESTS: "1"
+      CARGO_TARGET_DIR: /var/tmp/carapace-ci-target
+    steps:
+      - uses: actions/checkout@v4
+      - name: Assert the runner has cgroup delegation
+        run: |
+          set -euo pipefail
+          command -v systemd-run
+          systemd-run --user --scope true
+          grep -q "user.slice/user-$(id -u).slice" /proc/self/cgroup
+      - name: Full check (docs, fmt, clippy, tests, runtime matrix)
+        run: bash scripts/check.sh

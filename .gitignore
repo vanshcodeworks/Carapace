@@ -6,6 +6,10 @@
 # Machine-local WSL dev environment (see docs/agent/ENV.md)
 /.wsl/
 
+# Python
+__pycache__/
+*.pyc
+
 # OS
 .DS_Store
 Thumbs.db

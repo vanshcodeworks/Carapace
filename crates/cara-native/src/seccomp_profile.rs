@@ -215,12 +215,23 @@ const NETWORK_ALLOWED: &[libc::c_long] = &[
 pub fn filter_for(network: &carapace_core::NetworkMode) -> seccomp::Filter {
     let log = std::env::var("CARA_SECCOMP_LOG").is_ok_and(|v| v == "1");
     let mut allowed: Vec<libc::c_long> = base_allowed().to_vec();
-    if matches!(network, carapace_core::NetworkMode::Full) {
-        allowed.extend_from_slice(NETWORK_ALLOWED);
-        allowed.sort_unstable();
-        allowed.dedup();
+    match network {
+        carapace_core::NetworkMode::Full | carapace_core::NetworkMode::Allowlist(_) => {
+            allowed.extend_from_slice(NETWORK_ALLOWED);
+            allowed.sort_unstable();
+            allowed.dedup();
+        }
+        carapace_core::NetworkMode::None => {}
     }
-    seccomp::compile_allowlist(&allowed, log)
+    if matches!(network, carapace_core::NetworkMode::Allowlist(_)) {
+        // socket/bind/listen/etc stay ALLOW; only connect is deferred to
+        // the supervisor's broker. The BPF jump semantics for this are
+        // proven in carapace_sys::seccomp::tests::
+        // only_connect_routes_to_user_notification.
+        seccomp::compile_allowlist_with_user_notif(&allowed, log, libc::SYS_connect)
+    } else {
+        seccomp::compile_allowlist(&allowed, log)
+    }
 }
 
 /// The no-network base profile.
@@ -272,6 +283,31 @@ mod tests {
             libc::SYS_fremovexattr,
         ] {
             assert!(!v.contains(&banned), "syscall {banned} must not be allowed");
+        }
+    }
+
+    #[test]
+    fn allowlist_profile_has_the_full_socket_surface() {
+        // The allowlist must not repeat the old bug where socket(2) was
+        // denied before connect(2) could be notified: sockets are allowed
+        // and connect is routed to the broker by the compiler. This test
+        // pins the profile difference; the BPF action itself is proven in
+        // cara-sys::seccomp::tests::only_connect_routes_to_user_notification.
+        let plain = filter_for(&carapace_core::NetworkMode::None);
+        let full = filter_for(&carapace_core::NetworkMode::Full);
+        let allow = filter_for(&carapace_core::NetworkMode::Allowlist(Vec::new()));
+        assert!(full.len() > plain.len(), "full adds the socket syscalls");
+        assert_eq!(
+            allow.len(),
+            full.len(),
+            "allowlist and full share the same socket allowlist"
+        );
+        for net in [
+            &carapace_core::NetworkMode::Full,
+            &carapace_core::NetworkMode::Allowlist(Vec::new()),
+        ] {
+            let f = filter_for(net);
+            assert!(f.len() > 100 && f.len() <= 4096);
         }
     }
 

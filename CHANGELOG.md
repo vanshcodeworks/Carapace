@@ -17,6 +17,14 @@ Build from the `main` branch.
 - Added `cara-mcp --version/--help`, issue templates, PATH and WSL guidance,
   a self-bridging demo, and accurate build prerequisites.
 
+### CLI 2026-11-18
+
+- `cara` help now includes examples and a short product description.
+- Terminal output uses restrained color for status and summaries. Colors are
+  disabled for pipes, `NO_COLOR`, and `TERM=dumb`; JSON stays uncolored.
+- Added `cara vm` for the experimental Tier 3 backend (fails closed without
+  KVM).
+
 ### Added
 
 - `cara run`: one-shot sandbox for untrusted programs, with CPU, memory,

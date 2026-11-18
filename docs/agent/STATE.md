@@ -1,6 +1,6 @@
 # STATE - agent working state (overwritten every cycle)
 
-Last updated: cycle 19 (audit) - 2026-11-18.
+Last updated: cycle 20 (network allowlist) - 2026-11-18.
 
 ## Done (all green via scripts/check.sh)
 - C0-C12 COMPLETE at 02044f0 (see FINAL_REPORT.md).
@@ -122,11 +122,20 @@ Last updated: cycle 19 (audit) - 2026-11-18.
   templates, PATH and WSL guidance, working `cara-mcp --version/--help`,
   a self-bridging demo, and accurate prerequisites. All checks green.
 
+- **Cycle 20 build-out (COMPLETE):** safe network allowlist (seccomp user
+  notification, process_vm_readv, real TCP tests); Tier 3 libkrun boot path
+  with rootfs, capped console, kill/timeout and `cara vm` (9 tests, boot
+  skipped without KVM); Python and TypeScript MCP SDKs (4 tests each);
+  manual release workflow with glibc/musl/aarch64 artifacts;
+  docs/platform-matrix.md; self-hosted CI gate; aesthetic CLI with TTY-only
+  color and rich help (4 tests). All checks green.
+
 ## In progress
-- P3 rest: network allowlist (seccomp user-notification `connect` broker,
-  IP/CIDR + port only; `network = "allowlist"` is currently refused), then
-  Python/TypeScript SDKs (MCP clients + smoke tests), then P4
-  (external-review brief, draft escape challenge).
+- P3 rest: Python/TypeScript SDKs (MCP clients + smoke tests), then P4
+  (external-review brief, draft escape challenge). Network allowlist is
+  implemented and tested (cycle 20): seccomp user-notification `connect`
+  broker, IP/CIDR + port only, host netns. Outbound connects are filtered;
+  inbound listeners are not (documented trade-off in ADR-0004).
 
 ## Known bugs / risks
 - Alternate environments: one Debian userland data point only; no

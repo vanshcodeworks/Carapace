@@ -548,3 +548,104 @@ start with `examples/dev.toml`; network allowlist clean refusal.
 
 Next: Tier 3 needs a guest rootfs, bounded console, timeout/kill and boot
 tests before it can be called supported; Python/TypeScript SDKs remain open.
+
+## Cycle 20 - Tier 3 microVM implementation (subagent)
+
+- crates/cara-vm/src/lib.rs: added a pure rootfs planner that materialises
+  a disposable temp skeleton, a read-only host /usr virtiofs bind and a
+  writable /work export; corrected the 1.19.8 FFI signatures (4-arg
+  krun_set_exec, 3/5-arg virtiofs variants) and forced the krun crate into
+  the link with `extern crate krun;`.
+- Console now uses krun_add_virtio_console_default with two pipes and a hard
+  8 MiB per-stream cap (VM_STREAM_CAP); no unbounded temp log file.
+- Real kill: the VM boots in a forked child in its own process group; a
+  watchdog thread and kill() SIGKILL that group, reap the child, and set
+  KillReason::Timeout / KillReason::OutputOverflow.
+  krun_get_shutdown_eventfd is aarch64/macOS-only in 1.19.8 (confirmed by
+  nm -D), so it cannot be used on Linux x86_64.
+- crates/cara-cli/src/vm_ui.rs: new vm_ui::vm_main(policy, json, argv)
+  matching the existing Cmd::Vm wiring; added a path dependency on
+  carapace-vm to crates/cara-cli/Cargo.toml.
+- 9 unit tests pass; the KVM-gated boot test skips cleanly (no /dev/kvm).
+  cargo clippy -p carapace-vm --all-targets -- -D warnings is clean.
+- Updated CLAIMS.md and UNVERIFIED.md (R1.5-R1.7). No boot claim is made.
+- Note: two unrelated WIP format-string compile errors in
+  carapace-core/src/policy.rs and crates/cara-cli/src/run_ui.rs were fixed
+  minimally to make verification possible; a fourth in
+  carapace-native/src/child.rs (network allowlist WIP) was left untouched.
+
+## Cycle 20 - network allowlist implementation (separate subagent)
+
+Implemented `network = "allowlist"` end to end, replacing the fail-closed
+refusal from cycle 19 and the unsafe earlier attempt.
+
+- cara-core: `AllowlistEntry` parses `IP:port`, `CIDR:port` and
+  `[IPv6]:port`, matches by prefix bits, and refuses hostnames, bad ports
+  and bad prefixes at policy check time. `NetworkMode::Allowlist` now
+  holds parsed entries.
+- cara-sys: `compile_allowlist_with_user_notif` routes only `connect(2)` to
+  `SECCOMP_RET_USER_NOTIF`; `install_with_listener` uses
+  `SECCOMP_FILTER_FLAG_NEW_LISTENER`. New `notif.rs` wraps the kernel
+  structs/ioctls and reads the target `sockaddr` with `process_vm_readv`
+  (never a foreign pointer in this process). ABI and cross-process copy
+  are proven by named tests.
+- cara-native: stage-2 installs the listener and passes it to stage-1 over
+  a CLOEXEC AF_UNIX socketpair via SCM_RIGHTS before exec. The stage-1
+  broker handles one notification at a time, caps `sockaddr` at 128 bytes,
+  accepts only AF_INET/AF_INET6, logs each decision, checks the id with
+  NOTIF_ID_VALID, and responds CONTINUE or a clean ECONNREFUSED/EACCES.
+  Allowlist shares the host netns (like `full`) so sockets work; `none`
+  still unshares it. Sessions now round-trip allowlist entries.
+- Tests: `hardening.rs::network_allowlist_permits_listed_connect_and_denies_others`
+  and `cli_run.rs::run_allowlist_permits_listed_connect_and_denies_others`
+  run a real local TCP listener and assert allowed success, denied refusal,
+  no kill reason and a JSON report. `run_fails_closed_on_unknown_network_mode_in_policy`
+  was replaced by `run_fails_closed_on_malformed_allowlist_entry`.
+  Unit tests cover CIDR/IP:port parsing, BPF semantics, sockaddr decoding
+  and session round-trip.
+- Docs: docs/policy.md and ADR-0004 now describe the real format and the
+  inbound-listener trade-off; CLAIMS.md/UNVERIFIED.md updated. README was
+  NOT touched (owner will update its network-allowlist status).
+- Verification: `bash scripts/check.sh` all green (fmt, clippy -D warnings,
+  full workspace tests, 17/17 runtime matrix). Target allowlist tests pass
+  in 0.07-0.10 s on the reference WSL host.
+
+
+## Cycle 20 (build-out) - 2026-11-18 - network allowlist, Tier 3, SDKs, CLI
+
+Task: finish the leftover work from the audit: safe network allowlist,
+Tier 3 microVM, Python/TypeScript SDKs, prebuilt release workflow, aarch64
+and platform notes, CI isolation gate, and an aesthetic CLI.
+
+Outcome: all four workstreams landed with named tests.
+
+Network allowlist (cycle 20):
+- Implemented with seccomp user notification for connect(2) only. socket(2)
+  stays allowed; the broker copies the target sockaddr with process_vm_readv.
+- Policy entries: IP:port, CIDR:port and [IPv6]:port; hostnames rejected.
+- Real integration tests: allowed connect succeeds, denied connect returns
+  ECONNREFUSED with a JSON report and no kill reason. Full check green.
+
+Tier 3 microVM (cycle 20):
+- libkrun boot path, disposable guest rootfs, read-only /usr and writable
+  /work virtiofs exports, 8 MiB capped console, kill/timeout watchdog,
+  and the `cara vm` CLI command.
+- 9 carapace-vm tests pass; the boot e2e skips without an openable /dev/kvm.
+- Still experimental: virtio-fs is not a host filesystem boundary and no
+  boot has been observed in the reference environment.
+
+SDKs and release (cycle 20):
+- Python SDK (stdlib only) and TypeScript SDK (Node builtins only) with
+  4 passing tests each against a real cara-mcp handshake.
+- Manual release workflow: glibc, musl and aarch64 artifacts with SHA256;
+  draft release only, no crates.io publish.
+- docs/platform-matrix.md records built/tested per platform honestly.
+- self-hosted-check.yml runs scripts/check.sh on a cgroup-delegated runner.
+
+CLI aesthetics (cycle 20):
+- Rich help with examples; restrained TTY-only color for doctor, run,
+  session and errors; NO_COLOR and CLICOLOR_FORCE respected; JSON clean.
+- cli_help.rs adds 4 tests. scripts/check.sh full run green.
+
+Final verification: scripts/check.sh all green; cargo deny check ok;
+Python SDK 4/4; TypeScript SDK 4/4; demo 9/9; MCP smoke 8/8.

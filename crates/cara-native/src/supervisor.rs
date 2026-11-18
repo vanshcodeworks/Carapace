@@ -9,7 +9,7 @@ use carapace_core::report::{ExitReport, KillReason};
 use carapace_core::spec::SandboxSpec;
 use carapace_sys::fork;
 use std::io::Read;
-use std::os::unix::io::{FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -175,12 +175,17 @@ pub(crate) fn spawn_with(
         BackendError::Setup(format!("{what}: {e}"))
     };
 
-    // Network allowlist mode: designed (ADR-0004) but not implemented —
-    // fail closed with a clear message rather than pretending.
-    if let carapace_core::NetworkMode::Allowlist(_) = spec.network {
+    // Network allowlist needs SECCOMP_RET_USER_NOTIF and the NEW_LISTENER
+    // install flag. Fail closed before forking anything if the kernel
+    // cannot provide them (the payload must never run unbrokered).
+    let allowlist = match &spec.network {
+        carapace_core::NetworkMode::Allowlist(entries) => Some(entries.clone()),
+        _ => None,
+    };
+    if allowlist.is_some() && !carapace_sys::seccomp::user_notif_support() {
         return Err(BackendError::Setup(
-            "network mode \"allowlist\" is not implemented yet (ADR-0004); \
-             use mode = \"none\" or \"full\""
+            "network mode \"allowlist\" requires seccomp user notifications; \
+             this kernel does not support them"
                 .to_string(),
         ));
     }
@@ -242,6 +247,40 @@ pub(crate) fn spawn_with(
     let staging_dir = mk_staging_dir().map_err(|e| setup("staging dir", e))?;
     let staging_cref: &std::ffi::CStr = &staging_dir;
 
+    // Allowlist only: a CLOEXEC AF_UNIX socketpair lets stage-2 hand the
+    // seccomp notification fd to stage-1 (SCM_RIGHTS). Stage-1 is stage-2's
+    // direct parent inside the user namespace, so it has the ptrace
+    // permission needed for process_vm_readv on the sandbox's sockaddr.
+    let (notif_owner1, notif_owner2) = if allowlist.is_some() {
+        let mut fds = [-1 as libc::c_int; 2];
+        let r = unsafe {
+            // SAFETY: socketpair(2) into a valid 2-int array with
+            // SOCK_CLOEXEC; no path or address is involved.
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        if r < 0 {
+            return Err(setup(
+                "notification socketpair",
+                std::io::Error::last_os_error(),
+            ));
+        }
+        // SAFETY: both fds are open, exclusively ours, and not used again
+        // except to pass their numbers into the child config.
+        (
+            Some(unsafe { fd_owned_file(fds[0]) }),
+            Some(unsafe { fd_owned_file(fds[1]) }),
+        )
+    } else {
+        (None, None)
+    };
+    let notif_sock1 = notif_owner1.as_ref().map_or(-1, |f| f.as_raw_fd());
+    let notif_sock2 = notif_owner2.as_ref().map_or(-1, |f| f.as_raw_fd());
+
     let config = Box::new(ChildConfig {
         argv,
         envp,
@@ -288,6 +327,10 @@ pub(crate) fn spawn_with(
         seccomp_filter: crate::seccomp_profile::filter_for(&spec.network)
             .as_slice()
             .to_vec(),
+        user_notif: allowlist.is_some(),
+        allowlist: allowlist.clone().unwrap_or_default(),
+        notif_sock1,
+        notif_sock2,
         binds: binds_for(spec),
         alternatives: plan_alternatives(std::path::Path::new("/etc/alternatives")),
         exec_on_write: spec.exec_on_write,
@@ -392,6 +435,10 @@ pub(crate) fn spawn_with(
             libc::close(fd);
         }
     }
+    // Close the supervisor's copies: stage-1/stage-2 have theirs. Keeping
+    // them would hide the socket's EOF when stage-2 fails before exec.
+    drop(notif_owner1);
+    drop(notif_owner2);
 
     // SAFETY: result_rd is open and exclusively ours.
     let mut result_file = unsafe { fd_owned_file(result_rd) };
@@ -546,15 +593,17 @@ pub(crate) fn spawn_with(
     })
 }
 
-/// Namespace flags by network mode: "full" shares the host network
-/// namespace (loud, opt-in); everything else gets a fresh empty one.
+/// Namespace flags by network mode: "full" and "allowlist" both share the
+/// host network namespace; "none" gets a fresh empty one. For allowlist the
+/// isolation is the seccomp broker, not a separate netns. See ADR-0004 for
+/// the trade-off (inbound listeners are not filtered by the allowlist).
 fn unshare_flags_for(network: &carapace_core::NetworkMode) -> libc::c_int {
     let mut flags = libc::CLONE_NEWUSER as libc::c_int
         | libc::CLONE_NEWNS as libc::c_int
         | libc::CLONE_NEWPID as libc::c_int
         | libc::CLONE_NEWIPC as libc::c_int
         | libc::CLONE_NEWUTS as libc::c_int;
-    if !matches!(network, carapace_core::NetworkMode::Full) {
+    if matches!(network, carapace_core::NetworkMode::None) {
         flags |= libc::CLONE_NEWNET as libc::c_int;
     }
     flags
@@ -1113,6 +1162,26 @@ impl Drop for NativeSandbox {
 #[cfg(test)]
 mod compatibility_tests {
     use super::*;
+    use carapace_core::NetworkMode;
+
+    /// A named test for the documented netns trade-off: allowlist shares
+    /// the host netns (so sockets work) and enforces the boundary at
+    /// connect(2) instead of at the network namespace.
+    #[test]
+    fn allowlist_and_full_share_host_netns_while_none_unshares() {
+        let none = unshare_flags_for(&NetworkMode::None);
+        let full = unshare_flags_for(&NetworkMode::Full);
+        let allow = unshare_flags_for(&NetworkMode::Allowlist(Vec::new()));
+        let net = libc::CLONE_NEWNET as libc::c_int;
+        assert_ne!(none & net, 0, "none must unshare the netns");
+        assert_eq!(full & net, 0, "full shares the host netns");
+        assert_eq!(allow & net, 0, "allowlist needs working sockets");
+        assert_eq!(
+            none & !net,
+            allow & !net,
+            "only the netns flag differs between none and allowlist"
+        );
+    }
 
     #[test]
     fn alternatives_planner_exposes_only_usr_symlinks() {

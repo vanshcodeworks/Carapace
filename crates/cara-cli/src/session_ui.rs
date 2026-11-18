@@ -8,6 +8,8 @@ use carapace_native::session::{
 use std::io::{Read, Write};
 use std::process::ExitCode;
 
+use crate::style;
+
 pub(crate) fn start_main(policy_path: Option<&str>, json: bool) -> ExitCode {
     let policy = match policy_path {
         Some(path) => match Policy::from_file(std::path::Path::new(path)) {
@@ -198,13 +200,18 @@ pub(crate) fn list_main(json: bool) -> ExitCode {
             if json {
                 println!("{}", serde_json::json!({ "sessions": sessions }));
             } else if sessions.is_empty() {
-                eprintln!("cara session: no sessions");
+                eprintln!("{}", style::dim("cara session: no sessions"));
             } else {
                 for s in sessions {
+                    let state = if s.alive {
+                        style::ok("alive")
+                    } else {
+                        style::dim("dead")
+                    };
                     println!(
                         "{}  {:<5}  age {:>8}  keeper {:<8}  net {:<4}  timeout {}ms",
-                        s.meta.id,
-                        if s.alive { "alive" } else { "dead" },
+                        style::bold(&s.meta.id),
+                        state,
                         age_text(s.meta.created_at_ms),
                         s.meta.keeper_pid,
                         s.meta.policy.network,
@@ -303,9 +310,10 @@ fn exec_json(id: &str, r: &ExecResult) -> String {
 
 fn exec_summary(r: &ExecResult) -> String {
     let status = match (&r.exit_code, r.signal) {
-        (Some(c), _) => format!("exit code {c}"),
-        (None, Some(s)) => format!("killed by signal {s}"),
-        _ => "unknown status".to_string(),
+        (Some(0), _) => style::ok("ok").to_string(),
+        (Some(c), _) => style::warn(&format!("exit {c}")).to_string(),
+        (None, Some(s)) => style::fail(&format!("signal {s}")).to_string(),
+        _ => style::dim("unknown").to_string(),
     };
     let reason = r
         .kill_reason
@@ -313,7 +321,8 @@ fn exec_summary(r: &ExecResult) -> String {
         .map(|k| format!(", {k}"))
         .unwrap_or_default();
     format!(
-        "cara session: wall {}ms, cpu {}ms, peak mem {}{reason}, {status}",
+        "{} wall {}ms, cpu {}ms, peak mem {}{reason}",
+        status,
         r.wall_time_ms,
         r.cpu_usec.map(|u| u / 1000).unwrap_or(0),
         r.peak_memory_bytes

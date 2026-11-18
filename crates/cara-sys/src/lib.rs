@@ -18,5 +18,6 @@
 pub mod fork;
 pub mod landlock;
 pub mod mount;
+pub mod notif;
 pub mod ns;
 pub mod seccomp;

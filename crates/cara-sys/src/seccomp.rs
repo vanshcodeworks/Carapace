@@ -16,8 +16,13 @@ const RET_ALLOW: u32 = 0x7fff_0000;
 const RET_ERRNO: u32 = 0x0005_0000;
 /// `SECCOMP_RET_LOG` = 0x7ffc0000 (allow but log — profile development).
 const RET_LOG: u32 = 0x7ffc_0000;
+/// `SECCOMP_RET_USER_NOTIF` = 0x7fc00000. The kernel hands the syscall to
+/// a userspace listener instead of allowing or denying it directly.
+const RET_USER_NOTIF: u32 = 0x7fc0_0000;
 /// `SECCOMP_RET_KILL_PROCESS` = 0x80000000.
 const RET_KILL_PROCESS: u32 = 0x8000_0000;
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER` = (1 << 3), linux/seccomp.h.
+const SECCOMP_FILTER_FLAG_NEW_LISTENER: u32 = 1 << 3;
 
 /// `SECCOMP_GET_ACTION_AVAIL` operation for the `seccomp(2)` syscall.
 /// Per `linux/seccomp.h`: `2`.
@@ -25,6 +30,8 @@ const SECCOMP_GET_ACTION_AVAIL: u32 = 2;
 /// `SECCOMP_RET_KILL_PROCESS` action value. Per `linux/seccomp.h`:
 /// `0x80000000`.
 const SECCOMP_RET_KILL_PROCESS_PROBE: u32 = 0x8000_0000;
+/// `SECCOMP_RET_USER_NOTIF` action value, for the availability probe.
+const SECCOMP_RET_USER_NOTIF_PROBE: u32 = 0x7fc0_0000;
 
 // BPF instruction encoding (linux/bpf_common.h, verified).
 const BPF_LD: u16 = 0x00;
@@ -55,9 +62,9 @@ const OFF_ARG0_LO: u32 = 16;
 #[cfg(target_arch = "x86_64")]
 const CLONE_NEW_MASK: u32 = 0x7e02_0000;
 
-/// Returns `true` if this kernel supports seccomp-bpf filters.
-pub fn filter_support() -> bool {
-    let action: u32 = SECCOMP_RET_KILL_PROCESS_PROBE;
+/// Probes one seccomp return action with `SECCOMP_GET_ACTION_AVAIL`.
+fn action_available(action: u32) -> bool {
+    let probe = action;
     let ret = unsafe {
         // SAFETY: the documented availability probe. The third argument
         // points to a valid `u32` the kernel reads; flags are 0. No filter
@@ -66,10 +73,22 @@ pub fn filter_support() -> bool {
             libc::SYS_seccomp,
             SECCOMP_GET_ACTION_AVAIL,
             0u32,
-            std::ptr::from_ref(&action),
+            std::ptr::from_ref(&probe),
         )
     };
     ret == 0
+}
+
+/// Returns `true` if this kernel supports seccomp-bpf filters.
+pub fn filter_support() -> bool {
+    action_available(SECCOMP_RET_KILL_PROCESS_PROBE)
+}
+
+/// Returns `true` if this kernel supports `SECCOMP_RET_USER_NOTIF` and the
+/// `SECCOMP_FILTER_FLAG_NEW_LISTENER` install flag. An allowlist run fails
+/// closed before forking when this is false.
+pub fn user_notif_support() -> bool {
+    action_available(SECCOMP_RET_USER_NOTIF_PROBE)
 }
 
 /// A compiled filter. Build parent-side with [`compile_allowlist`].
@@ -123,6 +142,27 @@ fn jump(code: u16, k: u32, jt: u8, jf: u8) -> libc::sock_filter {
 /// filter cannot inspect); debugged empirically — glibc falls back to
 /// `clone` when `clone3` fails.
 pub fn compile_allowlist(allowed: &[libc::c_long], log_denied: bool) -> Filter {
+    compile_allowlist_inner(allowed, log_denied, None)
+}
+
+/// Same as [`compile_allowlist`], except that one syscall (used for
+/// `connect(2)` in the network allowlist) returns `RET_USER_NOTIF` instead
+/// of `RET_ALLOW`. The broker in the supervisor decides each call. All
+/// other syscalls keep their normal action, so the payload can still
+/// create sockets; only the destination check is deferred.
+pub fn compile_allowlist_with_user_notif(
+    allowed: &[libc::c_long],
+    log_denied: bool,
+    notif_nr: libc::c_long,
+) -> Filter {
+    compile_allowlist_inner(allowed, log_denied, Some(notif_nr))
+}
+
+fn compile_allowlist_inner(
+    allowed: &[libc::c_long],
+    log_denied: bool,
+    notif_nr: Option<libc::c_long>,
+) -> Filter {
     let default_action = if log_denied {
         RET_LOG
     } else {
@@ -182,7 +222,12 @@ pub fn compile_allowlist(allowed: &[libc::c_long], log_denied: bool) -> Filter {
             continue; // handled by the dedicated blocks above
         }
         prog.push(jump(BPF_JMP | BPF_JEQ | BPF_K, nr, 0, 1));
-        prog.push(stmt(BPF_RET | BPF_K, RET_ALLOW));
+        let action = if Some(nr as libc::c_long) == notif_nr {
+            RET_USER_NOTIF
+        } else {
+            RET_ALLOW
+        };
+        prog.push(stmt(BPF_RET | BPF_K, action));
     }
 
     // The default (chain end) comes FIRST; the wrong-architecture kill is
@@ -236,6 +281,40 @@ pub fn install(prog: &[libc::sock_filter]) -> Result<(), i32> {
         })
     } else {
         Ok(())
+    }
+}
+
+/// Installs a filter with `SECCOMP_FILTER_FLAG_NEW_LISTENER` and returns the
+/// notification fd. The caller must mark the fd CLOEXEC and pass it from
+/// the child to the supervisor over a Unix socket before `execve`, so the
+/// payload never inherits a handle it could use to answer its own
+/// notifications. Requires `no_new_privs` (set it first). Fails closed.
+pub fn install_with_listener(prog: &[libc::sock_filter]) -> Result<libc::c_int, i32> {
+    if prog.is_empty() || prog.len() > 4096 {
+        return Err(libc::EINVAL);
+    }
+    let fprog = libc::sock_fprog {
+        len: prog.len() as u16,
+        filter: prog.as_ptr() as *mut libc::sock_filter,
+    };
+    let fd = unsafe {
+        // SAFETY: seccomp(2) SET_MODE_FILTER with a valid sock_fprog whose
+        // filter array outlives the call, and the NEW_LISTENER flag. The
+        // kernel returns a fresh notification fd (or -1 with errno set).
+        libc::syscall(
+            libc::SYS_seccomp,
+            SECCOMP_SET_MODE_FILTER,
+            SECCOMP_FILTER_FLAG_NEW_LISTENER,
+            &fprog as *const libc::sock_fprog,
+        )
+    };
+    if fd < 0 {
+        Err(unsafe {
+            // SAFETY: per-thread errno pointer is valid to read here.
+            *libc::__errno_location()
+        })
+    } else {
+        Ok(fd as libc::c_int)
     }
 }
 
@@ -386,10 +465,70 @@ mod tests {
     }
 
     #[test]
+    fn only_connect_routes_to_user_notification() {
+        // The core of the allowlist filter: socket() and friends stay
+        // allowed so real clients work, and ONLY connect() is deferred to
+        // the broker. A stray ALLOW here would bypass the allowlist; a
+        // stray denial on socket() would break every client (the previous
+        // broken attempt had exactly that bug).
+        let f = compile_allowlist_with_user_notif(
+            &[
+                libc::SYS_socket,
+                libc::SYS_connect,
+                libc::SYS_bind,
+                libc::SYS_getsockopt,
+                libc::SYS_write,
+            ],
+            false,
+            libc::SYS_connect,
+        );
+        let p = f.as_slice();
+        assert_eq!(
+            eval_filter(p, &data_for(libc::SYS_connect, 0)),
+            RET_USER_NOTIF,
+            "connect must be handled by the broker"
+        );
+        for ok in [
+            libc::SYS_socket,
+            libc::SYS_bind,
+            libc::SYS_getsockopt,
+            libc::SYS_write,
+        ] {
+            assert_eq!(
+                eval_filter(p, &data_for(ok, 0)),
+                RET_ALLOW,
+                "syscall {ok} must still be allowed"
+            );
+        }
+        assert_eq!(
+            eval_filter(p, &data_for(libc::SYS_ptrace, 0)),
+            RET_ERRNO | libc::EPERM as u32,
+            "everything else stays denied"
+        );
+        let mut wrong = data_for(libc::SYS_connect, 0);
+        wrong.arch = 0x1234_5678;
+        assert_eq!(eval_filter(p, &wrong), RET_KILL_PROCESS);
+    }
+
+    #[test]
+    fn plain_filter_never_uses_user_notification() {
+        let f = compile_allowlist(&[libc::SYS_connect], false);
+        assert_eq!(
+            eval_filter(f.as_slice(), &data_for(libc::SYS_connect, 0)),
+            RET_ALLOW,
+            "mode none/full must not install a notif listener"
+        );
+    }
+
+    #[test]
     fn strict_env_has_seccomp() {
         if std::env::var("CARA_STRICT_ENV_TESTS").is_err() {
             return;
         }
         assert!(filter_support(), "dev environment must support seccomp-bpf");
+        assert!(
+            user_notif_support(),
+            "dev kernel must support user notifications"
+        );
     }
 }

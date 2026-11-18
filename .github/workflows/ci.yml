@@ -1,5 +1,14 @@
 name: CI
 
+# Hosted runners here only prove compile, format, lint, dependency and unit
+# behavior. They restrict unprivileged user namespaces and cgroup delegation,
+# so environment-dependent isolation tests self-skip (CARA_STRICT_ENV_TESTS is
+# unset). A green badge from this workflow is NOT proof of sandbox isolation.
+# The authoritative full loop is scripts/check.sh on a cgroup-delegated host,
+# run weekly by .github/workflows/self-hosted-check.yml. See
+# docs/platform-matrix.md. This workflow intentionally makes no support claim
+# for alternate distros or aarch64.
+
 on:
   push:
     branches: [main, agent/work]

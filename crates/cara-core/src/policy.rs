@@ -14,6 +14,149 @@ use std::time::Duration;
 /// all resolve helpers through the inherited `PATH`.
 pub const DEFAULT_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
+/// One outbound destination permitted by `[network] allow`.
+///
+/// Only literal IPs and CIDR ranges are accepted. Hostnames are refused at
+/// parse time: resolving them would make a policy depend on DNS, and doing
+/// it in the supervisor would add an unbounded attack surface. Write the
+/// resolved address instead. See docs/policy.md and ADR-0004.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AllowlistEntry {
+    /// IPv4 host or range: `1.2.3.4:443` or `10.0.0.0/8:443`.
+    V4 { ip: [u8; 4], prefix: u8, port: u16 },
+    /// IPv6 host or range: `[::1]:443` or `[2001:db8::/32]:443`.
+    V6 { ip: [u8; 16], prefix: u8, port: u16 },
+}
+
+impl AllowlistEntry {
+    /// Parses one `IP:port`, `CIDR:port` or `[IPv6]:port` entry. Anything
+    /// else (hostnames, ports out of range, bad prefixes) is an error.
+    pub fn parse(s: &str) -> Result<Self, PolicyError> {
+        let invalid = |why: &str| {
+            PolicyError::Invalid(format!(
+                "network.allow entry {s:?}: {why} (use IP:port, CIDR:port or [IPv6]:port)"
+            ))
+        };
+        let (addr_part, port_str, bracketed) = if let Some(inner) = s.strip_prefix('[') {
+            let Some(end) = inner.find(']') else {
+                return Err(invalid("missing ']'"));
+            };
+            let (addr, rest) = inner.split_at(end);
+            let port = rest
+                .strip_prefix(']')
+                .ok_or_else(|| invalid("missing ']'"))?
+                .strip_prefix(':')
+                .ok_or_else(|| invalid("missing :port"))?;
+            (addr, port, true)
+        } else {
+            let (addr, port) = s.rsplit_once(':').ok_or_else(|| invalid("missing :port"))?;
+            (addr, port, false)
+        };
+        if addr_part.is_empty() || (!bracketed && addr_part.contains(':')) {
+            return Err(invalid("IPv6 addresses must be written as [addr]:port"));
+        }
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| invalid("port must be a number"))?;
+        if port == 0 {
+            return Err(invalid("port must be between 1 and 65535"));
+        }
+        let (ip_str, prefix_str) = match addr_part.split_once('/') {
+            Some((ip, prefix)) => (ip, Some(prefix)),
+            None => (addr_part, None),
+        };
+        if ip_str.is_empty() {
+            return Err(invalid("empty address"));
+        }
+        if let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() {
+            let prefix = match prefix_str {
+                Some(p) => p
+                    .parse::<u8>()
+                    .map_err(|_| invalid("prefix must be a number"))?,
+                None => 32,
+            };
+            if prefix > 32 {
+                return Err(invalid("IPv4 prefix must be between 0 and 32"));
+            }
+            Ok(Self::V4 {
+                ip: ip.octets(),
+                prefix,
+                port,
+            })
+        } else if let Ok(ip) = ip_str.parse::<std::net::Ipv6Addr>() {
+            let prefix = match prefix_str {
+                Some(p) => p
+                    .parse::<u8>()
+                    .map_err(|_| invalid("prefix must be a number"))?,
+                None => 128,
+            };
+            if prefix > 128 {
+                return Err(invalid("IPv6 prefix must be between 0 and 128"));
+            }
+            Ok(Self::V6 {
+                ip: ip.octets(),
+                prefix,
+                port,
+            })
+        } else {
+            Err(invalid(
+                "hostnames are not supported; resolve to an IP first",
+            ))
+        }
+    }
+
+    /// True when `family`/`addr`/`port` (read from a live `sockaddr`) match
+    /// this entry. Ranges are matched by masking the configured network and
+    /// the target address with the prefix length.
+    pub fn matches(&self, family: u16, addr: &[u8], port: u16) -> bool {
+        match self {
+            Self::V4 {
+                ip,
+                prefix,
+                port: p,
+            } => {
+                family == AF_INET
+                    && *p == port
+                    && addr.len() >= 4
+                    && prefix_matches(ip, addr, *prefix)
+            }
+            Self::V6 {
+                ip,
+                prefix,
+                port: p,
+            } => {
+                family == AF_INET6
+                    && *p == port
+                    && addr.len() >= 16
+                    && prefix_matches(ip, addr, *prefix)
+            }
+        }
+    }
+}
+
+// cara-core is platform-agnostic, so it does not depend on libc. The Linux
+// sockaddr family numbers are stable ABI values (socket.h): AF_INET=2,
+// AF_INET6=10. cara-sys asserts these against libc in its own tests.
+const AF_INET: u16 = 2;
+const AF_INET6: u16 = 10;
+
+/// Compares the first `prefix` bits of two addresses.
+fn prefix_matches(configured: &[u8], target: &[u8], prefix: u8) -> bool {
+    let whole = (prefix as usize) / 8;
+    if whole > configured.len() || target.len() < configured.len() {
+        return false;
+    }
+    if configured[..whole] != target[..whole] {
+        return false;
+    }
+    let bits = (prefix as usize) % 8;
+    if bits == 0 {
+        return true;
+    }
+    let mask = 0xffu8 << (8 - bits);
+    (configured[whole] & mask) == (target[whole] & mask)
+}
+
 /// Network access mode.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum NetworkMode {
@@ -22,10 +165,10 @@ pub enum NetworkMode {
     None,
     /// Share the host's network namespace (opt-in, loud).
     Full,
-    /// DNS/domain allowlist — designed in ADR-0004, NOT implemented yet:
-    /// validating a policy with this mode succeeds, running it fails
-    /// closed with a clear error.
-    Allowlist(Vec<String>),
+    /// Outbound `connect(2)` is brokered by a seccomp user-notification
+    /// handler and only reaches the listed IPs/ports. Sockets and the host
+    /// network namespace are available so ordinary clients work.
+    Allowlist(Vec<AllowlistEntry>),
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -149,8 +292,8 @@ impl Policy {
         }
     }
 
-    /// `network-light`: dev limits with the (not yet implemented)
-    /// allowlist network mode — honest fail-closed at run time.
+    /// `network-light`: dev limits with an empty allowlist, so no outbound
+    /// `connect(2)` is permitted until the policy adds entries.
     pub fn network_light() -> Self {
         Self {
             network: NetworkMode::Allowlist(Vec::new()),
@@ -229,7 +372,13 @@ impl Policy {
             policy.network = match mode.as_str() {
                 "none" => NetworkMode::None,
                 "full" => NetworkMode::Full,
-                "allowlist" => NetworkMode::Allowlist(raw.network.allow.clone()),
+                "allowlist" => {
+                    let mut entries = Vec::with_capacity(raw.network.allow.len());
+                    for s in &raw.network.allow {
+                        entries.push(AllowlistEntry::parse(s)?);
+                    }
+                    NetworkMode::Allowlist(entries)
+                }
                 other => {
                     return Err(PolicyError::Invalid(format!(
                         "unknown network mode {other:?} (none | full | allowlist)"
@@ -334,10 +483,30 @@ impl Policy {
                 "  - FULL network access (shares the host network — this is the loud option)\n",
             ),
             NetworkMode::Allowlist(list) => {
-                out.push_str(&format!(
-                    "  - network access limited to: {} (NOT IMPLEMENTED YET — runs will fail closed until milestone lands)\n",
-                    if list.is_empty() { "(nothing)".to_string() } else { list.join(", ") }
-                ))
+                out.push_str("  - outbound connects limited to: ");
+                if list.is_empty() {
+                    out.push_str("(nothing)\n");
+                } else {
+                    for (i, e) in list.iter().enumerate() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        match e {
+                            AllowlistEntry::V4 { ip, prefix, port } => out.push_str(&format!(
+                                "{}.{}.{}.{}/{}/{}",
+                                ip[0], ip[1], ip[2], ip[3], prefix, port
+                            )),
+                            AllowlistEntry::V6 { ip, prefix, port } => {
+                                let addr = std::net::Ipv6Addr::from(*ip);
+                                out.push_str(&format!("[{addr}]/{prefix}:{port}"));
+                            }
+                        }
+                    }
+                    out.push('\n');
+                }
+                out.push_str(
+                    "  - sockets use the host network namespace; only connect(2) to these destinations is allowed\n",
+                );
             }
         }
         out.push_str("Everything not listed here is denied. Unlisted host paths are\n");
@@ -659,11 +828,91 @@ language = "python3.12"
     #[test]
     fn allowlist_requires_mode() {
         assert!(Policy::parse("[network]\nallow=[\"x\"]\n").is_err());
-        let p = Policy::parse("[network]\nmode=\"allowlist\"\nallow=[\"pypi.org\"]\n").unwrap();
+        let p = Policy::parse(
+            "[network]\nmode=\"allowlist\"\nallow=[\"127.0.0.1:443\", \"10.0.0.0/8:80\", \"[::1]:53\"]\n",
+        )
+        .unwrap();
         assert_eq!(
             p.network,
-            NetworkMode::Allowlist(vec!["pypi.org".to_string()])
+            NetworkMode::Allowlist(vec![
+                AllowlistEntry::V4 {
+                    ip: [127, 0, 0, 1],
+                    prefix: 32,
+                    port: 443,
+                },
+                AllowlistEntry::V4 {
+                    ip: [10, 0, 0, 0],
+                    prefix: 8,
+                    port: 80,
+                },
+                AllowlistEntry::V6 {
+                    ip: std::net::Ipv6Addr::LOCALHOST.octets(),
+                    prefix: 128,
+                    port: 53,
+                },
+            ])
         );
+    }
+
+    #[test]
+    fn allowlist_rejects_hostnames_and_malformed_entries() {
+        // Fail closed at policy check time: no DNS resolution, no guessing.
+        for bad in [
+            "pypi.org:443",    // hostname
+            "127.0.0.1",       // no port
+            "127.0.0.1:0",     // port zero
+            "127.0.0.1:65536", // port overflow
+            "10.0.0.0/33:443", // prefix out of range
+            "[::1]:notaport",  // bad port
+            "[::1",            // missing bracket
+            "2001:db8::1:443", // IPv6 must be bracketed
+            "256.1.1.1:443",   // not an IPv4 address
+            "",                // empty
+        ] {
+            let text = format!("[network]\nmode=\"allowlist\"\nallow=[\"{bad}\"]\n");
+            let e = match Policy::parse(&text) {
+                Err(e) => e,
+                Ok(_) => panic!("{bad:?} must be rejected"),
+            };
+            assert!(matches!(e, PolicyError::Invalid(_)), "{bad:?}: {e}");
+        }
+    }
+
+    #[test]
+    fn cidr_and_ip_port_matching_is_exact() {
+        let host = AllowlistEntry::parse("192.0.2.7:443").unwrap();
+        assert!(host.matches(AF_INET, &[192, 0, 2, 7], 443));
+        assert!(!host.matches(AF_INET, &[192, 0, 2, 7], 80), "port matters");
+        assert!(
+            !host.matches(AF_INET, &[192, 0, 2, 8], 443),
+            "host bits matter"
+        );
+
+        let range = AllowlistEntry::parse("10.0.0.0/8:443").unwrap();
+        assert!(range.matches(AF_INET, &[10, 200, 3, 4], 443));
+        assert!(!range.matches(AF_INET, &[11, 0, 0, 1], 443));
+        assert!(
+            !range.matches(AF_INET6, &[10, 0, 0, 1], 443),
+            "family matters"
+        );
+
+        // A non-byte-aligned prefix masks the remaining bits too.
+        let partial = AllowlistEntry::parse("192.0.2.0/25:443").unwrap();
+        assert!(partial.matches(AF_INET, &[192, 0, 2, 100], 443));
+        assert!(!partial.matches(AF_INET, &[192, 0, 2, 200], 443));
+
+        let v6 = AllowlistEntry::parse("[2001:db8::/32]:443").unwrap();
+        let mut addr = [0u8; 16];
+        addr[..2].copy_from_slice(&[0x20, 0x01]);
+        addr[2..4].copy_from_slice(&[0x0d, 0xb8]);
+        addr[15] = 7;
+        assert!(v6.matches(AF_INET6, &addr, 443));
+        addr[3] = 0xb9;
+        assert!(!v6.matches(AF_INET6, &addr, 443));
+
+        // Truncated or unreadable sockaddr bytes never match (fail closed).
+        assert!(!host.matches(AF_INET, &[192, 0], 443));
+        assert!(!v6.matches(AF_INET6, &[0x20, 0x01], 443));
     }
 
     #[test]

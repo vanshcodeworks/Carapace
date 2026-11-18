@@ -1,7 +1,11 @@
 //! End-to-end CLI tests: policy check/explain and `cara run` through the
 //! real binary (environment-gated; check.sh bridges WSL cgroup contexts).
 
+use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::process::Command;
+use std::thread;
+use std::time::{Duration, Instant};
 
 fn cara() -> Command {
     Command::new(env!("CARGO_BIN_EXE_cara"))
@@ -214,18 +218,19 @@ fn run_timeout_kills_with_reason() {
 }
 
 #[test]
-fn run_fails_closed_on_unknown_network_mode_in_policy() {
+fn run_fails_closed_on_malformed_allowlist_entry() {
     if !env_ready() {
         eprintln!("skipping: environment not Tier 1 ready");
         return;
     }
     let dir = std::env::temp_dir().join(format!("cara-cli-net-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // allowlist parses, but the backend must refuse (fail closed).
+    // Hostnames are refused at policy check time: no DNS resolution and
+    // no ambiguous input. The payload must never run.
     let f = dir.join("al.toml");
     std::fs::write(
         &f,
-        "[network]\nmode = \"allowlist\"\nallow = [\"pypi.org\"]\n",
+        "[network]\nmode = \"allowlist\"\nallow = [\"pypi.org:443\"]\n",
     )
     .unwrap();
     let out = cara()
@@ -240,10 +245,141 @@ fn run_fails_closed_on_unknown_network_mode_in_policy() {
         .output()
         .unwrap();
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(
-        stderr.contains("not implemented"),
-        "must fail closed loudly: {stderr}"
+    assert_eq!(
+        out.status.code(),
+        Some(3),
+        "invalid policy exit code: {stderr}"
     );
+    assert!(
+        stderr.contains("hostnames are not supported"),
+        "must name the bad entry: {stderr}"
+    );
+    // No report: the run was rejected before any sandbox was spawned.
+    assert!(
+        out.stdout.is_empty(),
+        "invalid policy must not produce a report"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The real allowlist proof: a live TCP listener on an allowed port answers
+/// the payload, a live listener on a denied port never sees a connection,
+/// and the JSON report is still produced with no kill reason.
+///
+/// This is environment-gated like the other end-to-end tests, but it runs
+/// on the reference WSL host (see docs/agent/ENV.md).
+#[test]
+fn run_allowlist_permits_listed_connect_and_denies_others() {
+    if !env_ready() {
+        eprintln!("skipping: environment not Tier 1 ready");
+        return;
+    }
+
+    let allowed_listener = TcpListener::bind("127.0.0.1:0").expect("bind allowed port");
+    allowed_listener.set_nonblocking(true).expect("nonblocking");
+    let allowed_port = allowed_listener.local_addr().unwrap().port();
+
+    let denied_listener = TcpListener::bind("127.0.0.1:0").expect("bind denied port");
+    denied_listener.set_nonblocking(true).expect("nonblocking");
+    let denied_port = denied_listener.local_addr().unwrap().port();
+
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            match allowed_listener.accept() {
+                Ok((mut conn, _)) => {
+                    let mut req = [0u8; 4];
+                    conn.read_exact(&mut req).expect("read request");
+                    conn.write_all(b"pong").expect("write reply");
+                    return req;
+                }
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+                {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(e) => panic!("allowed listener failed: {e}"),
+            }
+        }
+    });
+
+    let dir = std::env::temp_dir().join(format!("cara-cli-allow-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let policy = dir.join("allow.toml");
+    std::fs::write(
+        &policy,
+        format!("[network]\nmode = \"allowlist\"\nallow = [\"127.0.0.1:{allowed_port}\"]\n"),
+    )
+    .unwrap();
+
+    let script = format!(
+        "import socket\n\
+         s = socket.create_connection(('127.0.0.1', {allowed_port}), timeout=5)\n\
+         s.sendall(b'ping')\n\
+         print('allowed:' + s.recv(4).decode())\n\
+         s.close()\n\
+         try:\n\
+         \x20   s2 = socket.create_connection(('127.0.0.1', {denied_port}), timeout=5)\n\
+         \x20   print('denied:unexpected-success')\n\
+         \x20   s2.close()\n\
+         except (ConnectionRefusedError, PermissionError):\n\
+         \x20   print('denied:refused')\n"
+    );
+    let out = cara()
+        .args([
+            "run",
+            "--policy",
+            policy.to_str().unwrap(),
+            "--json",
+            "--",
+            "/usr/bin/python3",
+            "-c",
+            &script,
+        ])
+        .output()
+        .unwrap();
+    let stderr_cli = String::from_utf8_lossy(&out.stderr);
+    let report: serde_json::Value = serde_json::from_slice(&out.stdout)
+        .unwrap_or_else(|e| panic!("no JSON report: {e}; cli stderr={stderr_cli}"));
+
+    assert_eq!(
+        report["exit_code"], 0,
+        "allowed connect must work; denied connect must be a clean refusal: {report}"
+    );
+    assert!(
+        report["kill_reason"].is_null(),
+        "the sandbox must keep running after a denied connect: {report}"
+    );
+    let stdout = report["stdout"].as_str().unwrap();
+    assert!(
+        stdout.contains("allowed:pong"),
+        "allowed connect failed: {stdout}"
+    );
+    assert!(
+        stdout.contains("denied:refused"),
+        "denied connect must raise ConnectionRefusedError: {stdout}"
+    );
+
+    let sandbox_stderr = report["stderr"].as_str().unwrap();
+    assert!(
+        sandbox_stderr.contains(&format!("allow connect 127.0.0.1:{allowed_port}")),
+        "decision log missing allow line: {sandbox_stderr}"
+    );
+    assert!(
+        sandbox_stderr.contains(&format!("deny connect 127.0.0.1:{denied_port}")),
+        "decision log missing deny line: {sandbox_stderr}"
+    );
+
+    assert_eq!(
+        server.join().expect("server thread"),
+        *b"ping",
+        "the allowed listener did not receive the payload's request"
+    );
+    match denied_listener.accept() {
+        Ok(_) => panic!("a denied connect reached the listener"),
+        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+        Err(e) => panic!("denied listener error: {e}"),
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 
